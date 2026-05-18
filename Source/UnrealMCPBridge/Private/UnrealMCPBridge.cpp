@@ -25,6 +25,7 @@
 #include "Tools/NiagaraTools.h"
 #include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
+#include "Tools/SequencerTools.h"
 #include "Tools/UMGTools.h"
 
 #include "Dom/JsonObject.h"
@@ -272,10 +273,21 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	FNiagaraTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FPhysicsTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 5 Chunk D: Sequencer read-only surface (5 tools, all Lane A). list_cinematics enumerates
+	// ULevelSequence assets via FARFilter; get_tracks/get_camera_cuts walk the MovieScene's master
+	// tracks + per-binding tracks; get_keyframes resolves dotted track_path to a UMovieSceneSection
+	// and decodes float/double/bool/integer channel values (other types emit sentinel value=null);
+	// get_current_time reads the active LevelSequence editor playhead via
+	// ULevelSequenceEditorBlueprintLibrary::GetGlobalPosition. New error codes landed in MCPTypes.h:
+	// -32042 NoActiveSequencer, -32043 TrackNotFound, -32044 SectionIndexOOB.
+	// PHASE 5 COMPLETE with this registration — 30 user-visible tools across Chunks A/B/C/D
+	// (cumulative across all phases = 145 user-visible + 11 internal hidden).
+	FSequencerTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

@@ -92,6 +92,19 @@ public class UnrealMCPBridge : ModuleRules
 				// / SweepMultiByChannel + FCollisionShape::MakeCapsule + FCollisionQueryParams +
 				// ECollisionChannel + FHitResult are all in Engine (already a public dep). No additional
 				// physics module required for Chaos query path.
+				// Phase 5 Chunk D — Sequencer read-only surface.
+				// LevelSequence runtime: ULevelSequence class + asset type.
+				// MovieScene runtime: UMovieScene + UMovieSceneTrack + UMovieSceneSection + FMovieSceneBinding
+				// + FMovieScenePossessable + FMovieSceneSpawnable + FMovieSceneChannelProxy + float/double/
+				// bool/integer channel structs.
+				// MovieSceneTracks: UMovieSceneCameraCutTrack + UMovieSceneCameraCutSection.
+				// LevelSequenceEditor: ULevelSequenceEditorBlueprintLibrary (GetCurrentLevelSequence +
+				// GetGlobalPosition for sequencer.get_current_time). Editor-only — the plugin is editor-only
+				// already so the dep is safe.
+				"LevelSequence",
+				"MovieScene",
+				"MovieSceneTracks",
+				"LevelSequenceEditor",
 			}
 		);
 	}

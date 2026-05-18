@@ -198,11 +198,29 @@ inline constexpr int32 kMCPErrorVariableNotFound            = -32037;
  *                             string didn't map to a known ``ECollisionChannel`` enum value.
  *                             Caller's recovery: use ``"Visibility"`` (default) or one of the
  *                             listed builtins. Message lists the accepted channel names.
+ *
+ * Phase 5 Chunk D (Sequencer) adds three subcodes:
+ *
+ *   -32042 NoActiveSequencer  ``sequencer.get_current_time`` — no Sequencer editor tab open OR the
+ *                             active sequence is not a ``ULevelSequence`` (e.g. a non-level MovieScene
+ *                             subclass). Caller's recovery: open a LevelSequence in the Sequencer
+ *                             editor and retry.
+ *   -32043 TrackNotFound      ``sequencer.get_keyframes`` — the ``track_path`` segment didn't match
+ *                             any master track / possessable / spawnable / per-binding track name.
+ *                             Caller's recovery: use ``sequencer.get_tracks`` to enumerate valid
+ *                             names (case-sensitive).
+ *   -32044 SectionIndexOOB    ``sequencer.get_keyframes`` — the section-index component of
+ *                             ``track_path`` was out of range for the resolved track's
+ *                             ``GetAllSections()`` count. Caller's recovery: use ``sequencer.get_tracks``
+ *                             which reports ``section_count`` per track.
  */
 inline constexpr int32 kMCPErrorPIENotActive                = -32038;
 inline constexpr int32 kMCPErrorWidgetNotFound              = -32039;
 inline constexpr int32 kMCPErrorNiagaraParameterNotFound    = -32040; // reserved
 inline constexpr int32 kMCPErrorInvalidCollisionChannel     = -32041;
+inline constexpr int32 kMCPErrorNoActiveSequencer           = -32042;
+inline constexpr int32 kMCPErrorTrackNotFound               = -32043;
+inline constexpr int32 kMCPErrorSectionIndexOOB             = -32044;
 
 /**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.

@@ -7,7 +7,7 @@ the editor for asset/level/blueprint authoring tasks.
 
 ## Status
 
-**Phase 4 complete — 115 user-visible tools + 11 internal hidden handlers.**
+**Phase 5 complete — 145 user-visible tools + 11 internal hidden handlers.**
 
 | Phase | Tools | Surface |
 |---|---|---|
@@ -15,7 +15,8 @@ the editor for asset/level/blueprint authoring tasks.
 | Phase 2 | 31 | asset.* (13 C++ + 6 Python composites = 19), cb.* (12) — plus 5 internal hidden handlers |
 | Phase 3 | 45 | level.* (12), actor.* (20), component.* (8), composites (5 user-visible Python) — plus 5 internal hidden C++ handlers |
 | Phase 4 | 23 | bp.* (13 C++ + 1 Python composite = 14), material.* (9) — plus 1 internal hidden C++ handler |
-| **Total** | **115** | (user-visible; 126 total handler registrations counting hidden internals) |
+| Phase 5 | 30 | pie.* (10), editor.* (9 + pie.screenshot_to_disk), umg.* (2), niagara.* (1), physics.* (2), sequencer.* (5) |
+| **Total** | **145** | (user-visible; 156 total handler registrations counting hidden internals) |
 
 ### Phase 3 polish round (2026-05) — 5 known issues addressed
 
@@ -120,6 +121,12 @@ UnrealMCPBridge/
         BlueprintTools.h/.cpp         # Phase 4 Days 1-10 — 13 bp.* tools (6 reads + 6 writes + bp.compile)
         BlueprintCompositeTools.h/.cpp # Phase 4 Day 10 — 1 internal Lane B submitter (bp.compile_all_dirty)
         MaterialTools.h/.cpp          # Phase 4 Days 11-15 — 9 material.* tools (reads + MIC writes + create + diagnostic)
+        PIETools.h/.cpp               # Phase 5 Chunk A — 10 pie.* tools (lifecycle + introspection + actor identity)
+        EditorTools.h/.cpp            # Phase 5 Chunk B — 9 editor.* + pie.screenshot_to_disk (viewports + selection + toast)
+        UMGTools.h/.cpp               # Phase 5 Chunk C — 2 umg.* tools (WidgetTree walk + CDO property read)
+        NiagaraTools.h/.cpp           # Phase 5 Chunk C — 1 niagara.list_parameters (user/system/emitter enum)
+        PhysicsTools.h/.cpp           # Phase 5 Chunk C — 2 physics.* tools (Chaos line trace + capsule sweep)
+        SequencerTools.h/.cpp         # Phase 5 Chunk D — 5 sequencer.* tools (list_cinematics + tracks + cuts + keyframes + current_time)
       Utils/                                # Unified utility namespace post-polish #11
         MCPAssetPathUtils.h/.cpp     # Phase 2 — asset path canonicalisation
         MCPARFilterParser.h/.cpp     # Phase 2 — FARFilter JSON ↔ struct + hash
@@ -133,6 +140,7 @@ UnrealMCPBridge/
         MCPBlueprintUtils.h/.cpp     # Phase 4 — LoadBlueprintByPath / FindVariableIndex / GetGeneratedClass
         MCPPinTypeUtils.h/.cpp       # Phase 4 — FEdGraphPinType ↔ JSON (D3/D4 — fail-fast on unsupported)
         MCPMaterialUtils.h/.cpp      # Phase 4 — LoadMaterialInterfaceByPath / LoadMICByPath / WalkToBaseMaterial
+        MCPScreenshotUtils.h/.cpp    # Phase 5 — viewport/PIE screenshot encode (PNG/JPG via FImageUtils)
   Content/Python/MCPTools/
     registry.py     # @tool decorator (with _internal=True filter); Phase 1 polish #12 wraps
                     # tool body with try/except → translates Python exceptions to JSON-RPC errors
@@ -155,6 +163,11 @@ UnrealMCPBridge/
     smoke_phase4_days_1_5.py     # Phase 4 — 6 bp.* read tools
     smoke_phase4_days_6_10.py    # Phase 4 — 6 bp.* writes + bp.compile + bp.compile_all_dirty
     smoke_phase4_days_11_15.py   # Phase 4 — 9 material.* tools (reads + MIC writes + create + diagnostic)
+    smoke_phase5.py              # Phase 5 wrapper — runs all 4 chunk sub-suites and aggregates
+    smoke_phase5_pie.py          # Phase 5 Chunk A — 10 pie.* tools
+    smoke_phase5_editor.py       # Phase 5 Chunk B — 10 editor.* + pie.screenshot_to_disk
+    smoke_phase5_chunk_c.py      # Phase 5 Chunk C — 5 tools (umg + niagara + physics)
+    smoke_phase5_sequencer.py    # Phase 5 Chunk D — 5 sequencer.* tools
     lane_b_spike.py              # Phase 2 Day 0 Lane B audit harness
 ```
 
@@ -592,6 +605,231 @@ FMaterialResource does not surface compile-time warnings separately).
 //                "duration_ms":12345.6}}}
 ```
 
+## Phase 5 tool catalogue (30 user-visible tools)
+
+Breakdown: **10 pie.*** + **9 editor.*** + **1 pie.screenshot_to_disk** (lives in EditorTools but
+exposed under pie.* for surface coherence) + **2 umg.*** + **1 niagara.*** + **2 physics.*** +
+**5 sequencer.*** = 30 user-visible tools. No new internal hidden handlers — Chunk D's
+``sequencer.list_cinematics`` does the AR enumeration inline via C++ rather than spawning a Python
+composite (asset count is bounded; the composite-async pattern doesn't apply).
+
+All 30 tools are **Lane A** (game thread). Chunks A/B/D are exclusively reads or simple
+mutations that finish in one tick. Phase 5 introduces a NEW PIE-guard polarity (the inverse of
+Phase 3's PIEActive guard).
+
+### Inverse PIE-guard pattern (NEW with Phase 5)
+
+Phase 3 mutators ban PIE: editor-world writes refuse with ``-32027 PIEActive`` when
+``GEditor->PlayWorld != nullptr``. Phase 5's ``pie.*`` family is the SYMMETRIC OPPOSITE: every
+``pie.*`` tool (except ``pie.start`` itself and the always-callable ``pie.is_running``) refuses
+with ``-32038 PIENotActive`` when no PIE is running. The frozen message text steers callers to
+``pie.start`` or the appropriate ``editor.*`` tool:
+
+```
+"PIE is not running; pie.start first (or use editor.* tools for editor-world ops)"
+```
+
+Smoke tests assert the substrings ``"PIE is not running"`` AND ``"pie.start"`` AND ``"editor.*"``.
+
+### Chunk A — PIE lifecycle + introspection (10 tools, all Lane A)
+
+```
+pie.start                  → {started, already_running}        always callable
+pie.stop                   → {stopped}                          PIE-required
+pie.pause                  → {paused, was_already_paused}       PIE-required
+pie.resume                 → {resumed}                          PIE-required
+pie.step_frame             → {stepped}                          PIE-required (paused only)
+pie.console_exec           → {executed, output: <string>}       PIE-required
+pie.is_running             → {running, paused, world_kind}      always callable (probe)
+pie.get_player_controller  → {pc_actor_guid, pc_path, ...}      PIE-required
+pie.get_pawn               → {pawn_actor_guid, pawn_path}       PIE-required
+pie.focus_actor            → {focused, actor_path}              PIE-required
+```
+
+``pie.console_exec`` uses ``FStringOutputDevice`` to capture ``World->Exec`` output. Many commands
+(``stat fps``, ``r.SetRes 1920x1080``) write to the HUD/viewport rather than the output device, so
+``output`` may be empty even on ``executed=true``. Surface as best-effort.
+
+``pie.focus_actor`` accepts both editor + PIE actor IDs; if the actor is in the PIE world and PIE
+is active it uses ``PC->SetViewTargetWithBlend``, else falls through to
+``GEditor->MoveViewportCamerasToActor``.
+
+### Chunk B — Editor utilities (9 editor.* + 1 pie.screenshot, all Lane A)
+
+```
+editor.viewport_screenshot          → {base64, width, height, format}     in-memory base64 PNG/JPG
+editor.viewport_screenshot_to_disk  → {path, bytes, width, height}        path-sandboxed disk write
+pie.screenshot_to_disk              → {path, bytes, width, height}        PIE-required (lives here for cohesion)
+editor.get_camera                   → {location, rotation, fov, ortho_width}
+editor.set_camera                   → {set: true}
+editor.get_selection                → {actors[], components[]}
+editor.set_selection                → {selected_count}                    capped at 200 (-32017)
+editor.show_message                 → {shown: true}                        FSlateNotificationManager toast
+editor.current_world                → {world_path, world_name, pie_active}
+editor.tick_once                    → {ticked: true}                       advanced — re-entrancy hazard
+```
+
+Screenshot family supports ``format`` ∈ {png, jpg} + ``quality`` ∈ [1, 100] (JPG only).
+Width/height clamped to [32, 2048]. Path-based outputs go through ``FMCPPathSandbox::Resolve`` →
+``-32013 PathEscape`` on whitelist miss. Default output path is
+``Saved/Screenshots/MCP/{timestamp}.{ext}``.
+
+``editor.set_selection`` enforces a hard cap of 200 actor IDs per call (matches the Phase 2
+``asset.batch_metadata`` precedent). Larger sets land as ``-32017 InputTooLarge``.
+
+``editor.tick_once`` is marked advanced — calling ``GEditor->Tick(DT, false)`` mid-dispatch can
+re-entrantly drain the Lane-A queue. Recommended for headless / scripted-test usage only.
+
+### Chunk C — UMG + Niagara + Physics (5 tools, all Lane A, all reads)
+
+```
+umg.list_widgets         → {widgets[{name, class, parent, is_variable}]}     editor-only WBP walk
+umg.get_widget_property  → {value, type}                                       CDO-scoped (design-time)
+niagara.list_parameters  → {user_params[], system_params[], emitter_params[]}  decoded user defaults
+physics.line_trace       → {world, world_kind, ignored_count, hit, hits[]}    Chaos line trace
+physics.sweep_capsule    → {world, world_kind, ignored_count, hit, hits[]}    Chaos capsule sweep
+```
+
+``umg.list_widgets`` walks the editor-only ``UWidgetBlueprint::WidgetTree`` via ``ForEachWidget``
+(stops at foreign widget-tree boundaries — matches the editor's Widget Hierarchy panel). Each
+entry: ``name`` (UWidget::GetName), ``class`` (UClass path), ``parent`` (parent's name or null
+for root), ``is_variable`` (UWidget::bIsVariable). Root widget has ``parent=null``.
+
+``umg.get_widget_property`` is **CDO-scoped** — returns design-time defaults, NOT runtime instance
+state. After resolving the widget by name it delegates to
+``FMCPReflection::ResolvePropertyPath`` + ``ReadPropertyValueAt`` (same pipeline as
+``marshall.read_property`` / ``actor.get_property``). Widget-not-found → ``-32039 WidgetNotFound``
+(message embeds up to 16 top-level widget names for typo recovery).
+
+``niagara.list_parameters`` decodes **user** parameter binary values (float/int/bool/Vec2/Vec3/
+Vec4/Quat/LinearColor/Position); ``system_params`` and ``emitter_params`` emit name+type only.
+Unsupported value types emit a typed sentinel string ``"<unsupported: <typename>>"`` (never null).
+
+``physics.line_trace`` and ``physics.sweep_capsule`` operate on the UE **Chaos** system (NOT Jolt/
+Barrage). Flecs/Barrage entities (FatumGame projectiles, ISM-rendered items) are INVISIBLE to
+these traces. A future ``flecs.*`` trace family is reserved for Jolt queries (e.g. wrapping
+``UFlecsArtillerySubsystem::CastRayAllHits`` from the Barrage plugin). PIE world takes precedence
+over the editor world when both are available — response ``world`` field surfaces which.
+
+Collision channels accepted: Visibility (default), Camera, WorldStatic, WorldDynamic, Pawn,
+PhysicsBody, Vehicle, Destructible. Unknown channel → ``-32041 InvalidCollisionChannel`` with the
+accepted-list hint in the message body. ``ignore_actors`` array is best-effort — unresolved
+entries are SKIPPED with a Verbose log (NOT a hard error).
+
+### Chunk D — Sequencer (5 tools, all Lane A, all reads)
+
+```
+sequencer.list_cinematics   → {sequences[{path, name, duration_secs, frame_rate}]}     /Game default scope
+sequencer.get_tracks        → {master_tracks[], possessables[], spawnables[]}          MovieScene walk
+sequencer.get_camera_cuts   → {cuts[{start_frame, end_frame, camera_binding}], frame_rate}
+sequencer.get_keyframes     → {keys[{channel, time, value, interp}], section_range, frame_rate, supported_types}
+sequencer.get_current_time  → {time_seconds, frame, tick, frame_rate, tick_rate, sequence_path, world}
+```
+
+``sequencer.list_cinematics`` iterates ``ULevelSequence`` assets via FARFilter restricted to the
+``LevelSequence.LevelSequence`` class path. Each entry loads the asset to read
+``MovieScene->GetPlaybackRange()`` + ``GetDisplayRate()`` for duration/rate. Cold-loaded sequences
+are loaded on first query (intentional — cinematic counts are bounded by content scope, O(10-100)
+typically). The plan-mandated default scope is ``["/Game"]``.
+
+``sequencer.get_tracks`` splits the MovieScene's tracks across three arrays:
+  - ``master_tracks`` — top-level tracks NOT bound to an object (camera cuts, audio, fade, sub-
+    sequences). The ``CameraCutTrack`` is folded in here even though UE stores it in its own slot
+    (``GetCameraCutTrack()``) — surface coherence wins over the underlying storage layout.
+  - ``possessables`` — name+object_class+binding_guid plus a nested ``tracks`` array per binding.
+  - ``spawnables`` — same shape as possessables but for spawnable bindings (objects the sequence
+    creates rather than possesses).
+
+``sequencer.get_keyframes`` uses a dotted ``track_path``: ``"MasterName.SectionIdx"`` or
+``"BindingName.TrackName.SectionIdx"``. Channel value decoding covers **float, double, bool,
+integer** (Phase 5 D1 scope; matches plan §F-Sequencer L1287). Other channel types (event, byte,
+object, string, sub-section, blendable transform) emit a sentinel ``{channel, time:0, value:null,
+interp:"auto"}`` entry per channel so the wire schema stays uniform — the ``supported_types`` array
+in the response declares which value-types ARE decoded. Per-key ``interp`` is one of
+``linear|constant|cubic|auto``.
+
+``sequencer.get_current_time`` reads the active editor Sequencer playhead via
+``ULevelSequenceEditorBlueprintLibrary::GetCurrentLevelSequence`` + ``GetGlobalPosition``. Returns
+``time_seconds`` (continuous), ``frame`` (display rate), AND ``tick`` (tick resolution) so callers
+don't need to round-trip the conversion. ``world`` is ``"pie"`` or ``"editor"`` reflecting
+``IsPIEActive()`` at call time. When no Sequencer tab is open OR the active sequence is not a
+``ULevelSequence`` → ``-32042 NoActiveSequencer``.
+
+All ``time`` / ``frame`` fields in Sequencer results are emitted in TICKS at the MovieScene's
+``GetTickResolution()`` — the embedded ``frame_rate`` / ``tick_rate`` objects carry rational
+``{numerator, denominator, decimal}`` so callers can convert exactly to seconds OR to display-rate
+frames.
+
+### Phase 5 error codes (-32038..-32044)
+
+7 new error codes were added in Phase 5:
+
+```
+-32038 PIENotActive             pie.* tool called outside PIE; frozen message points at pie.start / editor.*
+-32039 WidgetNotFound            umg.get_widget_property — widget_name not found in WidgetTree; hint embeds names
+-32040 NiagaraParameterNotFound  RESERVED — reserved for future niagara.set_user_param (Phase 6+)
+-32041 InvalidCollisionChannel   physics.* — channel string didn't map to ECollisionChannel; accepted-list hint
+-32042 NoActiveSequencer         sequencer.get_current_time — no Sequencer tab open OR non-LevelSequence active
+-32043 TrackNotFound             sequencer.get_keyframes — track_path didn't resolve to a track
+-32044 SectionIndexOOB           sequencer.get_keyframes — section index segment exceeds GetAllSections().Num()
+```
+
+The `-32038 PIENotActive` message is **frozen** verbatim (kMCPMessagePIENotActive) — smoke tests
+assert substrings ``"PIE is not running"``, ``"pie.start"``, ``"editor.*"``. Mirror of Phase 3's
+frozen ``kMCPMessagePIEActive`` text.
+
+### Phase 5 example: PIE start + step + screenshot + stop
+
+```jsonc
+// 1. Lifecycle
+{"id":"p1","kind":"call_function","method":"pie.start", "args":{"mode":"selected_viewport"}}
+// → {"ok":true, "result":{"started":true, "already_running":false}}
+
+{"id":"p2","kind":"call_function","method":"pie.pause", "args":{}}
+// → {"ok":true, "result":{"paused":true, "was_already_paused":false}}
+
+{"id":"p3","kind":"call_function","method":"pie.step_frame", "args":{}}
+// → {"ok":true, "result":{"stepped":true}}
+
+// 2. Screenshot the paused frame
+{"id":"p4","kind":"call_function","method":"pie.screenshot_to_disk", "args":{"width":640, "height":360}}
+// → {"ok":true, "result":{"path":".../Saved/Screenshots/MCP/...png", "bytes":12345, "width":640, "height":360}}
+
+// 3. Console command (output may be empty for HUD-only commands)
+{"id":"p5","kind":"call_function","method":"pie.console_exec", "args":{"command":"stat fps"}}
+// → {"ok":true, "result":{"executed":true, "output":""}}
+
+{"id":"p6","kind":"call_function","method":"pie.stop", "args":{}}
+// → {"ok":true, "result":{"stopped":true}}
+```
+
+### Phase 5 example: Sequencer keyframe inspection
+
+```jsonc
+// 1. Find cinematics
+{"id":"s1","kind":"call_function","method":"sequencer.list_cinematics", "args":{"scope_paths":["/Game/Cinematics"]}}
+// → {"ok":true, "result":{"sequences":[{"path":"/Game/Cinematics/LS_Intro", "name":"LS_Intro",
+//                                        "duration_secs":12.5,
+//                                        "frame_rate":{"numerator":30, "denominator":1, "decimal":30.0}}]}}
+
+// 2. Enumerate tracks
+{"id":"s2","kind":"call_function","method":"sequencer.get_tracks", "args":{"sequence_path":"/Game/Cinematics/LS_Intro"}}
+// → {"ok":true, "result":{"master_tracks":[{"name":"CameraCutTrack", "class":"/Script/...", "section_count":2}],
+//                          "possessables":[{"name":"HeroActor", "binding_guid":"...",
+//                                            "tracks":[{"name":"Transform", "class":"/Script/MovieSceneTracks.MovieScene3DTransformTrack",
+//                                                       "section_count":1}]}],
+//                          "spawnables":[]}}
+
+// 3. Read keyframes from the transform track
+{"id":"s3","kind":"call_function","method":"sequencer.get_keyframes",
+ "args":{"sequence_path":"/Game/Cinematics/LS_Intro", "track_path":"HeroActor.Transform.0"}}
+// → {"ok":true, "result":{"keys":[{"channel":"Location.X", "time":0, "value":0.0, "interp":"cubic"},
+//                                   {"channel":"Location.X", "time":24000, "value":100.0, "interp":"cubic"}, ...],
+//                          "section_range":{"has_lower":true, "has_upper":true, "start":0, "end":300000},
+//                          "frame_rate":{"numerator":24000, "denominator":1, "decimal":24000.0},
+//                          "supported_types":["float", "double", "bool", "integer"]}}
+```
+
 ## Common patterns
 
 ### `cb.move_with_redirector_cleanup` (2-line recipe — no separate tool)
@@ -719,6 +957,11 @@ listener up (loopback port 30020 by default).
 | `smoke_phase4_days_1_5.py` | 14 | Phase 4 Days 1-5 — 6 `bp.*` read tools (exists/list/get) + pagination |
 | `smoke_phase4_days_6_10.py` | 19 | Phase 4 Days 6-10 — 6 `bp.*` writes + `bp.compile` + `bp.compile_all_dirty` |
 | `smoke_phase4_days_11_15.py` | 17 | Phase 4 Days 11-15 — 9 `material.*` tools (reads + MIC writes + create + diagnostic + boundary) |
+| `smoke_phase5.py` | **wrapper** | Runs all 4 Phase 5 chunk sub-suites below and aggregates pass/fail |
+| `smoke_phase5_pie.py` | 16+ | Phase 5 Chunk A — 10 `pie.*` tools (lifecycle + introspection + actor identity + PIE-required guard) |
+| `smoke_phase5_editor.py` | 13 | Phase 5 Chunk B — 10 `editor.*` + `pie.screenshot_to_disk` |
+| `smoke_phase5_chunk_c.py` | 11 | Phase 5 Chunk C — 5 tools (`umg.*` + `niagara.list_parameters` + `physics.*`) |
+| `smoke_phase5_sequencer.py` | 10 | Phase 5 Chunk D — 5 `sequencer.*` tools (list + tracks + cuts + keyframes + current_time) |
 
 Run a specific phase:
 ```
