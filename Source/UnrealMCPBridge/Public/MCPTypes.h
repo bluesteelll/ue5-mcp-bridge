@@ -18,6 +18,23 @@ inline constexpr int32 kMCPDefaultPort = 30020;
 inline constexpr int32 kMCPFrameMaxBytes = 64 * 1024 * 1024;
 
 /**
+ * Server-defined error codes (JSON-RPC -32000..-32099 range). Day 4-5 marshalling layer adds 4
+ * codes around generic property reflection — kept here so Python tools and tests can refer to the
+ * same numeric constants. Mirrored in `MCPTools/marshall.py` constants where appropriate.
+ *
+ *   -32004 ObjectNotFound         LoadObject(path) returned null
+ *   -32005 PropertyNotFound       FindPropertyByName on a path segment failed
+ *   -32006 PropertyTypeMismatch   Property exists but cast (e.g. expected FStructProperty) failed
+ *                                 OR ImportText_Direct could not parse the supplied JSON value
+ *   -32007 PropertyAccessDenied   Property hit a CPF_EditorOnly / CPF_BlueprintReadOnly guard at
+ *                                 runtime (write-side only)
+ */
+inline constexpr int32 kMCPErrorObjectNotFound       = -32004;
+inline constexpr int32 kMCPErrorPropertyNotFound     = -32005;
+inline constexpr int32 kMCPErrorPropertyTypeMismatch = -32006;
+inline constexpr int32 kMCPErrorPropertyAccessDenied = -32007;
+
+/**
  * Distinguishes the high-level kind of a wire request.
  *
  * Phase 1 baseline — values map 1:1 to the protocol verbs described in the

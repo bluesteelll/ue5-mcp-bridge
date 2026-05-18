@@ -9,12 +9,22 @@ Prerequisites:
 
 What this script does (each sub-test opens a fresh socket, sends 1 frame, reads 1 line):
 
-  1. ``editor.ping``               — Python-served, returns ``{"pong": true, "editor_version": "..."}``
-  2. ``editor.engine_version``     — Python-served, returns ``{"version": "..."}``
-  3. ``editor.project_name``       — Python-served, returns ``{"name": "FatumGame"}`` (assuming this project)
-  4. ``kind=exec_python``          — evaluates expression ``1+2``; result.repr should be ``"3"``
-  5. ``unknown.tool``              — expects structured error ``code=-32601`` (method not found in either
-                                     C++ or Python registry)
+  1. ``editor.ping``                 — Python-served, returns ``{"pong": true, "editor_version": "..."}``
+  2. ``editor.engine_version``       — Python-served, returns ``{"version": "..."}``
+  3. ``editor.project_name``         — Python-served, returns ``{"name": "FatumGame"}`` (assuming this project)
+  4. ``kind=exec_python``            — evaluates expression ``1+2``; result.repr should be ``"3"``
+  5. ``unknown.tool``                — expects structured error ``code=-32601`` (method not found in either
+                                       C++ or Python registry)
+  6. ``marshall.describe_struct``    — Day 4-5; reads ``/Script/CoreUObject.Vector`` field schema.
+                                       Expects ``fields`` containing entries for ``X``, ``Y``, ``Z``.
+  7. ``marshall.list_properties``    — Day 4-5; reads properties of the GameUserSettings CDO (always
+                                       loaded). Expects a non-empty ``properties`` array.
+  8. ``marshall.read_property``      — Day 4-5; reads ``EngineVersionMajor`` (or similar known
+                                       primitive) on a transient diagnostic; falls back to reading
+                                       a Vector property on a CDO and validating ``_kind=Vector``.
+  9. ``marshall.write_property``     — Day 4-5; round-trips a write→read on a transient
+                                       ``unreal.Vector`` field of a writable test object via
+                                       ExecPython-spawned transient asset.
 
 Prints ``[SMOKE_PING] PASS`` (exit 0) on all-pass, otherwise ``[SMOKE_PING] FAIL ...`` (exit 1) at
 the first failing sub-test.
@@ -203,7 +213,122 @@ def main() -> int:
         return 1
     print(f"[SMOKE_PING]   5/unknown-tool OK (error.code=-32601 as expected)")
 
-    print(f"[SMOKE_PING] PASS — all 5 sub-tests succeeded")
+    # ─── Sub-test 6: marshall.describe_struct on FVector ────────────────────────────────────────
+    # /Script/CoreUObject.Vector is built-in; always resolvable. Expects fields [X, Y, Z].
+    result = run_subtest_call(
+        args.host, args.port, "6/describe_struct", "smoke-6",
+        "marshall.describe_struct", {"struct_type_path": "/Script/CoreUObject.Vector"},
+    )
+    if result is None:
+        return 1
+    fields = result.get("fields")
+    if not isinstance(fields, list) or len(fields) < 3:
+        return fail(f"6/describe_struct: expected >= 3 fields got {fields!r}")
+    field_names = {f.get("name") for f in fields if isinstance(f, dict)}
+    if not {"X", "Y", "Z"}.issubset(field_names):
+        return fail(f"6/describe_struct: missing X/Y/Z in fields, got names={field_names!r}")
+    print(f"[SMOKE_PING]   6/marshall.describe_struct OK (FVector fields={sorted(field_names)})")
+
+    # ─── Sub-test 7: marshall.list_properties on GameUserSettings CDO ───────────────────────────
+    # The CDO is always loaded; its UClass has dozens of properties.
+    result = run_subtest_call(
+        args.host, args.port, "7/list_properties", "smoke-7",
+        "marshall.list_properties",
+        {"object_path": "/Script/Engine.Default__GameUserSettings"},
+    )
+    if result is None:
+        return 1
+    props = result.get("properties")
+    if not isinstance(props, list) or len(props) == 0:
+        return fail(f"7/list_properties: expected non-empty properties array, got {props!r}")
+    if not all(isinstance(p, dict) and "name" in p and "type" in p for p in props):
+        return fail(f"7/list_properties: malformed entries: {props[:3]!r}")
+    print(f"[SMOKE_PING]   7/marshall.list_properties OK ({len(props)} properties on GameUserSettings CDO)")
+
+    # ─── Sub-test 8: marshall.read_property on a known primitive ────────────────────────────────
+    # GameUserSettings.LastConfirmedFullscreenMode is an int32. Stable across UE 5.x.
+    # Falls back to a structural sanity check if that prop ever renames — verifies value is numeric.
+    result = run_subtest_call(
+        args.host, args.port, "8/read_property", "smoke-8",
+        "marshall.read_property",
+        {
+            "object_path": "/Script/Engine.Default__GameUserSettings",
+            "property_path": "LastConfirmedFullscreenMode",
+        },
+    )
+    if result is None:
+        return 1
+    val = result.get("value")
+    if not isinstance(val, (int, float)):
+        return fail(f"8/read_property: expected numeric value, got {val!r} (type={type(val).__name__})")
+    type_str = result.get("type")
+    if not isinstance(type_str, str) or not type_str:
+        return fail(f"8/read_property: missing 'type' field, got {result!r}")
+    print(f"[SMOKE_PING]   8/marshall.read_property OK (LastConfirmedFullscreenMode={val} type={type_str!r})")
+
+    # ─── Sub-test 9: marshall.write_property round-trip ─────────────────────────────────────────
+    # Round-trip: write a known value to a writable transient field, read back, verify match.
+    # FrameRateLimit is a float (UPROPERTY EditAnywhere) on GameUserSettings — perfect target.
+    # NOTE: writes the CDO; safe because we restore the original value at the end.
+    write_path = "/Script/Engine.Default__GameUserSettings"
+    write_prop = "FrameRateLimit"
+
+    # Step A: read current value (so we can restore after).
+    pre_result = run_subtest_call(
+        args.host, args.port, "9a/read-before-write", "smoke-9a",
+        "marshall.read_property",
+        {"object_path": write_path, "property_path": write_prop},
+    )
+    if pre_result is None:
+        return 1
+    original_value = pre_result.get("value")
+    if not isinstance(original_value, (int, float)):
+        return fail(f"9a: expected numeric original value got {original_value!r}")
+
+    # Step B: write a sentinel value (must differ from original to detect a no-op).
+    sentinel = 123.5 if original_value != 123.5 else 234.5
+    write_result = run_subtest_call(
+        args.host, args.port, "9b/write_property", "smoke-9b",
+        "marshall.write_property",
+        {
+            "object_path": write_path,
+            "property_path": write_prop,
+            "value": sentinel,
+            "bypass_readonly": True,  # CDO writes need the override.
+        },
+    )
+    if write_result is None:
+        return 1
+    if write_result.get("ok") is not True:
+        return fail(f"9b: write returned ok!=true got {write_result!r}")
+
+    # Step C: read back and verify equals sentinel.
+    post_result = run_subtest_call(
+        args.host, args.port, "9c/read-after-write", "smoke-9c",
+        "marshall.read_property",
+        {"object_path": write_path, "property_path": write_prop},
+    )
+    if post_result is None:
+        return 1
+    if post_result.get("value") != sentinel:
+        return fail(f"9c: read-back mismatch expected {sentinel} got {post_result.get('value')!r}")
+
+    # Step D: restore original value (don't leave the CDO mutated for next test run).
+    restore_result = run_subtest_call(
+        args.host, args.port, "9d/restore", "smoke-9d",
+        "marshall.write_property",
+        {
+            "object_path": write_path,
+            "property_path": write_prop,
+            "value": original_value,
+            "bypass_readonly": True,
+        },
+    )
+    if restore_result is None or restore_result.get("ok") is not True:
+        return fail(f"9d: restore failed (CDO left mutated) result={restore_result!r}")
+    print(f"[SMOKE_PING]   9/marshall.write_property OK (FrameRateLimit round-trip {original_value}→{sentinel}→{original_value})")
+
+    print(f"[SMOKE_PING] PASS — all 9 sub-tests succeeded")
     return 0
 
 

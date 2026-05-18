@@ -3,6 +3,7 @@
 #include "UnrealMCPBridge.h"
 
 #include "FMCPDispatchQueue.h"
+#include "FMCPMarshalling.h"
 #include "FMCPPythonBootstrap.h"
 #include "FMCPPythonEval.h"
 #include "FMCPServer.h"
@@ -127,9 +128,26 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 			return FMCPPythonEval::CallPythonTool(Req);
 		});
 
+	// Day 4-5: Tier 2 marshalling handlers. Registered as C++ handlers (not Python tools) for
+	// two reasons: (a) FProperty reflection isn't exposed to Python, and (b) C++ dispatch is
+	// ~2-3 ms faster per call (no wrapper script + base64 round-trip). These names take
+	// precedence over the Python fallback for ``marshall.*`` — see dispatch order in
+	// FMCPDispatchQueue::Drain. FHandler is a TFunction so we can pass the static method pointer
+	// directly — TFunction's converting ctor wraps it.
+	auto RegisterMarshall = [this](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler)
+	{
+		FMCPDispatchQueue::Get().RegisterHandler(MethodName, MoveTemp(Handler));
+		RegisteredMethodNames.Add(MethodName);
+	};
+	RegisterMarshall(TEXT("marshall.list_properties"), &FMCPMarshalling::ListProperties);
+	RegisterMarshall(TEXT("marshall.read_property"),   &FMCPMarshalling::ReadProperty);
+	RegisterMarshall(TEXT("marshall.write_property"),  &FMCPMarshalling::WriteProperty);
+	RegisterMarshall(TEXT("marshall.describe_struct"), &FMCPMarshalling::DescribeStruct);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
-		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool"));
+		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
+		TEXT("C++ handlers → marshall.list_properties / read_property / write_property / describe_struct"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

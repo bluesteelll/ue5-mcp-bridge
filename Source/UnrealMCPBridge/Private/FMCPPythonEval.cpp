@@ -233,9 +233,13 @@ FMCPResponse FMCPPythonEval::CallPythonTool(const FMCPRequest& Request)
 
 	// Build the wrapper script. EXECUTE_FILE mode supports multi-statement bodies. The script:
 	//   1. base64-decodes method + args from the embedded literals,
-	//   2. looks the tool up in the registry,
-	//   3. calls it (catching exceptions) and serialises the result via json.dumps,
-	//   4. emits __MCP_RESULT_START__<json>__MCP_RESULT_END__ via unreal.log so we can scrape it
+	//   2. passes args through MCPTools.marshall.json_to_py (Day 4-5: discriminator-driven
+	//      coercion of {"_kind":"Vector",...} → unreal.Vector etc.),
+	//   3. looks the tool up in the registry,
+	//   4. calls it (catching exceptions),
+	//   5. passes the result through MCPTools.marshall.py_to_json so tools can freely return
+	//      unreal.Vector / Rotator / Object / etc. without manual conversion,
+	//   6. emits __MCP_RESULT_START__<json>__MCP_RESULT_END__ via unreal.log so we can scrape it
 	//      from FPythonCommandEx::LogOutput on the C++ side.
 	//
 	// NOTE: the markers MUST appear in a SINGLE unreal.log call so they land in one LogOutput
@@ -253,10 +257,12 @@ FMCPResponse FMCPPythonEval::CallPythonTool(const FMCPRequest& Request)
 		TEXT("import base64, json, traceback\n")
 		TEXT("import unreal\n")
 		TEXT("from MCPTools.registry import get_tool\n")
+		TEXT("from MCPTools import marshall as _marshall\n")
 		TEXT("_method = base64.b64decode('%s').decode('utf-8')\n")
 		TEXT("_args_json = base64.b64decode('%s').decode('utf-8')\n")
 		TEXT("try:\n")
-		TEXT("    _args = json.loads(_args_json) if _args_json else {}\n")
+		TEXT("    _raw_args = json.loads(_args_json) if _args_json else {}\n")
+		TEXT("    _args = _marshall.json_to_py(_raw_args)\n")
 		TEXT("except Exception as _e:\n")
 		TEXT("    _payload = {'_mcp_error': {'code': %d, 'message': 'invalid params json: ' + str(_e)}}\n")
 		TEXT("else:\n")
@@ -266,7 +272,8 @@ FMCPResponse FMCPPythonEval::CallPythonTool(const FMCPRequest& Request)
 		TEXT("    else:\n")
 		TEXT("        try:\n")
 		TEXT("            _result = _tool['fn'](_args)\n")
-		TEXT("            _payload = {'_mcp_ok': _result}\n")
+		TEXT("            _result_json = _marshall.py_to_json(_result)\n")
+		TEXT("            _payload = {'_mcp_ok': _result_json}\n")
 		TEXT("        except Exception as _e:\n")
 		TEXT("            _payload = {'_mcp_error': {'code': %d, 'message': str(_e), 'traceback': traceback.format_exc()}}\n")
 		TEXT("unreal.log('%s' + json.dumps(_payload) + '%s')\n"),
