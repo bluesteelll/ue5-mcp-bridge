@@ -43,6 +43,13 @@ public class UnrealMCPBridge : ModuleRules
 				"Networking",
 				"Projects",
 				"PythonScriptPlugin",
+				// Phase 2 — Assets + Content Browser surface.
+				"AssetRegistry",            // IAssetRegistry::Get, FARFilter, FAssetData, GetReferencers/GetDependencies
+				"AssetTools",               // IAssetTools::ImportAssetTasks, FixupReferencers, RenameAssets
+				"ContentBrowser",           // IContentBrowserSingleton (folder ops + future sync)
+				"ContentBrowserData",       // FContentBrowserDataFilter (folder enumeration, used by cb.list_folders via IAR)
+				"EditorScriptingUtilities", // UEditorAssetSubsystem (LoadAsset, DoesAssetExist, DeleteAsset, SaveAsset, etc.)
+				"ImageWrapper",             // FImageUtils::CompressImageArray for thumbnail PNG encoding
 			}
 		);
 	}

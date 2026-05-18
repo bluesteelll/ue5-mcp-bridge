@@ -153,10 +153,9 @@ LANE_B_CANDIDATES: list[tuple[str, "ArgsFactory"]] = [
         "page_size": 5,
     }),
     ("asset.search_by_name", lambda i: {
-        "name_substring": "Test",
+        "name_pattern": "Test",
         "page_size": 5,
     }),
-    ("asset.metadata", lambda i: {"path": "/Game/Maps/Tutorial"}),  # second pass distinct args
     ("asset.get_class_hierarchy", lambda i: {"path": "/Game/Maps/Tutorial"}),
     ("asset.get_outermost_package", lambda i: {"path": "/Game/Maps/Tutorial"}),
     ("cb.list_folders", lambda i: {

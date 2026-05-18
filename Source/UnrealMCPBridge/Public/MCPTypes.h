@@ -35,6 +35,40 @@ inline constexpr int32 kMCPErrorPropertyTypeMismatch = -32006;
 inline constexpr int32 kMCPErrorPropertyAccessDenied = -32007;
 
 /**
+ * Phase 2 — Assets + Content Browser surface (30 tools across `asset.*` / `cb.*`).
+ *
+ *   -32010 InvalidPath            Path is empty, contains backslashes, contains `..`, OR is not a
+ *                                 recognized mount point (/Game//Engine//Plugins/<name>//Script/...).
+ *                                 Used by every tool that takes an asset/folder path argument.
+ *   -32011 WrongClass             Provided class_path doesn't resolve to a UClass. Used by
+ *                                 asset.search_by_class.
+ *   -32012 OverlyBroadQuery       Caller asked for a recursive /Game scan with no narrowing filters
+ *                                 (asset.list / asset.search_by_class) OR exceeded the 500-redirector
+ *                                 hard cap (cb.fix_redirectors) OR exceeded the 10k visited-set in
+ *                                 the recursive ref/dep walk OR exceeded the 5000-asset hard cap on
+ *                                 asset.find_unused / asset.find_broken_references / asset._size_report_internal.
+ *   -32013 PathEscape             Disk path argument (cb.export dest_file, cb.import source_file,
+ *                                 asset.get_thumbnail_to_disk output_path) resolves outside the
+ *                                 sandbox whitelist (project / saved / intermediate / engine).
+ *   -32014 PathInUse              cb.rename / cb.duplicate target path already exists.
+ *   -32015 StaleCursor            asset.list / asset.find_references / asset.find_dependents /
+ *                                 asset.search_by_* page_token's embedded filter_hash doesn't match
+ *                                 the current call's filter — caller changed the filter mid-pagination.
+ *   -32016 JobSubmitFailed        FMCPJobRegistry::SubmitJob failed (registry not initialized).
+ *                                 Used by cb.save_all_dirty, cb.bulk_import, asset.batch_metadata_async.
+ *   -32017 InputTooLarge          paths array exceeds the synchronous-batch limit (asset.batch_metadata
+ *                                 cap = 200).
+ */
+inline constexpr int32 kMCPErrorInvalidPath          = -32010;
+inline constexpr int32 kMCPErrorWrongClass           = -32011;
+inline constexpr int32 kMCPErrorOverlyBroadQuery     = -32012;
+inline constexpr int32 kMCPErrorPathEscape           = -32013;
+inline constexpr int32 kMCPErrorPathInUse            = -32014;
+inline constexpr int32 kMCPErrorStaleCursor          = -32015;
+inline constexpr int32 kMCPErrorJobSubmitFailed      = -32016;
+inline constexpr int32 kMCPErrorInputTooLarge        = -32017;
+
+/**
  * Distinguishes the high-level kind of a wire request.
  *
  * Phase 1 baseline — values map 1:1 to the protocol verbs described in the

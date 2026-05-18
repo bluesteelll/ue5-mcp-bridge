@@ -28,6 +28,10 @@
 			"Enabled": true
 		},
 		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		},
+		{
 			"Name": "RemoteControl",
 			"Enabled": true,
 			"Optional": true
