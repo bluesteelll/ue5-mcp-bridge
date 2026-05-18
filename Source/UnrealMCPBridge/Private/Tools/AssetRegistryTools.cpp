@@ -13,8 +13,15 @@
 #include "AssetRegistry/AssetIdentifier.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "ImageUtils.h"
 #include "Misc/AssetRegistryInterface.h"
+#include "Misc/Base64.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Guid.h"
+#include "Misc/ObjectThumbnail.h"
+#include "ObjectTools.h"
 #include "UObject/Class.h"
+#include "Utils/MCPPathSandbox.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "HAL/FileManager.h"
@@ -1068,13 +1075,249 @@ FMCPResponse Tool_AssetSearchByName(const FMCPRequest& Request)
 	return AR_BuildPaginatedResponse(Request, TEXT("matches"), Page, Matches.Num(), NextSentinel,
 		FilterHash, /*bIncludeTags*/ false, /*bIncludeColdCacheFlag*/ false);
 }
+// ─── Thumbnail rendering helpers (shared by both tools) ──────────────────────────────────────
+namespace
+{
+	/**
+	 * Render the thumbnail for ``Path`` at the requested size; return the raw RGBA8 image plus
+	 * dimensions plus an "is_class_generic" hint. On total failure (no asset, no class-generic
+	 * fallback) returns false with OutError populated.
+	 *
+	 * MUST RUN ON GAME THREAD — ThumbnailTools::RenderThumbnail enqueues to the render thread.
+	 *
+	 * @param OutImageRGBA8     Raw RGBA8 byte array (Width*Height*4 bytes).
+	 * @param OutWidth/OutHeight Image dimensions (typically == requested Size, may be smaller).
+	 * @param bOutIsClassGeneric True if the result is the class-default icon rather than an
+	 *                           asset-specific render.
+	 */
+	bool AR_RenderAssetThumbnail(
+		const FString& NormalizedPath, int32 Size,
+		TArray<uint8>& OutImageRGBA8, int32& OutWidth, int32& OutHeight,
+		bool& bOutIsClassGeneric, FString& OutError)
+	{
+		OutError.Reset();
+		OutImageRGBA8.Reset();
+		OutWidth = 0;
+		OutHeight = 0;
+		bOutIsClassGeneric = false;
+
+		// Resolve to UObject*. Thumbnail rendering needs the actual instance. This DOES load the
+		// asset — by design (a thumbnail of an unloaded asset would have no content to render).
+		const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(NormalizedPath);
+		UObject* Asset = nullptr;
+		// First try FindObject for already-loaded assets (cheap). If miss, fall back to LoadObject.
+		Asset = FindObject<UObject>(nullptr, *ObjectPath);
+		if (Asset == nullptr)
+		{
+			Asset = LoadObject<UObject>(nullptr, *ObjectPath);
+		}
+		if (Asset == nullptr)
+		{
+			OutError = FString::Printf(TEXT("could not load object '%s'"), *ObjectPath);
+			return false;
+		}
+
+		FObjectThumbnail RenderedThumbnail;
+		ThumbnailTools::RenderThumbnail(Asset, Size, Size,
+			ThumbnailTools::EThumbnailTextureFlushMode::AlwaysFlush,
+			/*InRenderTargetResource*/ nullptr,
+			&RenderedThumbnail);
+
+		if (RenderedThumbnail.IsEmpty() || !RenderedThumbnail.HasValidImageData())
+		{
+			// No specific renderer + no class-generic fallback obtainable.
+			OutError = FString::Printf(TEXT("RenderThumbnail returned empty result for '%s'"), *ObjectPath);
+			return false;
+		}
+
+		// Heuristic for class-generic detection: a class-generic icon for assets without their
+		// own renderer is conventionally returned at the requested size but with a uniform
+		// content pattern. We can't easily distinguish from the bitmap alone — instead we
+		// inspect whether the asset class has a registered specific renderer via
+		// IThumbnailManager. A simpler proxy: if RenderThumbnail had to fall back to its
+		// generic path the OBJECT thumbnail won't be cached. We surface bOutIsClassGeneric as
+		// "best-effort false" — clients that need a reliable signal should call
+		// asset.get_class_hierarchy and check whether the leaf class has a thumbnail renderer.
+		bOutIsClassGeneric = false;
+
+		OutImageRGBA8 = RenderedThumbnail.GetUncompressedImageData();
+		OutWidth = RenderedThumbnail.GetImageWidth();
+		OutHeight = RenderedThumbnail.GetImageHeight();
+		return true;
+	}
+
+	/**
+	 * Convert raw RGBA8 bytes to a PNG byte array via FImageUtils::PNGCompressImageArray.
+	 * Input MUST be Width*Height*4 bytes (BGRA8 actually — UE stores thumbnails in B,G,R,A order
+	 * but the helper treats them as FColor which is uint32 in the same order).
+	 */
+	bool AR_EncodePNG(const TArray<uint8>& RGBA8, int32 Width, int32 Height, TArray64<uint8>& OutPNGBytes)
+	{
+		if (RGBA8.Num() != Width * Height * 4) { return false; }
+		const TArrayView64<const FColor> ColorView(
+			reinterpret_cast<const FColor*>(RGBA8.GetData()),
+			static_cast<int64>(Width) * static_cast<int64>(Height));
+		FImageUtils::PNGCompressImageArray(Width, Height, ColorView, OutPNGBytes);
+		return OutPNGBytes.Num() > 0;
+	}
+}
+
+// ─── asset.get_thumbnail (in-memory base64, capped at 256×256) ──────────────────────────────
 FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.get_thumbnail — Day 5 stub"));
+	FString NormalizedPath;
+	FMCPResponse Err;
+	if (!AR_RequirePath(Request, NormalizedPath, Err)) { return Err; }
+
+	FAssetData Data;
+	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
+	{
+		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
+	}
+
+	int32 Size = 128;
+	Request.Args->TryGetNumberField(TEXT("size"), Size);
+	if (Size < 16 || Size > 256)
+	{
+		// Cap is 256 per D6 — larger requests get the disk-tier tool.
+		return AR_MakeError(Request, kARErrorInvalidParams,
+			FString::Printf(TEXT("size %d outside [16, 256] — use asset.get_thumbnail_to_disk "
+				"for larger sizes (max 2048)"), Size));
+	}
+
+	TArray<uint8> RGBA8;
+	int32 Width = 0, Height = 0;
+	bool bIsClassGeneric = false;
+	FString RenderErr;
+	if (!AR_RenderAssetThumbnail(NormalizedPath, Size, RGBA8, Width, Height, bIsClassGeneric, RenderErr))
+	{
+		// Hard failure per the spec — no asset-specific bitmap AND no class-generic fallback.
+		return AR_MakeError(Request, -32000, // THUMBNAIL_RENDER_FAILED (no dedicated code; -32000 reserved)
+			FString::Printf(TEXT("thumbnail render failed: %s"), *RenderErr));
+	}
+
+	TArray64<uint8> PNGBytes;
+	if (!AR_EncodePNG(RGBA8, Width, Height, PNGBytes))
+	{
+		return AR_MakeError(Request, -32000,
+			TEXT("PNG encode failed (unexpected RGBA8 size mismatch)"));
+	}
+
+	const FString Base64 = FBase64::Encode(reinterpret_cast<const uint8*>(PNGBytes.GetData()), PNGBytes.Num());
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("base64"), Base64);
+	Out->SetStringField(TEXT("mime"), TEXT("image/png"));
+	Out->SetNumberField(TEXT("width"),  Width);
+	Out->SetNumberField(TEXT("height"), Height);
+	Out->SetBoolField(TEXT("is_class_generic"), bIsClassGeneric);
+	return AR_MakeSuccessObj(Request, Out);
 }
+
+// ─── asset.get_thumbnail_to_disk (file output, sandboxed, max 2048) ─────────────────────────
 FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.get_thumbnail_to_disk — Day 5 stub"));
+	FString NormalizedPath;
+	FMCPResponse Err;
+	if (!AR_RequirePath(Request, NormalizedPath, Err)) { return Err; }
+
+	FAssetData Data;
+	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
+	{
+		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
+	}
+
+	int32 Size = 256;
+	Request.Args->TryGetNumberField(TEXT("size"), Size);
+	if (Size < 16 || Size > 2048)
+	{
+		return AR_MakeError(Request, kARErrorInvalidParams,
+			FString::Printf(TEXT("size %d outside [16, 2048]"), Size));
+	}
+
+	// Format: png (default) or jpg.
+	FString Format = TEXT("png");
+	Request.Args->TryGetStringField(TEXT("format"), Format);
+	const bool bJpg = Format.Equals(TEXT("jpg"), ESearchCase::IgnoreCase) ||
+		Format.Equals(TEXT("jpeg"), ESearchCase::IgnoreCase);
+
+	// Resolve output_path: default = <Saved>/UnrealMCP/thumbnails/<uuid>.<ext>.
+	FString OutputPathRaw;
+	Request.Args->TryGetStringField(TEXT("output_path"), OutputPathRaw);
+	if (OutputPathRaw.IsEmpty())
+	{
+		const FString Ext = bJpg ? TEXT("jpg") : TEXT("png");
+		const FGuid Guid = FGuid::NewGuid();
+		OutputPathRaw = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UnrealMCP"),
+			TEXT("thumbnails"), FString::Printf(TEXT("%s.%s"), *Guid.ToString(EGuidFormats::Digits), *Ext));
+	}
+
+	// Sandbox resolve (PATH_ESCAPE on whitelist miss).
+	FString AbsPath;
+	FString SandboxErr;
+	if (!FMCPPathSandbox::Resolve(OutputPathRaw, AbsPath, SandboxErr))
+	{
+		return AR_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+	}
+
+	TArray<uint8> RGBA8;
+	int32 Width = 0, Height = 0;
+	bool bIsClassGeneric = false;
+	FString RenderErr;
+	if (!AR_RenderAssetThumbnail(NormalizedPath, Size, RGBA8, Width, Height, bIsClassGeneric, RenderErr))
+	{
+		return AR_MakeError(Request, -32000,
+			FString::Printf(TEXT("thumbnail render failed: %s"), *RenderErr));
+	}
+
+	TArray64<uint8> EncodedBytes;
+	if (bJpg)
+	{
+		// JPG via FImageUtils::CompressImage + FImageView (zero-copy wrapper around RGBA8 bytes).
+		// Quality 85 = good visual / size tradeoff for thumbnails.
+		const FImageView Src(
+			reinterpret_cast<const FColor*>(RGBA8.GetData()), Width, Height, EGammaSpace::sRGB);
+		if (!FImageUtils::CompressImage(EncodedBytes, TEXT("jpg"), Src, /*Quality*/ 85))
+		{
+			return AR_MakeError(Request, -32000, TEXT("JPG encode failed"));
+		}
+	}
+	else
+	{
+		if (!AR_EncodePNG(RGBA8, Width, Height, EncodedBytes))
+		{
+			return AR_MakeError(Request, -32000,
+				TEXT("PNG encode failed (unexpected RGBA8 size mismatch)"));
+		}
+	}
+
+	// Ensure parent directory exists; SaveArrayToFile will silently fail otherwise.
+	const FString ParentDir = FPaths::GetPath(AbsPath);
+	IFileManager::Get().MakeDirectory(*ParentDir, /*Tree*/ true);
+
+	// SaveArrayToFile takes TArray<uint8> not TArray64; convert if it fits in int32 (PNG of
+	// 2048x2048 is ~10 MiB — comfortably under 2 GiB).
+	if (EncodedBytes.Num() > INT32_MAX)
+	{
+		return AR_MakeError(Request, -32000,
+			TEXT("encoded thumbnail exceeds 2 GiB — refusing to write"));
+	}
+	TArray<uint8> WriteBuf;
+	WriteBuf.Append(EncodedBytes.GetData(), static_cast<int32>(EncodedBytes.Num()));
+	if (!FFileHelper::SaveArrayToFile(WriteBuf, *AbsPath))
+	{
+		return AR_MakeError(Request, -32000,
+			FString::Printf(TEXT("could not write thumbnail to '%s'"), *AbsPath));
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("path"), AbsPath);
+	Out->SetNumberField(TEXT("bytes"), static_cast<double>(WriteBuf.Num()));
+	Out->SetNumberField(TEXT("width"),  Width);
+	Out->SetNumberField(TEXT("height"), Height);
+	return AR_MakeSuccessObj(Request, Out);
 }
 // ─── asset.get_class_hierarchy ───────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)

@@ -49,6 +49,7 @@ public class UnrealMCPBridge : ModuleRules
 				"ContentBrowser",           // IContentBrowserSingleton (folder ops + future sync)
 				"ContentBrowserData",       // FContentBrowserDataFilter (folder enumeration, used by cb.list_folders via IAR)
 				"EditorScriptingUtilities", // UEditorAssetSubsystem (LoadAsset, DoesAssetExist, DeleteAsset, SaveAsset, etc.)
+				"ImageCore",                // FImageView (constructs from FColor* for thumbnail encoding)
 				"ImageWrapper",             // FImageUtils::CompressImageArray for thumbnail PNG encoding
 			}
 		);
