@@ -644,7 +644,7 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	return CB_MakeSuccessObj(Request, Out);
 }
 
-// ─── cb.list_folders (Lane B!) ───────────────────────────────────────────────────────────────
+// ─── cb.list_folders (Lane A post-hotfix — body remains Lane-B-safe for Phase 3+ revival) ──
 FMCPResponse Tool_ListFolders(const FMCPRequest& Request)
 {
 	FString ParentPath;
@@ -1098,8 +1098,12 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("cb.delete"),          &Tool_Delete,          /*Lane A*/ false);
 
 	// Day 8: redirector + folder enumeration.
-	RegisterTool(TEXT("cb.fix_redirectors"), &Tool_FixRedirectors,  /*Lane A*/ false);
-	RegisterTool(TEXT("cb.list_folders"),    &Tool_ListFolders,     /*Lane B*/ true);
+	// HOTFIX 2026-05 (Plan R11): cb.list_folders demoted to Lane A. IAR.GetSubPaths shares the
+	// AssetRegistry enumeration path with the AR query tools that crash on listener thread in
+	// UE 5.7 (GetAssetRegistryTags not fully thread-safe). See AssetRegistryTools.cpp registration
+	// block for the full assertion text. Lane B router infrastructure is preserved for Phase 3+.
+	RegisterTool(TEXT("cb.fix_redirectors"), &Tool_FixRedirectors,  /*Lane A*/          false);
+	RegisterTool(TEXT("cb.list_folders"),    &Tool_ListFolders,     /*Lane A (was B)*/ false);
 
 	// Day 9: import / export.
 	RegisterTool(TEXT("cb.import"),          &Tool_Import,          /*Lane A*/ false);
@@ -1109,7 +1113,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("cb.save_all_dirty"),  &Tool_SaveAllDirty,    /*Lane A*/ false);
 	RegisterTool(TEXT("cb.bulk_import"),     &Tool_BulkImport,      /*Lane A*/ false);
 
-	UE_LOG(LogMCP, Log, TEXT("Phase 2 Days 6-10: registered 12 cb.* handlers (1 Lane B, 11 Lane A)"));
+	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 12 cb.* handlers (all Lane A — UE 5.7 AR not thread-safe)"));
 }
 
 } // namespace FContentBrowserTools

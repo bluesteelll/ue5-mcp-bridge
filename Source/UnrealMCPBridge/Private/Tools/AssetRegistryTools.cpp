@@ -1374,35 +1374,40 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
-	// Per the plan baseline 11 of 12 register with bThreadSafe=true (Lane B). Audit demotion list
-	// from Tests/lane_b_audit_results.md applies after Day 0b spike runs — until then we ship the
-	// optimistic baseline since the AR read API is documented thread-safe since UE 5.0.
+	// HOTFIX 2026-05 (Plan R11 systemic-unsafe contingency): ALL AR read tools demoted to Lane A.
+	// Discovered via autonomous test crash: IAR.GetAssets() asserts when enumerating in-memory
+	// assets off the game thread because UE 5.7's GetAssetRegistryTags() is not fully thread-safe
+	// ("Enumerating in-memory assets can only be done on the game thread or in the loader, there
+	// are too many GetAssetRegistryTags() still not thread-safe" — AssetRegistry.cpp:2906). The
+	// AR read API was documented thread-safe since UE 5.0 but the in-memory-enumeration path
+	// regressed. Lane B router (FMCPDispatchQueue::DispatchInline + IsThreadSafe + FMCPConnection
+	// short-circuit) remains for Phase 3+ — only the per-tool flag changes here. Possible Phase 3+
+	// workaround: pass Filter.bIncludeOnlyOnDiskAssets=true to skip the unsafe enumeration path.
 	auto RegisterTool = [&](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler, bool bThreadSafe)
 	{
 		Queue.RegisterHandler(MethodName, MoveTemp(Handler), bThreadSafe);
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// Day 2: first 4 tools (3 Lane B + 1 Lane A).
-	RegisterTool(TEXT("asset.exists"),                &Tool_AssetExists,                /*Lane B*/ true);
-	RegisterTool(TEXT("asset.metadata"),              &Tool_AssetMetadata,              /*Lane B*/ true);
-	RegisterTool(TEXT("asset.get_outermost_package"), &Tool_AssetGetOutermostPackage,   /*Lane B*/ true);
-	RegisterTool(TEXT("asset.is_dirty"),              &Tool_AssetIsDirty,               /*Lane A*/ false);
+	// Day 2: first 4 tools (all Lane A post-hotfix).
+	RegisterTool(TEXT("asset.exists"),                &Tool_AssetExists,                /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.metadata"),              &Tool_AssetMetadata,              /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.get_outermost_package"), &Tool_AssetGetOutermostPackage,   /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.is_dirty"),              &Tool_AssetIsDirty,               /*Lane A*/          false);
 
-	// Day 3+ stubs — register so the Day 0b audit harness has something to probe; the bodies
-	// return method-not-found until the implementation day. Each is wired with the eventual
-	// Lane B flag so once the body lands the routing is already correct.
-	RegisterTool(TEXT("asset.list"),                  &Tool_AssetList,                  /*Lane B*/ true);
-	RegisterTool(TEXT("asset.find_references"),       &Tool_AssetFindReferences,        /*Lane B*/ true);
-	RegisterTool(TEXT("asset.find_dependents"),       &Tool_AssetFindDependents,        /*Lane B*/ true);
-	RegisterTool(TEXT("asset.search_by_class"),       &Tool_AssetSearchByClass,         /*Lane B*/ true);
-	RegisterTool(TEXT("asset.search_by_tag"),         &Tool_AssetSearchByTag,           /*Lane B*/ true);
-	RegisterTool(TEXT("asset.search_by_name"),        &Tool_AssetSearchByName,          /*Lane B*/ true);
-	RegisterTool(TEXT("asset.get_thumbnail"),         &Tool_AssetGetThumbnail,          /*Lane A*/ false);
-	RegisterTool(TEXT("asset.get_thumbnail_to_disk"), &Tool_AssetGetThumbnailToDisk,    /*Lane A*/ false);
-	RegisterTool(TEXT("asset.get_class_hierarchy"),   &Tool_AssetGetClassHierarchy,     /*Lane B*/ true);
+	// Day 3+ AR query tools — all Lane A post-hotfix. Thumbnail tools were already Lane A
+	// (need game-thread for RT enqueue + FObjectThumbnail cache) and are unchanged.
+	RegisterTool(TEXT("asset.list"),                  &Tool_AssetList,                  /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.find_references"),       &Tool_AssetFindReferences,        /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.find_dependents"),       &Tool_AssetFindDependents,        /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.search_by_class"),       &Tool_AssetSearchByClass,         /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.search_by_tag"),         &Tool_AssetSearchByTag,           /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.search_by_name"),        &Tool_AssetSearchByName,          /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset.get_thumbnail"),         &Tool_AssetGetThumbnail,          /*Lane A*/          false);
+	RegisterTool(TEXT("asset.get_thumbnail_to_disk"), &Tool_AssetGetThumbnailToDisk,    /*Lane A*/          false);
+	RegisterTool(TEXT("asset.get_class_hierarchy"),   &Tool_AssetGetClassHierarchy,     /*Lane A (was B)*/ false);
 
-	UE_LOG(LogMCP, Log, TEXT("Phase 2 Day 1-2: registered asset.* handlers (4 active + 9 stubs)"));
+	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 13 asset.* handlers (all Lane A — UE 5.7 AR not thread-safe)"));
 }
 
 } // namespace FAssetRegistryTools

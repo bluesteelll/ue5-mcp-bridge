@@ -15,13 +15,16 @@ class FMCPDispatchQueue;
  * (`asset_composites.py`) call them by exact name as one-round-trip helpers, avoiding the
  * per-asset Python ferry catastrophe that would otherwise occur for find_unused / size_report.
  *
- * Routing:
- *   - `_find_unused_internal`  → Lane B (pure AR walk + GetReferencers loop, no UObject)
- *   - `_size_report_internal`  → Lane B (AR walk + IFileManager::FileSize, no UObject)
- *   - `_batch_metadata_internal` → Lane A (Day 5/D5 — submits an async job whose body runs
- *     on a worker thread with bGameThreadRequired=false; the JOB body is Lane B-safe but the
- *     submit step itself enters the dispatch from listener thread anyway, registered Lane A
- *     for simplicity / parity with the other async submitters in ContentBrowserTools.cpp).
+ * Routing (post-hotfix 2026-05, Plan R11):
+ *   - `_find_unused_internal`  → Lane A (calls IAR.GetAssets which asserts on listener thread
+ *     in UE 5.7 — see AssetRegistryTools.cpp registration block for full context)
+ *   - `_size_report_internal`  → Lane A (same reason — IAR.GetAssets enumeration)
+ *   - `_batch_metadata_internal` → **Lane B (kept)**. Synchronous body only does string
+ *     normalisation + FMCPJobRegistry::SubmitJob — no AR enumeration. The submitted lambda
+ *     uses IAR.GetAssetByObjectPath (single point query, not enumerating). MUST stay Lane B
+ *     because the Python composite calls this via dispatch_internal (TCP loopback) from inside
+ *     FMCPPythonEval::CallPythonTool on the game thread — routing it back through Lane A would
+ *     deadlock (game thread waits 60s on socket.recv).
  */
 namespace FAssetCompositeTools
 {

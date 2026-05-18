@@ -7,7 +7,7 @@ the editor for asset/level/blueprint authoring tasks.
 
 ## Status
 
-**Phase 2 complete — 31 user-visible tools + 3 internal C++ Lane B handlers.**
+**Phase 2 complete — 31 user-visible tools + 3 internal C++ handlers.**
 
 | Phase | Tools | Surface |
 |---|---|---|
@@ -15,9 +15,37 @@ the editor for asset/level/blueprint authoring tasks.
 | Phase 2 | 31 | asset.* (13 C++ + 6 Python composites = 19), cb.* (12) — plus 3 internal hidden handlers |
 | **Total** | **47** | (user-visible; 34 total handler registrations counting hidden internals) |
 
-11 of the 31 user-visible Phase 2 tools run on **Lane B** — the TCP listener thread
-bypasses the game-thread queue entirely for ~16× latency improvement on AR queries
-(see "Lane B contract" below). All 3 internal `asset._*` handlers are Lane B too.
+### Known limitation — Phase 2 ships all tools Lane A (hotfix 2026-05)
+
+The original Phase 2 design registered 11 user-visible AR-query tools (plus 2 internal
+helpers) on **Lane B** (TCP listener thread, bypassing the game-thread `Drain` queue) for
+~16× latency improvement. The AR read API is documented thread-safe since UE 5.0, so this
+seemed safe.
+
+Autonomous testing in UE 5.7 surfaced an assertion crash:
+
+```
+Assertion failed: IsInGameThread() || IsInAsyncLoadingThread() || IsInParallelLoadingThread()
+[AssetRegistry.cpp:2906]
+Enumerating in-memory assets can only be done on the game thread or in the loader,
+there are too many GetAssetRegistryTags() still not thread-safe.
+```
+
+Epic themselves note "too many `GetAssetRegistryTags()` still not thread-safe." Per the
+phase-2 plan's R11 contingency ("> 5 Lane B demotions → Lane B becomes a no-op for Phase 2,
+infrastructure remains for Phase 3+"), every AR query tool was demoted to **Lane A** (game
+thread, processed in the `OnEndFrame` drain). The Lane B router infrastructure
+(`FMCPDispatchQueue::IsThreadSafe` + `DispatchInline`, `FMCPConnection` listener-thread
+short-circuit) stays in place — only the per-tool registration flag changes. The single
+exception is `asset._batch_metadata_internal` whose synchronous body does NOT call
+`IAR.GetAssets` (only string normalisation + `FMCPJobRegistry::SubmitJob`); it stays on
+Lane B to avoid a TCP-loopback deadlock from the Python composite.
+
+Phase 3+ may revisit Lane B promotion by passing
+`FARFilter::bIncludeOnlyOnDiskAssets=true` per call, which should skip the in-memory
+enumeration path that hits the assert. The handler bodies are already authored to the Lane B
+contract (no UObject access, no GWorld), so flipping the flag is a one-line revival per tool
+after the filter change is verified stand-alone.
 
 ## Reference
 
@@ -45,9 +73,9 @@ UnrealMCPBridge/
     Private/
       UnrealMCPBridge.cpp, FMCPConnection.cpp, FMCPServer.cpp, ...
       Tools/
-        AssetRegistryTools.h/.cpp   # Category A — 12 Lane B reads + thumbnails
-        ContentBrowserTools.h/.cpp  # Category B — 12 Lane A writes (1 Lane B list_folders)
-        AssetCompositeTools.h/.cpp  # Category D — 3 internal C++ helpers
+        AssetRegistryTools.h/.cpp   # Category A — 13 AR reads (all Lane A post-hotfix; was 10 Lane B)
+        ContentBrowserTools.h/.cpp  # Category B — 12 CB writes (all Lane A; list_folders was Lane B)
+        AssetCompositeTools.h/.cpp  # Category D — 3 internal C++ helpers (1 Lane B, 2 Lane A)
       Utils/
         MCPAssetPathUtils.h/.cpp    # Path canonicalisation
         MCPARFilterParser.h/.cpp    # FARFilter JSON ↔ struct + hash
@@ -71,19 +99,19 @@ UnrealMCPBridge/
 Breakdown: **13 C++ asset.*** + **6 Python composite asset.*** + **12 cb.*** = 31 user-visible
 tools, plus **3 internal hidden** asset._*internal handlers (used by Python composites).
 
-### Category A — Asset Registry queries (13 C++ tools, mostly Lane B)
+### Category A — Asset Registry queries (13 C++ tools, all Lane A post-hotfix)
 
 ```
-asset.exists                  → {exists, asset_path_canonical}                    Lane B
-asset.metadata                → {class, package, tags, size_disk, ...}            Lane B
-asset.list                    → {assets[], next_page_token, total_known, ...}     Lane B
-asset.find_references         → {referencers[], next_page_token, total_known}     Lane B
-asset.find_dependents         → {dependents[], next_page_token, total_known}      Lane B
-asset.search_by_class         → {matches[], next_page_token, total_known}         Lane B
-asset.search_by_tag           → {matches[], next_page_token, total_known}         Lane B
-asset.search_by_name          → {matches[], next_page_token, total_known}         Lane B
-asset.get_class_hierarchy     → {chain[]}                                          Lane B
-asset.get_outermost_package   → {package_path, on_disk}                            Lane B
+asset.exists                  → {exists, asset_path_canonical}                    Lane A (was B)
+asset.metadata                → {class, package, tags, size_disk, ...}            Lane A (was B)
+asset.list                    → {assets[], next_page_token, total_known, ...}     Lane A (was B)
+asset.find_references         → {referencers[], next_page_token, total_known}     Lane A (was B)
+asset.find_dependents         → {dependents[], next_page_token, total_known}      Lane A (was B)
+asset.search_by_class         → {matches[], next_page_token, total_known}         Lane A (was B)
+asset.search_by_tag           → {matches[], next_page_token, total_known}         Lane A (was B)
+asset.search_by_name          → {matches[], next_page_token, total_known}         Lane A (was B)
+asset.get_class_hierarchy     → {chain[]}                                          Lane A (was B)
+asset.get_outermost_package   → {package_path, on_disk}                            Lane A (was B)
 asset.get_thumbnail           → {base64, mime, width, height, is_class_generic}   Lane A (RT enqueue)
 asset.get_thumbnail_to_disk   → {path, bytes, width, height}                       Lane A (RT enqueue)
 asset.is_dirty                → {dirty, in_memory}                                  Lane A (loaded-pkg map)
@@ -97,7 +125,7 @@ Example:
          "page_size":50}}
 ```
 
-### Category B — Content Browser write operations (12 tools, Lane A)
+### Category B — Content Browser write operations (12 tools, all Lane A)
 
 ```
 cb.create_folder      → {created, normalized_path}      idempotent
@@ -107,7 +135,7 @@ cb.move               → {moved[], failed[]}              per-asset transaction
 cb.duplicate          → {new_path}                       FScopedTransaction
 cb.delete             → {deleted, redirector_left}       force=true Display-logged (Warning on depth-2)
 cb.fix_redirectors    → {fixed_count, removed_count}    500-redirector hard cap
-cb.list_folders       → {folders[]}                       LANE B (only Cat B Lane B tool)
+cb.list_folders       → {folders[]}                       Lane A (was B; hotfix 2026-05)
 cb.import             → {asset_path}                     UAssetImportTask, sandboxed source
 cb.export             → {exported, bytes}                temp-dir trampoline + sandboxed dest
 cb.save_all_dirty     → {job_id}                          ASYNC (job)

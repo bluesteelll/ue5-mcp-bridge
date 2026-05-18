@@ -8,18 +8,22 @@
 class FMCPDispatchQueue;
 
 /**
- * Phase 2 — Category A (Asset Registry queries). 12 tools, mostly Lane B (subject to Day 0b audit
- * outcome — see ``Tests/lane_b_audit_results.md`` after audit runs). Each handler is a static
- * function taking ``const FMCPRequest&`` and returning ``FMCPResponse``.
+ * Phase 2 — Category A (Asset Registry queries). 13 tools, ALL Lane A post-hotfix (2026-05).
+ * Each handler is a static function taking ``const FMCPRequest&`` and returning ``FMCPResponse``.
  *
- * Lane B handlers MUST follow the contract documented in ``FMCPDispatchQueue.h`` — no UObject
- * access, no GWorld, no mutating editor APIs. Per the plan baseline 11 of the 12 tools register
- * with ``bThreadSafe=true``; the exception is ``asset.is_dirty`` which touches the loaded-package
- * map and is Lane A always.
+ * **HOTFIX (Plan R11 systemic-unsafe contingency):** the original design registered 10 of 13
+ * tools Lane B (``bThreadSafe=true``) since the AR read API is documented thread-safe since UE
+ * 5.0. Autonomous testing in UE 5.7 revealed ``IAR.GetAssets()`` asserts when enumerating
+ * in-memory assets off the game thread — Epic comment "there are too many GetAssetRegistryTags()
+ * still not thread-safe" (``AssetRegistry.cpp:2906``). All AR tools were demoted to Lane A.
+ * The handler bodies were already authored to the Lane B contract (no UObject access, no GWorld,
+ * AR-only reads) so re-promoting in Phase 3+ requires only changing the per-tool flag — possibly
+ * after switching ``IAR.GetAssets()`` calls to pass ``Filter.bIncludeOnlyOnDiskAssets=true`` to
+ * skip the unsafe in-memory enumeration path. See ``FMCPDispatchQueue.h`` Lane B contract block.
  *
- * Thumbnail tools (``asset.get_thumbnail`` / ``asset.get_thumbnail_to_disk``) are Lane A because
- * thumbnail rendering enqueues to the render thread and needs game-thread context for the
- * FObjectThumbnail cache.
+ * Thumbnail tools (``asset.get_thumbnail`` / ``asset.get_thumbnail_to_disk``) and
+ * ``asset.is_dirty`` were Lane A from day one (RT enqueue + game-thread FObjectThumbnail cache
+ * for the thumbnail pair; loaded-package map walk for is_dirty).
  */
 namespace FAssetRegistryTools
 {

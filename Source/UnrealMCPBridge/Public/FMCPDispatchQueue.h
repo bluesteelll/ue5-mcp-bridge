@@ -72,6 +72,20 @@ public:
 	//
 	// Phase 1 callers (marshall.*, job.*, log.*, tools.list) continue to use the default
 	// `bThreadSafe=false` overload — they remain Lane A and run on the game thread unchanged.
+	//
+	// **Known UE 5.7 limitation (2026-05):** AssetRegistry read APIs (`GetAssets`, `GetReferencers`,
+	// etc.) assert `IsInGameThread()` internally when enumerating in-memory assets via
+	// `GetAssetRegistryTags()` — Epic's own comment at `AssetRegistry.cpp:2906` reads
+	// "Enumerating in-memory assets can only be done on the game thread or in the loader,
+	// there are too many GetAssetRegistryTags() still not thread-safe." Lane B handlers using AR
+	// enumeration queries crash on the TCP listener thread. **Phase 2 ships ALL AR tools as
+	// Lane A (`bThreadSafe=false`) until this is resolved.** Single-point AR queries
+	// (`GetAssetByObjectPath`) appear safe; only the enumerating bulk-query path triggers the
+	// assert. Future workaround: passing `Filter.bIncludeOnlyOnDiskAssets=true` to `GetAssets()`
+	// may bypass the path that hits the assert. Phase 3+ should retry Lane B with that mitigation
+	// after stand-alone verification. The Lane B router (`IsThreadSafe` + `DispatchInline` +
+	// `FMCPConnection` short-circuit) remains fully functional — the demotion is per-tool, not
+	// infrastructural.
 
 	/** Singleton accessor. The instance lives for the lifetime of the bridge module. */
 	static FMCPDispatchQueue& Get();

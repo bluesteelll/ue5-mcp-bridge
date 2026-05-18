@@ -113,7 +113,7 @@ namespace
 namespace FAssetCompositeTools
 {
 
-// ─── asset._find_unused_internal (Lane B) ────────────────────────────────────────────────────
+// ─── asset._find_unused_internal (Lane A post-hotfix — IAR.GetAssets unsafe on listener) ────
 FMCPResponse Tool_FindUnusedInternal(const FMCPRequest& Request)
 {
 	TArray<FString> Scopes;
@@ -186,7 +186,7 @@ FMCPResponse Tool_FindUnusedInternal(const FMCPRequest& Request)
 	return COMP_MakeSuccessObj(Request, Out);
 }
 
-// ─── asset._size_report_internal (Lane B) ────────────────────────────────────────────────────
+// ─── asset._size_report_internal (Lane A post-hotfix — IAR.GetAssets unsafe on listener) ────
 FMCPResponse Tool_SizeReportInternal(const FMCPRequest& Request)
 {
 	TArray<FString> Scopes;
@@ -260,7 +260,7 @@ FMCPResponse Tool_SizeReportInternal(const FMCPRequest& Request)
 	return COMP_MakeSuccessObj(Request, Out);
 }
 
-// ─── asset._batch_metadata_internal (Lane A submit — body runs Lane B-safe on worker) ──────
+// ─── asset._batch_metadata_internal (Lane B — sync only validates strings + submits job) ───
 FMCPResponse Tool_BatchMetadataInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
@@ -370,22 +370,27 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// _find_unused_internal: pure AR walk + GetReferencers — Lane B-safe.
-	RegisterTool(TEXT("asset._find_unused_internal"),  &Tool_FindUnusedInternal,    /*Lane B*/ true);
-	// _size_report_internal: AR walk + FileSize — Lane B-safe.
-	RegisterTool(TEXT("asset._size_report_internal"),  &Tool_SizeReportInternal,    /*Lane B*/ true);
-	// _batch_metadata_internal: submits an async job, returns {job_id}.
-	// MUST be Lane B — the Python composite asset.batch_metadata_async calls this via
+	// HOTFIX 2026-05 (Plan R11 systemic-unsafe contingency): demoted to Lane A. Both internals
+	// call IAR.GetAssets(Filter) synchronously to walk the candidate set — same code path that
+	// asserts on listener thread in UE 5.7 ("Enumerating in-memory assets can only be done on
+	// the game thread or in the loader, there are too many GetAssetRegistryTags() still not
+	// thread-safe" — AssetRegistry.cpp:2906). See AssetRegistryTools.cpp registration block.
+	RegisterTool(TEXT("asset._find_unused_internal"),  &Tool_FindUnusedInternal,    /*Lane A (was B)*/ false);
+	RegisterTool(TEXT("asset._size_report_internal"),  &Tool_SizeReportInternal,    /*Lane A (was B)*/ false);
+
+	// _batch_metadata_internal: submits an async job, returns {job_id}. STAYS Lane B post-hotfix.
+	// The synchronous handler body does NOT enumerate AR — it only does (a) path-string Normalize
+	// + (b) FMCPJobRegistry::SubmitJob (thread-safe; no game-thread assert). The submitted lambda
+	// runs on the worker pool and calls IAR.GetAssetByObjectPath (a single point query, NOT the
+	// enumerating GetAssets path that triggers the UE 5.7 assert).
+	// MUST stay Lane B — the Python composite asset.batch_metadata_async calls this via
 	// dispatch_internal (TCP loopback), which itself runs inside FMCPPythonEval::CallPythonTool
 	// on the game thread. If this handler were Lane A it would queue back to the same game
 	// thread that's blocked on socket.recv() → 60s deadlock until socket timeout.
-	// Lane B safety: handler body only does (a) AR string ops to validate paths and
-	// (b) FMCPJobRegistry::SubmitJob, which is thread-safe (FScopeLock(JobsLock), no game-thread
-	// assert). The submitted lambda runs on the worker pool — never on this handler thread.
 	RegisterTool(TEXT("asset._batch_metadata_internal"), &Tool_BatchMetadataInternal, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 2 Day 11: registered 3 internal asset.* handlers (hidden from tools.list)"));
+		TEXT("Phase 2 hotfix: registered 3 internal asset.* handlers (2 Lane A, 1 Lane B — batch_metadata stays B to avoid loopback deadlock)"));
 }
 
 } // namespace FAssetCompositeTools
