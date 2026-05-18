@@ -178,13 +178,31 @@ inline constexpr int32 kMCPErrorVariableNotFound            = -32037;
 /**
  * Phase 5 — PIE + Editor utilities + UMG/Niagara/Physics/Sequencer surface.
  *
- *   -32038 PIENotActive    Inverse of -32027 PIEActive. Returned by ``pie.*`` tools that require an
- *                          active PIE session (every pie.* tool except ``pie.start`` and the always-
- *                          callable ``pie.is_running``). Caller's recovery: ``pie.start`` first OR
- *                          use ``editor.*`` tools for editor-world operations. Message is frozen
- *                          verbatim (see ``kMCPMessagePIENotActive``).
+ *   -32038 PIENotActive       Inverse of -32027 PIEActive. Returned by ``pie.*`` tools that require an
+ *                             active PIE session (every pie.* tool except ``pie.start`` and the always-
+ *                             callable ``pie.is_running``). Caller's recovery: ``pie.start`` first OR
+ *                             use ``editor.*`` tools for editor-world operations. Message is frozen
+ *                             verbatim (see ``kMCPMessagePIENotActive``).
+ *
+ * Phase 5 Chunk C (UMG + Niagara + Physics) adds three subcodes:
+ *
+ *   -32039 WidgetNotFound     ``umg.get_widget_property`` — widget_name not found in the WidgetTree.
+ *                             Caller's recovery: ``umg.list_widgets`` to inspect available names.
+ *                             Message embeds the list of top-level widget names (capped at 16) so
+ *                             the caller can correct typos without a follow-up call when the tree
+ *                             is small.
+ *   -32040 NiagaraParameterNotFound (RESERVED) — not raised by Chunk C ``niagara.list_parameters``
+ *                             (read-only enumeration). Reserved for future ``niagara.set_user_param``
+ *                             when set-side tools land in Phase 6+.
+ *   -32041 InvalidCollisionChannel  ``physics.line_trace`` / ``physics.sweep_capsule`` — channel
+ *                             string didn't map to a known ``ECollisionChannel`` enum value.
+ *                             Caller's recovery: use ``"Visibility"`` (default) or one of the
+ *                             listed builtins. Message lists the accepted channel names.
  */
 inline constexpr int32 kMCPErrorPIENotActive                = -32038;
+inline constexpr int32 kMCPErrorWidgetNotFound              = -32039;
+inline constexpr int32 kMCPErrorNiagaraParameterNotFound    = -32040; // reserved
+inline constexpr int32 kMCPErrorInvalidCollisionChannel     = -32041;
 
 /**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.

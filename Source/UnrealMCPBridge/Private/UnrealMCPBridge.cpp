@@ -22,7 +22,10 @@
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
 #include "Tools/MaterialTools.h"
+#include "Tools/NiagaraTools.h"
+#include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
+#include "Tools/UMGTools.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -257,10 +260,22 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// (-32017 InputTooLarge) mirroring Phase 2 batch_metadata.
 	FEditorTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 5 Chunk C: UMG + Niagara + Physics traces (5 tools, all Lane A, all read-only).
+	//   - UMG (2)     : umg.list_widgets + umg.get_widget_property (WidgetTree walk + Tier-1 property read)
+	//   - Niagara (1) : niagara.list_parameters (user / system / per-emitter parameter enumeration)
+	//   - Physics (2) : physics.line_trace + physics.sweep_capsule (UE Chaos system; NOT Jolt/Barrage)
+	// No PIE guard — all 5 are reads. Physics traces operate on the PIE world when PIE is running,
+	// editor world otherwise (selectable transparently via world resolution helpers). New error codes
+	// landed in MCPTypes.h: -32039 WidgetNotFound, -32041 InvalidCollisionChannel; -32040 reserved for
+	// future niagara.set_user_param.
+	FUMGTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+	FNiagaraTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+	FPhysicsTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

@@ -77,6 +77,21 @@ public class UnrealMCPBridge : ModuleRules
 				"SlateCore",                // FNotificationInfo, slate enums
 				// ImageWrapper already listed (Phase 2) — reused by FMCPScreenshotUtils for
 				// PNG/JPG encode via FImageUtils::CompressImage.
+				// Phase 5 Chunk C — UMG + Niagara + Physics surface.
+				// UMG runtime: UWidget, UWidgetTree, UUserWidget, UPanelWidget.
+				// UMGEditor: UWidgetBlueprint (asset class) — only available in editor builds; the
+				// Phase 5 Chunk C tools are editor-only by design (UnrealEd is already a private dep).
+				"UMG",                      // UWidget / UWidgetTree / UUserWidget (runtime classes).
+				"UMGEditor",                // UWidgetBlueprint — Cast<UWidgetBlueprint> + WidgetTree access.
+				// Niagara runtime — UNiagaraSystem / UNiagaraEmitter / FNiagaraParameterStore /
+				// FNiagaraUserRedirectionParameterStore / FNiagaraVariable + FNiagaraTypeDefinition
+				// (niagara.list_parameters read-only enumeration). NiagaraEditor NOT needed for
+				// read-side enumeration — exposed parameters live on the runtime UNiagaraSystem.
+				"Niagara",                  // UNiagaraSystem::GetExposedParameters / GetEmitterHandles.
+				// Physics traces (physics.line_trace / sweep_capsule) — UWorld::LineTraceMultiByChannel
+				// / SweepMultiByChannel + FCollisionShape::MakeCapsule + FCollisionQueryParams +
+				// ECollisionChannel + FHitResult are all in Engine (already a public dep). No additional
+				// physics module required for Chaos query path.
 			}
 		);
 	}
