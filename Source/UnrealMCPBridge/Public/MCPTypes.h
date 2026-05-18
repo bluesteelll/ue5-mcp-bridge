@@ -134,6 +134,48 @@ inline constexpr int32 kMCPErrorLevelNotStreamingEntry      = -32028;
 inline constexpr int32 kMCPErrorWorldPartitionNotSupported  = -32029;
 
 /**
+ * Phase 4 — Blueprint + Material surface. 8 new codes spanning bp.* / material.* tools.
+ *
+ *   -32030 KismetCompilationError   ``bp.compile`` (when ``args.fail_on_error=true``) — compile
+ *                                   produced errors. result still carries the errors/warnings
+ *                                   arrays for diagnostic surface. With default (false) the body
+ *                                   returns a non-error success with ``compiled=false`` instead.
+ *   -32031 BlueprintTypeMismatch    ``bp.*`` — path resolved to a non-UBlueprint asset (e.g. a
+ *                                   UMaterial, UStaticMesh, UDataAsset). Message contains both
+ *                                   the asset class name and the expected type.
+ *   -32032 PinTypeUnsupported       ``bp.*`` variable/function pin IO — pin uses a PC_* category
+ *                                   (or container shape) that MCPPinTypeUtils doesn't yet round-trip
+ *                                   (e.g. PC_Verse, future PC_Delegate variants). Fail-fast per
+ *                                   plan D4; tool body returns immediately rather than coercing
+ *                                   to a lossy fallback.
+ *   -32033 ReparentUnsafe           ``bp.reparent`` — caller omitted ``confirm_dangerous=true``.
+ *                                   The dangerous-flag gate matches ``cb.delete force=true``
+ *                                   precedent. Reparent may invalidate variables/functions
+ *                                   inherited from the prior parent class with no clean rollback.
+ *   -32034 MaterialClassMismatch    ``material.*`` — path resolves to a class outside the expected
+ *                                   family. Writes require UMaterialInstanceConstant; reads allow
+ *                                   any UMaterialInterface. Base UMaterial mutations require
+ *                                   graph-node edits (future Phase 7 ``material.edit_node``).
+ *   -32035 ShaderRecompilePending   ``material.set_static_switch`` — shader compile queue at or
+ *                                   above the soft cap (default 1000 jobs, tunable via CVar
+ *                                   ``mcp.material.shader_queue_soft_limit``). Write rejected;
+ *                                   caller polls ``material.is_shader_compiling`` and retries.
+ *   -32036 ParameterNotFound        ``material.{get,set}_*_param`` — parameter name not found on
+ *                                   the resolved material/MIC. Caller checks ``material.list_parameters``.
+ *   -32037 VariableNotFound         ``bp.{get,remove,change}_variable``, ``bp.{get,remove}_function``
+ *                                   — named variable or function missing on the blueprint. Message
+ *                                   disambiguates between variable/function origins.
+ */
+inline constexpr int32 kMCPErrorKismetCompilationError      = -32030;
+inline constexpr int32 kMCPErrorBlueprintTypeMismatch       = -32031;
+inline constexpr int32 kMCPErrorPinTypeUnsupported          = -32032;
+inline constexpr int32 kMCPErrorReparentUnsafe              = -32033;
+inline constexpr int32 kMCPErrorMaterialClassMismatch       = -32034;
+inline constexpr int32 kMCPErrorShaderRecompilePending      = -32035;
+inline constexpr int32 kMCPErrorParameterNotFound           = -32036;
+inline constexpr int32 kMCPErrorVariableNotFound            = -32037;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */

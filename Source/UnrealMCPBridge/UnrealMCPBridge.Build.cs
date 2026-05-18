@@ -54,6 +54,14 @@ public class UnrealMCPBridge : ModuleRules
 				// Phase 3 — Level + Actor + Component surface.
 				"LevelEditor",              // ULevelEditorSubsystem (NewLevel/LoadLevel/SaveCurrentLevel/etc.),
 				                            // FEditorFileUtils streaming-level helpers used by level.* tools.
+				// Phase 4 — Blueprint + Material surface. FBlueprintEditorUtils + FKismetEditorUtilities
+				// + FCompilerResultsLog all live in UnrealEd (already listed). These two add the K2 graph
+				// types (UK2Node_FunctionEntry / Result) and the PC_* enum constants from UEdGraphSchema_K2,
+				// plus FKismetCompilerContext for future write-side support.
+				"KismetCompiler",           // FCompilerResultsLog + FKismetCompilerContext
+				                            // (bp.compile / bp.compile_all_dirty).
+				"BlueprintGraph",           // UK2Node_FunctionEntry, UK2Node_FunctionResult, UEdGraphSchema_K2
+				                            // PC_* constants (variable/function pin type IO).
 			}
 		);
 	}
