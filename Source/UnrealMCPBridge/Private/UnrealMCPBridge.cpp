@@ -11,6 +11,7 @@
 #include "FMCPPythonEval.h"
 #include "FMCPServer.h"
 #include "MCPTypes.h"
+#include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
 #include "Tools/ContentBrowserTools.h"
 
@@ -185,11 +186,12 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// RegisteredMethodNames so ShutdownModule can mirror-cleanup.
 	FAssetRegistryTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FContentBrowserTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+	FAssetCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (3)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

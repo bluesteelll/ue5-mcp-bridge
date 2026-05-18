@@ -25,6 +25,7 @@ def tool(
     schema_out: Optional[Dict[str, Any]] = None,
     thread_safe: bool = False,
     failure_modes: Optional[List[Dict[str, Any]]] = None,
+    _internal: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Register a callable as an MCP tool.
 
@@ -41,6 +42,13 @@ def tool(
             See blueprint v2 §C3 for the dispatch-lane contract.
         failure_modes: Optional list of ``{"code", "when", "recovery"}`` dicts
             documenting expected error surfaces, used for tool-listing UX.
+        _internal: If True the tool is registered + dispatchable but FILTERED OUT
+            of ``tools.list`` enumeration. Used for Python-side helper composites
+            that need a private name (e.g. ``asset._find_unused_internal_py``).
+            Note: C++ internal handlers (``asset._batch_metadata_internal`` etc.)
+            are registered directly via ``FMCPDispatchQueue::RegisterHandler`` and
+            are never seen by this Python decorator — they appear in the
+            ``cpp_handlers`` list of ``tools.list`` regardless of this flag.
     """
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -64,6 +72,7 @@ def tool(
             "thread_safe": thread_safe,
             "failure_modes": failure_modes or [],
             "module": fn.__module__,
+            "_internal": bool(_internal),
         }
         return fn
 
@@ -71,7 +80,21 @@ def tool(
 
 
 def get_all_tools() -> Dict[str, Dict[str, Any]]:
-    """Return a shallow copy of the registry. Callers MUST treat the result as read-only."""
+    """Return a shallow copy of the registry, EXCLUDING tools registered with ``_internal=True``.
+
+    Internal helpers stay dispatchable (a caller who knows the exact name can still invoke
+    them via the unknown-method fallback) but are hidden from the public ``tools.list``
+    enumeration consumed by AI agents and discovery clients.
+    """
+
+    return {k: v for k, v in _TOOLS.items() if not v.get("_internal", False)}
+
+
+def get_all_tools_including_internal() -> Dict[str, Dict[str, Any]]:
+    """Return a shallow copy of the FULL registry, including internal helpers.
+
+    Used by smoke tests that need to assert presence of internal Python wrappers.
+    """
 
     return dict(_TOOLS)
 
