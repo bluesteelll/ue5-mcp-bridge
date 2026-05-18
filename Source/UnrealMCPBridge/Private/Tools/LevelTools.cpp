@@ -5,8 +5,9 @@
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "UnrealMCPBridge.h"
-#include "Utility/MCPReflection.h"
-#include "Utility/MCPWorldContext.h"
+#include "Utils/MCPPageCursor.h"
+#include "Utils/MCPReflection.h"
+#include "Utils/MCPWorldContext.h"
 
 #include "Editor.h"
 #include "EditorLevelUtils.h"
@@ -226,6 +227,75 @@ namespace
 			}
 		}
 		return nullptr;
+	}
+
+	// ─── Sentinel-cursor pagination helpers (mirrors AssetRegistryTools / ActorTools pattern) ───
+	//
+	// Mirrors the Phase 2 cursor contract: filter hash binds the result-set identity (mutation
+	// between pages → kMCPErrorStaleCursor); LastAssetPath sentinel is the last-emitted entry's
+	// stable sort key (Actor::GetPathName here, matching ACT_SliceActorPage). Keyset pagination
+	// survives mid-pagination inserts/deletes — new actors land in their sorted slot naturally,
+	// deleted ones leave a gap the next-greater key fills.
+
+	/** Clamp ``page_size`` to [1, 1000]. */
+	int32 LVL_ClampPageSize(const TSharedPtr<FJsonObject>& Args, const TCHAR* FieldName, int32 Default)
+	{
+		int32 Out = Default;
+		if (Args.IsValid())
+		{
+			Args->TryGetNumberField(FieldName, Out);
+		}
+		return FMath::Clamp(Out, 1, 1000);
+	}
+
+	/**
+	 * Stable hash over every arg that affects result-set identity. ``page_size`` is intentionally
+	 * NOT mixed — callers may resize between pages without invalidating the cursor.
+	 *
+	 * For level.get_persistent_level_actors the only such input is the resolved level's package
+	 * name (the underlying ``Level->Actors`` source). Computing the hash over the RESOLVED level
+	 * package — not the raw ``map_path`` arg — means an empty ``map_path`` (=persistent level) and
+	 * an explicit map_path pointing at that same persistent level produce identical hashes; the
+	 * caller can switch arg form without a stale cursor.
+	 */
+	uint64 LVL_HashLevelFilter(const FString& ResolvedLevelPackageName)
+	{
+		const uint32 H1 = GetTypeHash(ResolvedLevelPackageName);
+		// Magic constants discriminate this tool's filter shape from other future LVL_* paginators
+		// that may hash the same string but mean something different.
+		constexpr uint64 ToolDiscriminant = 0xA1B2C3D400000001ull; // level.get_persistent_level_actors == 1
+		return (static_cast<uint64>(H1) << 32) ^ ToolDiscriminant;
+	}
+
+	/**
+	 * Decode + filter-hash-validate a page_token. Populates ``OutCursor`` on success; on decode or
+	 * hash mismatch populates ``OutError`` (caller returns it directly) and returns false. Empty
+	 * token = first-page request (always succeeds).
+	 */
+	bool LVL_DecodeCursor(
+		const FMCPRequest& Request,
+		const FString& TokenWire,
+		uint64 ExpectedFilterHash,
+		FMCPPageCursor& OutCursor,
+		FMCPResponse& OutError)
+	{
+		FString DecodeErr;
+		if (!FMCPPageCursorUtils::Decode(TokenWire, OutCursor, DecodeErr))
+		{
+			// Fail-fast on malformed token: -32602 (invalid params) per the CLAUDE.md contract, not
+			// STALE_CURSOR (which is reserved for "valid encoding, wrong filter").
+			OutError = LVL_MakeError(Request, kLVLErrorInvalidParams,
+				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
+			return false;
+		}
+		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
+		{
+			OutError = LVL_MakeError(Request, kMCPErrorStaleCursor,
+				TEXT("page_token filter_hash mismatch — caller mutated filter between pages; "
+					 "restart pagination with page_token=null"));
+			return false;
+		}
+		return true;
 	}
 } // namespace
 
@@ -846,11 +916,16 @@ FMCPResponse Tool_SetWorldSettings(const FMCPRequest& Request)
 
 // ─── level.get_persistent_level_actors (read-only, paginated — works in PIE) ─────────────────
 //
-// Page-by-index iteration over the persistent level's Actors[] array (or the sublevel resolved
-// via map_path). Cursor is the integer offset of the next entry.
+// Keyset-paginated iteration over the persistent level's Actors[] array (or the sublevel resolved
+// via map_path). Cursor = opaque FMCPPageCursor (base64 JSON: filter_hash + last actor PathName +
+// total_known snapshot). Survives mid-pagination level mutations: new actors land in their sorted
+// slot, deleted actors leave a gap the next-greater key fills naturally.
+//
+// Filter-hash inputs: the resolved level's package name. ``page_size`` may change between pages.
+// Switching ``map_path`` → -32015 STALE_CURSOR.
 //
 // Args: { "map_path": "..." (optional, defaults to persistent level), "page_size": int (default 200),
-//   "page_token": "..." (opaque base10 int offset). }
+//   "page_token": "..." (opaque base64; null/empty → first page). }
 //
 // Response: { "map_path": "...", "actors": [...], "next_page_token": str|null, "total_known": N }
 FMCPResponse Tool_GetPersistentLevelActors(const FMCPRequest& Request)
@@ -881,54 +956,88 @@ FMCPResponse Tool_GetPersistentLevelActors(const FMCPRequest& Request)
 		return LVL_MakeError(Request, kMCPErrorLevelNotFound, TEXT("no persistent level on world"));
 	}
 
-	int32 PageSize = 200;
-	if (Request.Args.IsValid())
-	{
-		Request.Args->TryGetNumberField(TEXT("page_size"), PageSize);
-	}
-	PageSize = FMath::Clamp(PageSize, 1, 1000);
+	const int32 PageSize = LVL_ClampPageSize(Request.Args, TEXT("page_size"), 200);
 
-	int32 StartIdx = 0;
+	// Filter hash binds the result-set identity to the resolved level package name. Caller can
+	// omit map_path (defaults to persistent) on page 1 and pass the persistent's path explicitly
+	// on page 2 — both resolve to the same package, same hash, cursor stays valid.
+	const FString ResolvedLevelPkg = Level->GetOutermost()->GetName();
+	const uint64 FilterHash = LVL_HashLevelFilter(ResolvedLevelPkg);
+
+	FString PageTokenWire;
 	if (Request.Args.IsValid())
 	{
-		FString Token;
-		if (Request.Args->TryGetStringField(TEXT("page_token"), Token) && !Token.IsEmpty())
+		Request.Args->TryGetStringField(TEXT("page_token"), PageTokenWire);
+	}
+	FMCPPageCursor Cursor;
+	FMCPResponse CursorErr;
+	if (!LVL_DecodeCursor(Request, PageTokenWire, FilterHash, Cursor, CursorErr))
+	{
+		return CursorErr;
+	}
+
+	// Build a stable sorted view. ``Level->Actors`` may contain null entries (post-destroy gaps);
+	// drop them up front so the sort key & sentinel comparison are well-defined.
+	const TArray<AActor*>& AllActors = Level->Actors;
+	TArray<AActor*> Sorted;
+	Sorted.Reserve(AllActors.Num());
+	for (AActor* A : AllActors)
+	{
+		if (A)
 		{
-			StartIdx = FCString::Atoi(*Token);
-			if (StartIdx < 0)
-			{
-				StartIdx = 0;
-			}
+			Sorted.Add(A);
 		}
 	}
+	Sorted.StableSort([](const AActor& A, const AActor& B)
+	{
+		return A.GetPathName().Compare(B.GetPathName(), ESearchCase::IgnoreCase) < 0;
+	});
 
-	const TArray<AActor*>& Actors = Level->Actors;
-	const int32 Total = Actors.Num();
-	const int32 EndExcl = FMath::Min(Total, StartIdx + PageSize);
+	const int32 TotalKnown = Sorted.Num();
+
+	// Skip-until-past-sentinel. O(N) linear scan — matches the AR pattern; for typical level sizes
+	// (<10k actors) this is negligible vs the JSON marshalling cost.
+	int32 StartIdx = 0;
+	if (!Cursor.LastAssetPath.IsEmpty())
+	{
+		while (StartIdx < TotalKnown)
+		{
+			if (Sorted[StartIdx]->GetPathName().Compare(Cursor.LastAssetPath, ESearchCase::IgnoreCase) > 0)
+			{
+				break;
+			}
+			++StartIdx;
+		}
+	}
+	const int32 EndExcl = FMath::Min(TotalKnown, StartIdx + PageSize);
 
 	TArray<TSharedPtr<FJsonValue>> Out;
 	Out.Reserve(EndExcl - StartIdx);
+	FString NextSentinel;
 	for (int32 i = StartIdx; i < EndExcl; ++i)
 	{
-		AActor* Actor = Actors[i];
-		if (!Actor)
-		{
-			continue;
-		}
-		Out.Add(MakeShared<FJsonValueObject>(LVL_BuildActorSummary(Actor)));
+		Out.Add(MakeShared<FJsonValueObject>(LVL_BuildActorSummary(Sorted[i])));
+	}
+	if (EndExcl < TotalKnown && Out.Num() > 0)
+	{
+		NextSentinel = Sorted[EndExcl - 1]->GetPathName();
 	}
 
 	TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-	Obj->SetStringField(TEXT("map_path"), Level->GetOutermost()->GetName());
+	Obj->SetStringField(TEXT("map_path"), ResolvedLevelPkg);
 	Obj->SetArrayField(TEXT("actors"), Out);
-	Obj->SetNumberField(TEXT("total_known"), static_cast<double>(Total));
-	if (EndExcl < Total)
+	Obj->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
+	if (NextSentinel.IsEmpty())
 	{
-		Obj->SetStringField(TEXT("next_page_token"), FString::FromInt(EndExcl));
+		Obj->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
 	else
 	{
-		Obj->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
+		FMCPPageCursor NewCursor;
+		NewCursor.FilterHash = FilterHash;
+		NewCursor.LastAssetPath = NextSentinel;
+		NewCursor.TotalKnownSnapshot = TotalKnown;
+		Obj->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
 	}
 	return LVL_MakeSuccessObj(Request, Obj);
 }

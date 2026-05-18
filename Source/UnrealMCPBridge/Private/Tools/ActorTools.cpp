@@ -4,10 +4,10 @@
 
 #include "FMCPDispatchQueue.h"
 #include "UnrealMCPBridge.h"
-#include "Utility/MCPActorPathUtils.h"
-#include "Utility/MCPReflection.h"
-#include "Utility/MCPWorldContext.h"
+#include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPPageCursor.h"
+#include "Utils/MCPReflection.h"
+#include "Utils/MCPWorldContext.h"
 
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
@@ -77,9 +77,14 @@ namespace
 
 	/**
 	 * Read a Vector value from a JSON object — accepts either ``{x,y,z}`` shorthand OR the canonical
-	 * marshalling ``{_kind:"Vector",x,y,z}`` form. Returns true on success.
+	 * marshalling ``{_kind:"Vector",x,y,z}`` form. Returns true on success; on false, ``OutV`` is
+	 * left untouched and the caller must keep its pre-existing default.
+	 *
+	 * Kept as bool-out-param (NOT TOptional) for consistency with sibling helpers
+	 * ``ACT_ReadJsonRotator`` / ``ACT_ReadJsonString``. ``[[nodiscard]]`` forces deliberate
+	 * handling — fire-and-forget callers must explicitly ``(void)`` the result.
 	 */
-	bool ACT_ReadJsonVector(const TSharedPtr<FJsonObject>& Obj, FVector& OutV)
+	[[nodiscard]] bool ACT_ReadJsonVector(const TSharedPtr<FJsonObject>& Obj, FVector& OutV)
 	{
 		if (!Obj.IsValid())
 		{
@@ -486,13 +491,26 @@ namespace
 		}
 	}
 
+	/**
+	 * Filter-kind discriminator for ``ACT_HashFilter`` — replaces raw 0/1/2 magic ints with
+	 * a type-safe enum so the compiler catches accidental int↔enum implicit conversions.
+	 * Underlying values are part of the on-the-wire hash contract — DO NOT reorder existing
+	 * entries (would invalidate every outstanding page_token).
+	 */
+	enum class EACTHashFilter : uint8
+	{
+		Class = 0,
+		Label = 1,
+		Tag   = 2,
+	};
+
 	/** Compute a stable hash for a filter string (class_path / label / tag). */
-	uint64 ACT_HashFilter(const FString& A, const FString& B = FString(), bool bC = false, int32 D = 0)
+	uint64 ACT_HashFilter(const FString& A, const FString& B, bool bC, EACTHashFilter Kind)
 	{
 		const uint32 H1 = GetTypeHash(A);
 		const uint32 H2 = GetTypeHash(B);
 		const uint32 H3 = bC ? 0x9E3779B9u : 0x12345678u;
-		const uint32 H4 = static_cast<uint32>(D);
+		const uint32 H4 = static_cast<uint32>(Kind);
 		uint64 Out = (static_cast<uint64>(H1) << 32) ^ H2;
 		Out ^= (static_cast<uint64>(H3) << 16);
 		Out ^= H4;
@@ -570,22 +588,36 @@ namespace
 
 	// ─── cycle detection (attach) ────────────────────────────────────────────────────────────────
 
-	/**
-	 * Walk parent chain from ``Start``; returns true if ``Target`` appears anywhere in the chain.
-	 * Used by Tool_Attach to refuse parent reassignments that would create a cycle.
-	 */
-	bool ACT_AttachWouldCycle(const AActor* NewParent, const AActor* Child)
+	/** Maximum attach-chain depth ``ACT_AttachWouldCycle`` will traverse before giving up. */
+	constexpr int32 kACTMaxAttachDepth = 256;
+
+	/** Tri-state result for the bounded cycle walk. */
+	enum class EACTCycleCheckResult : uint8
 	{
-		if (!NewParent || !Child) { return false; }
-		if (NewParent == Child) { return true; }
+		Safe,         // walk completed, ``Child`` not found in ancestor chain
+		WouldCycle,   // ``Child`` is already an ancestor of ``NewParent`` — attach forbidden
+		DepthExceeded // hit ``kACTMaxAttachDepth`` without terminating — corrupted hierarchy
+	};
+
+	/**
+	 * Walk parent chain from ``NewParent`` upward; returns ``WouldCycle`` if ``Child`` appears in
+	 * the chain, ``DepthExceeded`` if the walk exceeds ``kACTMaxAttachDepth`` (indicating a likely
+	 * pre-existing cycle in the actor graph — fail-fast rather than infinite-loop), else ``Safe``.
+	 * Used by Tool_Attach to refuse parent reassignments that would create a loop.
+	 */
+	EACTCycleCheckResult ACT_AttachWouldCycle(const AActor* NewParent, const AActor* Child)
+	{
+		if (!NewParent || !Child) { return EACTCycleCheckResult::Safe; }
+		if (NewParent == Child)   { return EACTCycleCheckResult::WouldCycle; }
 		const AActor* Cur = NewParent;
-		// Bounded walk — a sane attach chain is at most a few dozen deep; cap at 64 for safety.
-		for (int32 i = 0; i < 64 && Cur; ++i)
+		for (int32 i = 0; i < kACTMaxAttachDepth; ++i)
 		{
-			if (Cur == Child) { return true; }
+			if (!Cur) { return EACTCycleCheckResult::Safe; }
+			if (Cur == Child) { return EACTCycleCheckResult::WouldCycle; }
 			Cur = Cur->GetAttachParentActor();
 		}
-		return false;
+		// Cap reached without termination — chain is either pathologically deep or already cyclic.
+		return EACTCycleCheckResult::DepthExceeded;
 	}
 
 	/**
@@ -670,7 +702,8 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 	const TSharedPtr<FJsonObject>* LocObj = nullptr;
 	if (Request.Args->TryGetObjectField(TEXT("location"), LocObj) && LocObj && LocObj->IsValid())
 	{
-		ACT_ReadJsonVector(*LocObj, Location);
+		// Default Location remains (0,0,0) if read fails — intentional fall-through.
+		(void)ACT_ReadJsonVector(*LocObj, Location);
 	}
 	const TSharedPtr<FJsonObject>* RotObj = nullptr;
 	if (Request.Args->TryGetObjectField(TEXT("rotation"), RotObj) && RotObj && RotObj->IsValid())
@@ -936,7 +969,8 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	if (Request.Args->TryGetObjectField(TEXT("offset_location"), OffsetObj)
 		&& OffsetObj && OffsetObj->IsValid())
 	{
-		ACT_ReadJsonVector(*OffsetObj, OffsetLoc);
+		// Default OffsetLoc remains (0,0,0) if read fails — intentional fall-through.
+		(void)ACT_ReadJsonVector(*OffsetObj, OffsetLoc);
 	}
 
 	FActorSpawnParameters Params;
@@ -1374,13 +1408,21 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 					*Parent->GetLevel()->GetOutermost()->GetName() : TEXT("?")));
 	}
 
-	// Cycle detection.
-	if (ACT_AttachWouldCycle(Parent, Child))
+	// Cycle detection — bounded walk, fail-fast on corrupted/infinite ancestor chain.
+	switch (ACT_AttachWouldCycle(Parent, Child))
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
-			FString::Printf(
-				TEXT("attach would create a cycle — '%s' (or its ancestor) is already attached under '%s'"),
-				*Parent->GetName(), *Child->GetName()));
+		case EACTCycleCheckResult::WouldCycle:
+			return ACT_MakeError(Request, kACTErrorInvalidParams,
+				FString::Printf(
+					TEXT("attach would create a cycle — '%s' (or its ancestor) is already attached under '%s'"),
+					*Parent->GetName(), *Child->GetName()));
+		case EACTCycleCheckResult::DepthExceeded:
+			return ACT_MakeError(Request, kACTErrorInternal,
+				FString::Printf(
+					TEXT("attach hierarchy depth exceeded (%d ancestors walked from '%s'); possible cycle in existing parent chain"),
+					kACTMaxAttachDepth, *Parent->GetName()));
+		case EACTCycleCheckResult::Safe:
+			break;
 	}
 
 	FName SocketName(NAME_None);
@@ -1770,7 +1812,8 @@ FMCPResponse Tool_SelectInEditor(const FMCPRequest& Request)
 // Args:
 //   class_path     (required) — same resolution as actor.spawn
 //   search_subclasses (optional bool, default true) — IsA semantics; false = exact class
-//   page_size      (optional, default 200, clamped to [1, 1000])
+//   page_size      (optional, default 100, clamped to [1, 1000]) — Phase 3 cap keeps
+//                  responses comfortably under 256 KB; bump only if caller truly needs more
 //   page_token     (optional opaque base64 from previous response)
 //
 // Response: { actors: [...], total_known, next_page_token: str | null }
@@ -1838,7 +1881,7 @@ FMCPResponse Tool_FindByClass(const FMCPRequest& Request)
 	}
 	ACT_SortByPathName(Matches);
 
-	const uint64 FilterHash = ACT_HashFilter(TargetClass->GetPathName(), FString(), bSearchSubclasses, 0);
+	const uint64 FilterHash = ACT_HashFilter(TargetClass->GetPathName(), FString(), bSearchSubclasses, EACTHashFilter::Class);
 
 	FString TokenWire;
 	Request.Args->TryGetStringField(TEXT("page_token"), TokenWire);
@@ -1849,7 +1892,7 @@ FMCPResponse Tool_FindByClass(const FMCPRequest& Request)
 		return CursorErr;
 	}
 
-	const int32 PageSize = ACT_ClampPageSize(Request.Args, TEXT("page_size"), 200);
+	const int32 PageSize = ACT_ClampPageSize(Request.Args, TEXT("page_size"), 100);
 
 	TArray<AActor*> Page;
 	FString NextSentinel;
@@ -1914,7 +1957,7 @@ FMCPResponse Tool_FindByLabel(const FMCPRequest& Request)
 	}
 	ACT_SortByPathName(Matches);
 
-	const uint64 FilterHash = ACT_HashFilter(LabelSub, FString(), bExact, 1);
+	const uint64 FilterHash = ACT_HashFilter(LabelSub, FString(), bExact, EACTHashFilter::Label);
 
 	FString TokenWire;
 	Request.Args->TryGetStringField(TEXT("page_token"), TokenWire);
@@ -1925,7 +1968,7 @@ FMCPResponse Tool_FindByLabel(const FMCPRequest& Request)
 		return CursorErr;
 	}
 
-	const int32 PageSize = ACT_ClampPageSize(Request.Args, TEXT("page_size"), 200);
+	const int32 PageSize = ACT_ClampPageSize(Request.Args, TEXT("page_size"), 100);
 
 	TArray<AActor*> Page;
 	FString NextSentinel;
@@ -1973,7 +2016,7 @@ FMCPResponse Tool_FindByTag(const FMCPRequest& Request)
 	}
 	ACT_SortByPathName(Matches);
 
-	const uint64 FilterHash = ACT_HashFilter(Tag, FString(), false, 2);
+	const uint64 FilterHash = ACT_HashFilter(Tag, FString(), false, EACTHashFilter::Tag);
 
 	FString TokenWire;
 	Request.Args->TryGetStringField(TEXT("page_token"), TokenWire);
@@ -1984,7 +2027,7 @@ FMCPResponse Tool_FindByTag(const FMCPRequest& Request)
 		return CursorErr;
 	}
 
-	const int32 PageSize = ACT_ClampPageSize(Request.Args, TEXT("page_size"), 200);
+	const int32 PageSize = ACT_ClampPageSize(Request.Args, TEXT("page_size"), 100);
 
 	TArray<AActor*> Page;
 	FString NextSentinel;

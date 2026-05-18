@@ -7,13 +7,36 @@ the editor for asset/level/blueprint authoring tasks.
 
 ## Status
 
-**Phase 2 complete — 31 user-visible tools + 5 internal C++ handlers (post-Hotfix-3).**
+**Phase 3 complete — 92 user-visible tools + 10 internal hidden handlers.**
 
 | Phase | Tools | Surface |
 |---|---|---|
 | Phase 1 | 16 | marshall.* (4), job.* (5), log.* (3), tools.list, editor.* (3) |
 | Phase 2 | 31 | asset.* (13 C++ + 6 Python composites = 19), cb.* (12) — plus 5 internal hidden handlers |
-| **Total** | **47** | (user-visible; 36 total handler registrations counting hidden internals) |
+| Phase 3 | 45 | level.* (12), actor.* (20), component.* (8), composites (5 user-visible Python) — plus 5 internal hidden C++ handlers |
+| **Total** | **92** | (user-visible; 102 total handler registrations counting hidden internals) |
+
+### Phase 3 polish round (2026-05) — 5 known issues addressed
+
+After Phase 3 Days 11-14 landed, a polish pass cleared 5 remaining nits:
+
+- **#9** `level.get_persistent_level_actors` migrated from integer-offset pagination to
+  `FMCPPageCursor` sentinel cursor (filter_hash + last_path + total_known snapshot). Caller
+  changing filter mid-pagination now returns `-32015 StaleCursor` instead of silently skipping
+  items.
+- **#10** ActorTools.cpp: page_size default 200 → 100 (256 KB JSON cap convention),
+  `ACT_ReadJsonVector` made `[[nodiscard]]`, `ACT_HashFilter` discriminator promoted to
+  `enum class EACTHashFilter : uint8`, `Tool_Attach` cycle-detection walk gained a 256-depth
+  bound returning `-32603` on overflow.
+- **#11** Folder unification — `Source/UnrealMCPBridge/Private/Utility/` (Phase 3 utilities)
+  merged into `Utils/` (Phase 1/2 utilities). Single utility namespace per project convention.
+- **#12** Phase 1 Python dispatcher: tool-body Python exceptions now translate to JSON-RPC
+  errors with type-tagged messages (`ValueError`/`KeyError`/`TypeError` → `-32602 Invalid Params`,
+  other `Exception` → `-32603 Internal Error`). Prior to this fix, a composite raising
+  `ValueError` on empty input would block the game thread and the client would get a `-32002 Timeout`
+  after ~5 s instead of a structured error.
+- **#13** README updated with Phase 3 inventory + consolidated `smoke_phase3.py` wrapper script
+  (calls all 4 Days sub-suites and aggregates pass/fail).
 
 ### Known limitation — Phase 2 ships all tools Lane A (Hotfix 1, 2026-05)
 
@@ -86,25 +109,41 @@ UnrealMCPBridge/
     Private/
       UnrealMCPBridge.cpp, FMCPConnection.cpp, FMCPServer.cpp, ...
       Tools/
-        AssetRegistryTools.h/.cpp   # Category A — 13 AR reads (all Lane A post-hotfix; was 10 Lane B)
-        ContentBrowserTools.h/.cpp  # Category B — 12 CB writes (all Lane A; list_folders was Lane B)
-        AssetCompositeTools.h/.cpp  # Category D — 5 internal C++ helpers (all Lane B, all async-job)
-      Utils/
-        MCPAssetPathUtils.h/.cpp    # Path canonicalisation
-        MCPARFilterParser.h/.cpp    # FARFilter JSON ↔ struct + hash
-        MCPPageCursor.h/.cpp        # Opaque cursor encode/decode
-        MCPPathSandbox.h/.cpp       # Disk path whitelist guard
+        AssetRegistryTools.h/.cpp   # Phase 2 Category A — 13 AR reads (all Lane A post-hotfix; was 10 Lane B)
+        ContentBrowserTools.h/.cpp  # Phase 2 Category B — 12 CB writes (all Lane A; list_folders was Lane B)
+        AssetCompositeTools.h/.cpp  # Phase 2 Category D — 5 internal C++ helpers (all Lane B, all async-job)
+        LevelTools.h/.cpp           # Phase 3 Category A — 12 level.* tools + 1 hidden Lane B probe
+        ActorTools.h/.cpp           # Phase 3 Category B — 20 actor.* tools (all Lane A)
+        ComponentTools.h/.cpp       # Phase 3 Category C — 8 component.* tools (all Lane A)
+        LevelCompositeTools.h/.cpp  # Phase 3 Category D — 5 internal C++ submitters (Lane B, async-job)
+      Utils/                                # Unified utility namespace post-polish #11
+        MCPAssetPathUtils.h/.cpp    # Phase 2 — asset path canonicalisation
+        MCPARFilterParser.h/.cpp    # Phase 2 — FARFilter JSON ↔ struct + hash
+        MCPPageCursor.h/.cpp        # Phase 2 — opaque sentinel cursor (also used by Phase 3)
+        MCPPathSandbox.h/.cpp       # Phase 2 — disk-path whitelist guard
+        MCPReflection.h/.cpp        # Phase 3 Day 0 — FProperty read/write helpers + FMCPWritePropertyScope RAII
+        MCPWorldContext.h/.cpp      # Phase 3 — GetEditorWorld / IsPIEActive / ResolveLevelByMapPath
+        MCPActorPathUtils.h/.cpp    # Phase 3 — ParseActorPath / BuildActorPath / ResolveActor
+        MCPComponentPathUtils.h/.cpp # Phase 3 — ResolveComponent (with ambiguity detection)
+        MCPPropertyPathParser.h/.cpp # Phase 3 — dotted path + array-index parser
   Content/Python/MCPTools/
-    registry.py     # @tool decorator (with _internal=True filter)
+    registry.py     # @tool decorator (with _internal=True filter); Phase 1 polish #12 wraps
+                    # tool body with try/except → translates Python exceptions to JSON-RPC errors
     marshall.py     # Tier 1 type marshalling
     tools/
       smoke_tools.py       # editor.ping demo
-      asset_tools.py       # Shared helpers for composites
-      asset_composites.py  # 6 Category D Python composites
+      asset_tools.py       # Shared helpers for Phase 2 composites
+      asset_composites.py  # Phase 2 — 6 Category D Python composites
+      level_composites.py  # Phase 3 — 5 Category D Python composites (level/actor batch ops)
   Tests/
-    smoke_ping.py        # Phase 1 14-subtest smoke
-    smoke_phase2.py      # Phase 2 34-subtest smoke
-    lane_b_spike.py      # Day 0 audit harness
+    smoke_ping.py                # Phase 1 14-subtest smoke
+    smoke_phase2.py              # Phase 2 34-subtest smoke
+    smoke_phase3.py              # Phase 3 wrapper — runs all 4 Days sub-suites and aggregates
+    smoke_phase3_days_1_3.py     # Phase 3 — 12 level.* tools
+    smoke_phase3_days_4_8.py     # Phase 3 — 20 actor.* tools (22 sub-tests)
+    smoke_phase3_days_9_10.py    # Phase 3 — 8 component.* tools
+    smoke_phase3_days_11_14.py   # Phase 3 — 5 composite tools (9 sub-tests)
+    lane_b_spike.py              # Phase 2 Day 0 Lane B audit harness
 ```
 
 ## Phase 2 tool catalogue (31 user-visible tools)
@@ -233,6 +272,127 @@ always worked correctly.
 The bridge-level helper ``wait_for_job_and_return_result`` (in ``asset_tools.py``) remains
 available for future tooling that runs off-GT, but NO production composite uses it.
 
+## Phase 3 tool catalogue (45 user-visible tools)
+
+Breakdown: **12 level.*** + **20 actor.*** + **8 component.*** + **5 user-visible Python composites**
+= 45 user-visible tools, plus **5 internal hidden** level._*/actor._*_internal C++ submitters
+used by the Python composites (all async-job pattern).
+
+All Phase 3 mutators are **PIE-guarded** — refused with `-32027 PIEActive` when
+`GEditor->PlayWorld != nullptr`, returning the frozen message that points callers at the
+future `pie.*` surface (Phase 5). World Partition maps are hard-rejected by every level/actor
+mutator with `-32029 WorldPartitionNotSupported`.
+
+### Category A — Level operations (12 tools, all Lane A)
+
+```
+level.list_loaded                  → {levels[{map_path, kind, loaded, visible, ...}]}
+level.current_map                  → {map_path, world_kind}
+level.load                         → {loaded, was_already_loaded}             editor-world only
+level.save                         → {saved, dirty_before, package_size}      transactional
+level.create                       → {created, map_path}                       PIE-guarded
+level.unload                       → {unloaded, was_loaded}                    PIE-guarded
+level.set_streaming_state          → {state_changed, prior_state, new_state}  PIE-guarded
+level.get_world_settings           → {properties:{gravity, time_dilation, ...7 fields}}
+level.set_world_settings           → {applied_count, rejected[{field, reason}]}
+level.get_persistent_level_actors  → {actors[{actor_path, class, label}], next_page_token, total_known}
+level.save_all_dirty               → {job_id}                                  ASYNC (Lane A submitter)
+level.duplicate                    → {duplicated, source_map, dest_map}        PIE-guarded
+```
+
+### Category B — Actor operations (20 tools, all Lane A)
+
+```
+actor.spawn                  → {actor_path, label}                       PIE-guarded
+actor.destroy                → {destroyed, was_already_gone}             PIE-guarded
+actor.duplicate              → {actor_path}                              PIE-guarded
+actor.get                    → {actor_path, class, label, folder, transform, components_count}
+actor.set_transform          → {applied, prior}                          PIE-guarded
+actor.set_location           → {applied, prior_location}                 PIE-guarded
+actor.set_rotation           → {applied, prior_rotation}                 PIE-guarded
+actor.set_scale              → {applied, prior_scale}                    PIE-guarded
+actor.set_label              → {applied, prior_label}                    PIE-guarded
+actor.set_folder             → {applied, prior_folder}                   PIE-guarded
+actor.attach                 → {attached, prior_parent}                  PIE-guarded; 256-depth cycle bound
+actor.detach                 → {detached, was_attached_to}               PIE-guarded
+actor.get_property           → {value, type, property_path}              uses FMCPReflection
+actor.set_property           → {applied, prior_value}                    edit-const 3-flag gate + RAII scope
+actor.exists                 → {exists}
+actor.select_in_editor       → {selected}                                editor-only
+actor.find_by_class          → {matches[{actor_path, label}], next_page_token, total_known}
+actor.find_by_label          → {matches[...], next_page_token, total_known}
+actor.find_by_tag            → {matches[...], next_page_token, total_known}
+actor.list_components        → {components[{component_path, class, attach_parent}]}
+```
+
+### Category C — Component operations (8 tools, all Lane A)
+
+```
+component.add                                → {component_path, class}              PIE-guarded; full lifecycle
+component.remove                             → {removed}                            PIE-guarded
+component.get                                → {component_path, class, attach_parent, transform, properties}
+component.get_property                       → {value, type}
+component.set_property                       → {applied, prior_value}              edit-const gate
+component.set_transform                      → {applied, prior}                    PIE-guarded
+component.move_in_hierarchy                  → {moved, prior_parent}               PIE-guarded
+component.list_class_default_subcomponents   → {subcomponents[{name, class}]}
+```
+
+`component.add` walks the full UE registration lifecycle:
+`NewObject` → `AddInstanceComponent` → `OnComponentCreated` → `RegisterComponent` →
+`RerunConstructionScripts`. Returns the resolved component path including ambiguity disambiguator
+suffix if needed (`-32024 AmbiguousComponent` if multiple components share an FName).
+
+### Category D — Python composites (5 user-visible + 5 internal C++) — ALL ASYNC
+
+Same pattern as Phase 2 composites — composites return `{job_id}` immediately; AI client polls
+`job.status` / `job.result` from outside the game thread. See "Why composites are async" under
+Phase 2's Category D for the deadlock pattern this resolves.
+
+```
+level.full_actor_dump          → {job_id}  → level._full_actor_dump_internal         (Lane B, async, GT body)
+level.find_actors_with_class   → {job_id}  → level._find_actors_with_class_internal  (Lane B, async, GT body)
+actor.batch_spawn              → {job_id}  → actor._batch_spawn_internal             (Lane B, async, GT body)
+actor.batch_destroy            → {job_id}  → actor._batch_destroy_internal           (Lane B, async, GT body)
+actor.batch_set_property       → {job_id}  → actor._batch_set_property_internal      (Lane B, async, GT body)
+```
+
+Inner result schemas (returned by `job.result` once `Succeeded`):
+
+```
+level.full_actor_dump          → {actors[{actor_path, class, label, transform, ...}], total_count, scanned_count}
+level.find_actors_with_class   → {matches[{actor_path, label}], scanned_count}
+actor.batch_spawn              → {succeeded[{actor_path, label, index}], failed[{index, reason}]}
+actor.batch_destroy            → {succeeded[{actor_path, was_already_gone, index}], failed[...]}
+actor.batch_set_property       → {succeeded[{actor_path, property_path, prior_value, index}], failed[...]}
+```
+
+Batch caps: `MAX_BATCH_ITEMS=1000` per request, `MAX_ACTORS_PER_DUMP=5000` for the dump. Empty
+input arrays return `-32602 InvalidParams` synchronously (NOT as a failing job — caught at the
+Python wrapper layer, which is why polish #12 mattered: pre-fix this synchronous rejection would
+silently time out instead of returning the proper error).
+
+### Phase 3 error codes (-32019..-32029)
+
+11 new error codes were added in Phase 3:
+
+```
+-32019 LevelNotFound                  map_path resolves to no UWorld, OR actor's owning sublevel not loaded
+-32020 ClassNotFound                  actor.spawn class_path autoload failed
+-32021 ClassAbstract                  actor.spawn target UClass has CLASS_Abstract
+-32022 WrongClassFamily               actor.spawn class_path is not an AActor subclass
+-32023 InvalidClassPath               actor.spawn class_path syntactically malformed
+-32024 AmbiguousComponent             component.* tools: actor has multiple components with same FName
+-32025 PropertyPathTooDeep            Property path nesting exceeds 16-segment hard cap
+-32026 PropertyIndexOOB               Property path used [N] indexing past array bounds
+-32027 PIEActive                      Editor-world mutator refused — PIE running (Phase 5 will ship pie.*)
+-32028 LevelNotStreamingEntry         level.set_streaming_state target not in GetStreamingLevels()
+-32029 WorldPartitionNotSupported     Map is World Partition — Phase 5 will ship dedicated wp.* surface
+```
+
+The `-32027 PIEActive` message is **frozen** — smoke tests assert both substrings `"Phase 5"`
+and `"pie."` so any client UI can rely on stable wording.
+
 ## Common patterns
 
 ### `cb.move_with_redirector_cleanup` (2-line recipe — no separate tool)
@@ -344,16 +504,24 @@ their content (custom Game-Mode subclasses, asset-manager driven systems, etc.).
 
 ## Smoke tests
 
-Two end-to-end harnesses live in `Tests/`:
+End-to-end harnesses live in `Tests/`. All require the editor running with the bridge
+listener up (loopback port 30020 by default).
 
-- `smoke_ping.py` — 14 sub-tests covering Phase 1 (`editor.*`, `marshall.*`,
-  `job.*`, `log.*`, `tools.list`).
-- `smoke_phase2.py` — 34 sub-tests covering Phase 2 (every Category A/B/D tool
-  exercised with a positive + negative case).
+| Suite | Sub-tests | Surface |
+|---|---|---|
+| `smoke_ping.py` | 14 | Phase 1 — `editor.*`, `marshall.*`, `job.*`, `log.*`, `tools.list` |
+| `smoke_phase2.py` | 34 | Phase 2 — every Category A/B/D asset/cb tool, positive + negative |
+| `smoke_phase3.py` | **wrapper** | Runs all 4 Phase 3 sub-suites below and aggregates pass/fail |
+| `smoke_phase3_days_1_3.py` | 7 | Phase 3 Days 1-3 — 12 `level.*` tools + Lane B sanity |
+| `smoke_phase3_days_4_8.py` | 22 | Phase 3 Days 4-8 — 20 `actor.*` tools |
+| `smoke_phase3_days_9_10.py` | 9 | Phase 3 Days 9-10 — 8 `component.*` tools |
+| `smoke_phase3_days_11_14.py` | 9 | Phase 3 Days 11-14 — 5 composite tools (full_actor_dump, batch_spawn, ...) |
 
-Both require the editor running with the bridge listener up. Run as:
+Run a specific phase:
 ```
 python Tests/smoke_phase2.py [--host 127.0.0.1] [--port 30020]
+python Tests/smoke_phase3.py                              # runs all 4 sub-suites in sequence
+python Tests/smoke_phase3_days_4_8.py                     # just the actor.* surface
 ```
 
 Pre-test data prep (one-time, optional — sub-tests with missing assets log
@@ -364,3 +532,8 @@ SKIP rather than fail):
    magenta PNG for sub-test 23 (`cb.import`).
 3. `Plugins/UnrealMCPBridge/Tests/test_assets/test_mesh.fbx` — minimal cube
    FBX for sub-test 27 (`cb.bulk_import`). MAY BE SKIPPED.
+4. **Phase 3:** ANY non-empty editor map (the default test map at `/Game/Maps/Default`
+   suffices). `smoke_phase3_days_1_3.py` sub-test 5 reads `level.get_persistent_level_actors`
+   page 1 and asserts `total_known >= 0`. If the persistent level is empty, downstream
+   tests (`find_actors_with_class`, `batch_spawn`/`destroy`) still pass — they spawn their
+   own actors first.

@@ -21,13 +21,24 @@ namespace
 	 * (Content/Python/MCPTools/registry.py) so both sides agree.
 	 *
 	 *   -32601  Method not found              (tool name unknown to the registry)
-	 *   -32602  Invalid params                (tool arg dict could not be JSON-decoded)
-	 *   -32002  Server-defined: tool raised   (Python exception inside the tool body)
-	 *   -32603  Internal error                (wrapper script itself failed — protocol bug)
+	 *   -32602  Invalid params                Two cases:
+	 *                                          (a) tool arg dict could not be JSON-decoded, OR
+	 *                                          (b) tool body raised ValueError/KeyError/TypeError —
+	 *                                          these are caller-input errors (empty arrays, missing
+	 *                                          required keys, wrong types). Decided Python-side in
+	 *                                          the wrapper try/except by isinstance check.
+	 *   -32603  Internal error                Two cases:
+	 *                                          (a) wrapper script itself failed (protocol bug), OR
+	 *                                          (b) tool body raised any other Exception subclass
+	 *                                          (bug in the tool implementation).
+	 *
+	 *  Note: -32002 was the previous lump-everything-into-tool-exception code. Removed — any
+	 *  Python exception now flows through the -32602/-32603 fork above. BaseException (e.g.
+	 *  KeyboardInterrupt, SystemExit) deliberately NOT caught — those propagate so the Python
+	 *  plugin can surface them as wrapper-script failure → C++ -32603 protocol path.
 	 */
 	constexpr int32 kErrorMethodNotFound = -32601;
 	constexpr int32 kErrorInvalidParams  = -32602;
-	constexpr int32 kErrorToolException  = -32002;
 	constexpr int32 kErrorInternal       = -32603;
 
 	/**
@@ -236,11 +247,23 @@ FMCPResponse FMCPPythonEval::CallPythonTool(const FMCPRequest& Request)
 	//   2. passes args through MCPTools.marshall.json_to_py (Day 4-5: discriminator-driven
 	//      coercion of {"_kind":"Vector",...} → unreal.Vector etc.),
 	//   3. looks the tool up in the registry,
-	//   4. calls it (catching exceptions),
+	//   4. calls it (catching exceptions, mapping Python exception type → JSON-RPC code:
+	//      ValueError/KeyError/TypeError → -32602 Invalid Params (caller-input bug),
+	//      any other Exception subclass    → -32603 Internal Error  (tool-body bug)),
 	//   5. passes the result through MCPTools.marshall.py_to_json so tools can freely return
 	//      unreal.Vector / Rotator / Object / etc. without manual conversion,
 	//   6. emits __MCP_RESULT_START__<json>__MCP_RESULT_END__ via unreal.log so we can scrape it
 	//      from FPythonCommandEx::LogOutput on the C++ side.
+	//
+	// Why Python-side translation (vs C++ PyErr_Fetch): the wrapper already has a Python try/except
+	// anyway, isinstance is the canonical Python type-check, and the existing _mcp_error envelope
+	// already gives us the cross-language signal — we just refine which numeric code lands in it.
+	// Doing it C++-side would mean parsing CommandResult traceback strings or threading PyObject*
+	// across the IPythonScriptPlugin boundary, neither of which is cleaner.
+	//
+	// BaseException (KeyboardInterrupt, SystemExit, GeneratorExit) is intentionally NOT caught —
+	// those signal "stop everything" and propagating them lets the Python plugin tear down cleanly,
+	// surfacing as ExecPythonCommandEx returning false → wrapper-failure -32603 below.
 	//
 	// NOTE: the markers MUST appear in a SINGLE unreal.log call so they land in one LogOutput
 	// entry — otherwise our extractor would have to stitch consecutive entries. unreal.log's
@@ -249,9 +272,10 @@ FMCPResponse FMCPPythonEval::CallPythonTool(const FMCPRequest& Request)
 	const FString EndMarker(GetResultMarkerEnd());
 
 	// Argument order matters — Printf consumes args left-to-right, matching the %s slots in script:
-	//   first  %s : _method   base64 → MethodB64
-	//   second %s : _args     base64 → ArgsB64
-	//   three %d  : error codes for params / not-found / tool-exception
+	//   first  %s : _method     base64 → MethodB64
+	//   second %s : _args       base64 → ArgsB64
+	//   four %d   : invalid-params (json decode), method-not-found, invalid-params (caller-input),
+	//               internal-error (tool body bug)
 	//   final two %s : start + end markers
 	const FString Wrapper = FString::Printf(
 		TEXT("import base64, json, traceback\n")
@@ -274,14 +298,17 @@ FMCPResponse FMCPPythonEval::CallPythonTool(const FMCPRequest& Request)
 		TEXT("            _result = _tool['fn'](_args)\n")
 		TEXT("            _result_json = _marshall.py_to_json(_result)\n")
 		TEXT("            _payload = {'_mcp_ok': _result_json}\n")
+		TEXT("        except (ValueError, KeyError, TypeError) as _e:\n")
+		TEXT("            _payload = {'_mcp_error': {'code': %d, 'message': type(_e).__name__ + ': ' + str(_e), 'traceback': traceback.format_exc()}}\n")
 		TEXT("        except Exception as _e:\n")
-		TEXT("            _payload = {'_mcp_error': {'code': %d, 'message': str(_e), 'traceback': traceback.format_exc()}}\n")
+		TEXT("            _payload = {'_mcp_error': {'code': %d, 'message': type(_e).__name__ + ': ' + str(_e), 'traceback': traceback.format_exc()}}\n")
 		TEXT("unreal.log('%s' + json.dumps(_payload) + '%s')\n"),
 		*MethodB64,
 		*ArgsB64,
 		kErrorInvalidParams,
 		kErrorMethodNotFound,
-		kErrorToolException,
+		kErrorInvalidParams,
+		kErrorInternal,
 		*StartMarker,
 		*EndMarker);
 

@@ -5,9 +5,9 @@
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "UnrealMCPBridge.h"
-#include "Utility/MCPActorPathUtils.h"
-#include "Utility/MCPReflection.h"
-#include "Utility/MCPWorldContext.h"
+#include "Utils/MCPActorPathUtils.h"
+#include "Utils/MCPReflection.h"
+#include "Utils/MCPWorldContext.h"
 
 #include "Editor.h"
 #include "Engine/Engine.h"

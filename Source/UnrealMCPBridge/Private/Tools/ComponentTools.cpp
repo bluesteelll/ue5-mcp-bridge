@@ -4,10 +4,10 @@
 
 #include "FMCPDispatchQueue.h"
 #include "UnrealMCPBridge.h"
-#include "Utility/MCPActorPathUtils.h"
-#include "Utility/MCPComponentPathUtils.h"
-#include "Utility/MCPReflection.h"
-#include "Utility/MCPWorldContext.h"
+#include "Utils/MCPActorPathUtils.h"
+#include "Utils/MCPComponentPathUtils.h"
+#include "Utils/MCPReflection.h"
+#include "Utils/MCPWorldContext.h"
 
 #include "Components/ActorComponent.h"
 #include "Components/SceneComponent.h"

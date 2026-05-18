@@ -29,7 +29,11 @@
  *   - Python not initialised      -> -32603 "python not initialised"
  *   - ExecPythonCommandEx returns false -> -32603 "python eval failed" + log entries appended
  *   - Tool name not registered    -> -32601 "tool not found"
- *   - Tool raised an exception    -> -32002 "<exception message>" (full traceback logged to LogMCP)
+ *   - Tool raised ValueError/KeyError/TypeError -> -32602 "<ExcType>: <message>"
+ *                                   (caller-input bugs: empty arrays, missing required keys,
+ *                                   wrong types — full traceback logged to LogMCP)
+ *   - Tool raised any other Exception subclass  -> -32603 "<ExcType>: <message>"
+ *                                   (tool-body bug — full traceback logged to LogMCP)
  *   - Marker missing from output  -> -32603 "python wrapper produced no result marker"
  *   - Marker payload not JSON     -> -32603 "python wrapper result was not valid JSON"
  */
