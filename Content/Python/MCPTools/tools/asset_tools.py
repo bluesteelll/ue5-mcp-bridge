@@ -107,3 +107,62 @@ def dispatch_internal(method: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(result, dict):
         raise RuntimeError(f"dispatch_internal({method}): result is not an object, got {type(result).__name__}")
     return result
+
+
+def wait_for_job_and_return_result(job_id: str, timeout_s: float = 120.0,
+                                   poll_initial_s: float = 0.02,
+                                   poll_max_s: float = 0.5) -> Dict[str, Any]:
+    """Poll ``job.result`` until terminal, return the inner result payload.
+
+    Used by composite tools (``asset.find_unused``, ``asset.size_report``,
+    ``asset.batch_metadata_async``) that submitted a Lane-B C++ handler returning a job_id and
+    need to return the actual data back to the caller in the same composite call.
+
+    Polling rules:
+      - Each call passes ``wait_timeout_s=0`` to ``job.result`` so the server returns
+        immediately (no in-server blocking that would stall game-thread Drain for
+        bGameThreadRequired=true jobs).
+      - Sleep between polls grows exponentially from poll_initial_s up to poll_max_s. The sleep
+        is CRITICAL — it releases the game thread back to UE so AsyncTask(GameThread, …) job
+        bodies can advance, otherwise we'd starve our own job.
+      - Raises RuntimeError on Failed / Cancelled / timeout / unexpected response shape.
+      - Returns the dict that was the original handler's result.
+
+    ``job.result`` and ``job.status`` MUST be Lane B for this loop to be deadlock-free; both
+    were promoted in hotfix 2 (see C++ FMCPDay7Handlers.cpp / UnrealMCPBridge.cpp). If either
+    is reverted to Lane A this helper will hang because the poll request queues back to the
+    same game thread the composite is running on.
+    """
+    import time
+
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    sleep_s = max(0.001, float(poll_initial_s))
+    sleep_max = max(sleep_s, float(poll_max_s))
+
+    while True:
+        resp = dispatch_internal("job.result", {"job_id": job_id, "wait_timeout_s": 0})
+        state = resp.get("state")
+        if state == "Succeeded":
+            inner = resp.get("result")
+            if not isinstance(inner, dict):
+                raise RuntimeError(
+                    f"wait_for_job({job_id}): Succeeded but result is not an object — "
+                    f"got {type(inner).__name__}"
+                )
+            return inner
+        if state == "Failed":
+            raise RuntimeError(
+                f"wait_for_job({job_id}): Failed — {resp.get('error') or '(no error message)'}"
+            )
+        if state == "Cancelled":
+            raise RuntimeError(
+                f"wait_for_job({job_id}): Cancelled — {resp.get('message') or '(no message)'}"
+            )
+        # Still Pending / Running — keep polling unless we're past the deadline.
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"wait_for_job({job_id}): timeout after {timeout_s:.1f}s; last state={state!r} "
+                f"progress={resp.get('progress')}"
+            )
+        time.sleep(sleep_s)
+        sleep_s = min(sleep_max, sleep_s * 1.5)

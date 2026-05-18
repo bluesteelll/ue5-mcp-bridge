@@ -255,7 +255,15 @@ FMCPResponse FMCPDay7Handlers::JobSubmit(const FMCPRequest& Request)
 
 FMCPResponse FMCPDay7Handlers::JobStatus(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// HOTFIX 2 (2026-05): promoted to Lane B. Body only does (a) string parse of job_id and
+	// (b) FMCPJobRegistry::GetStatus which takes FScopeLock(JobsLock) and reads
+	// std::atomic fields — no UObject access, no AR enumeration, no GWorld. Required to break
+	// the composite-deadlock cycle where a Python composite that runs on the game thread inside
+	// CallPythonTool tries to dispatch_internal('job.status', ...) and blocks on socket.recv()
+	// — if job.status were Lane A, the request would queue back to the same game thread that's
+	// blocked on the socket, deadlocking until the 60s TCP timeout. Lane B lets the listener
+	// thread answer immediately so the game thread can continue processing the job-pool
+	// AsyncTask(GameThread) callbacks that drive bGameThreadRequired=true jobs to completion.
 
 	if (!Request.Args.IsValid())
 	{
@@ -283,7 +291,13 @@ FMCPResponse FMCPDay7Handlers::JobStatus(const FMCPRequest& Request)
 
 FMCPResponse FMCPDay7Handlers::JobResult(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	// HOTFIX 2 (2026-05): promoted to Lane B. Same rationale as JobStatus — composite tools call
+	// this via dispatch_internal (TCP loopback) from inside CallPythonTool on the game thread,
+	// so Lane A would deadlock. Body uses only thread-safe FMCPJobRegistry methods
+	// (GetStatus / GetResult — both FScopeLock(JobsLock)-guarded). wait_timeout_s honoured via
+	// FPlatformProcess::Sleep on the listener thread itself — clamped to 5s (existing) so a
+	// stuck job can't permanently lock the connection; other connections have their own threads
+	// and remain responsive. Callers SHOULD pass wait_timeout_s=0 and poll externally.
 
 	if (!Request.Args.IsValid())
 	{

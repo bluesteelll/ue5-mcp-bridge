@@ -154,9 +154,9 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// precedence over the Python fallback for ``marshall.*`` — see dispatch order in
 	// FMCPDispatchQueue::Drain. FHandler is a TFunction so we can pass the static method pointer
 	// directly — TFunction's converting ctor wraps it.
-	auto RegisterHandler = [this](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler)
+	auto RegisterHandler = [this](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler, bool bThreadSafe = false)
 	{
-		FMCPDispatchQueue::Get().RegisterHandler(MethodName, MoveTemp(Handler));
+		FMCPDispatchQueue::Get().RegisterHandler(MethodName, MoveTemp(Handler), bThreadSafe);
 		RegisteredMethodNames.Add(MethodName);
 	};
 	RegisterHandler(TEXT("marshall.list_properties"), &FMCPMarshalling::ListProperties);
@@ -166,9 +166,18 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 
 	// Day 7: async job system (5 handlers). Bodies dispatch to a separate worker pool — the
 	// handlers themselves are synchronous and bounded.
+	// HOTFIX 2 (2026-05): job.status + job.result registered Lane B so Python composites that
+	// submit jobs from inside the game thread (via dispatch_internal TCP loopback) can poll
+	// without deadlocking the game thread on socket.recv. Both handlers only read FMCPJobRegistry
+	// state under its internal lock — see the Lane B promotion notes in FMCPDay7Handlers.cpp.
+	// job.submit / job.cancel / job.list_active remain Lane A: submit creates a job (writes the
+	// jobs map under the same lock — safe in isolation, but conservatively Lane A because the
+	// SubmitJob path also calls EnsureInitialized which spins up the worker pool the first time
+	// and that pool init should run on the game thread for predictability). list_active is rarely
+	// hot-pathed by composites.
 	RegisterHandler(TEXT("job.submit"),      &FMCPDay7Handlers::JobSubmit);
-	RegisterHandler(TEXT("job.status"),      &FMCPDay7Handlers::JobStatus);
-	RegisterHandler(TEXT("job.result"),      &FMCPDay7Handlers::JobResult);
+	RegisterHandler(TEXT("job.status"),      &FMCPDay7Handlers::JobStatus,      /*bThreadSafe*/ true);
+	RegisterHandler(TEXT("job.result"),      &FMCPDay7Handlers::JobResult,      /*bThreadSafe*/ true);
 	RegisterHandler(TEXT("job.cancel"),      &FMCPDay7Handlers::JobCancel);
 	RegisterHandler(TEXT("job.list_active"), &FMCPDay7Handlers::JobListActive);
 

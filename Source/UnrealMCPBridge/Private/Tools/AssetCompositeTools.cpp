@@ -113,7 +113,26 @@ namespace
 namespace FAssetCompositeTools
 {
 
-// ─── asset._find_unused_internal (Lane A post-hotfix — IAR.GetAssets unsafe on listener) ────
+// ─── asset._find_unused_internal (HOTFIX 2 — async job pattern; sync handler is Lane B) ─────
+//
+// Why async?
+//
+//   Hotfix 1 demoted both internals to Lane A so the AR enumeration would run on the game thread
+//   (UE 5.7 asserts on non-game-thread enumeration — see AssetRegistry.cpp:2906). But that broke
+//   the Python composite path: asset.find_unused / asset.size_report run inside CallPythonTool
+//   on the game thread, then call dispatch_internal('asset._find_unused_internal', ...) which
+//   opens a TCP loopback and blocks on sock.recv(). The Lane-A handler would queue back to the
+//   SAME game thread that's blocked on the socket → 60-second deadlock until TCP timeout.
+//
+//   The fix: the sync handler runs Lane B (validate args → submit job → return {job_id}) — never
+//   touches AR on the listener thread. The actual enumeration runs in the job body via
+//   bGameThreadRequired=true (the worker thread blocks on AsyncTask(GameThread, …) → satisfies
+//   the UE 5.7 game-thread requirement for AR enumeration). The Python composite then polls
+//   job.result (also promoted to Lane B by this hotfix) which returns immediately on the listener
+//   thread without touching the game thread, so the game-thread Tick can drain the AsyncTask
+//   pending the job body. Loop completes, composite returns the inner result. No deadlock.
+//
+//   See FMCPDay7Handlers.cpp JobStatus/JobResult promotion notes for the dual-Lane-B contract.
 FMCPResponse Tool_FindUnusedInternal(const FMCPRequest& Request)
 {
 	TArray<FString> Scopes;
@@ -136,57 +155,95 @@ FMCPResponse Tool_FindUnusedInternal(const FMCPRequest& Request)
 		}
 	}
 
-	// Build a single AR query spanning all scopes (recursive).
-	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
-	FARFilter Filter;
-	Filter.bRecursivePaths = true;
-	for (const FString& S : Scopes) { Filter.PackagePaths.Add(FName(*S)); }
-
-	TArray<FAssetData> Candidates;
-	IAR.GetAssets(Filter, Candidates);
-
-	// Hard cap per the plan — 5000 entries.
-	constexpr int32 kFindUnusedCap = 5000;
-	if (Candidates.Num() > kFindUnusedCap)
-	{
-		return COMP_MakeError(Request, kMCPErrorOverlyBroadQuery,
-			FString::Printf(TEXT("scope contains %d candidates (cap=%d) — narrow package_paths"),
-				Candidates.Num(), kFindUnusedCap));
-	}
-
-	TArray<TSharedPtr<FJsonValue>> Unused;
-	Unused.Reserve(Candidates.Num());
-
-	for (const FAssetData& Data : Candidates)
-	{
-		// Skip excluded class kinds. Compare against the AssetClassPath string for portability
-		// (the user passes "/Script/Engine.World" etc.).
-		if (ExcludeClasses.Contains(Data.AssetClassPath.ToString()))
+	// Submit a game-thread-required job. The body runs on the game thread (via the registry's
+	// AsyncTask coordinator) so IAR.GetAssets enumeration is safe per the UE 5.7 contract.
+	const FGuid JobId = FMCPJobRegistry::Get().SubmitJob(
+		TEXT("asset._find_unused_internal"),
+		[ScopesCap = MoveTemp(Scopes), ExcludeClassesCap = MoveTemp(ExcludeClasses)]
+		(FMCPJob& Job) -> TSharedPtr<FJsonValue>
 		{
-			continue;
-		}
+			// Build a single AR query spanning all scopes (recursive).
+			IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+			FARFilter Filter;
+			Filter.bRecursivePaths = true;
+			for (const FString& S : ScopesCap) { Filter.PackagePaths.Add(FName(*S)); }
 
-		// Look up referencers via package-level GetReferencers (Lane B-safe). Empty result =
-		// unused per static analysis. The well-known caveat about runtime LoadClass / construction
-		// script refs being invisible to AR is documented in the tool description.
-		TArray<FName> Referencers;
-		IAR.GetReferencers(Data.PackageName, Referencers, UE::AssetRegistry::EDependencyCategory::Package);
-		if (Referencers.Num() == 0)
-		{
-			TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-			Obj->SetStringField(TEXT("asset_path"), Data.GetObjectPathString());
-			Obj->SetStringField(TEXT("class"),      Data.AssetClassPath.ToString());
-			Unused.Add(MakeShared<FJsonValueObject>(Obj));
-		}
+			TArray<FAssetData> Candidates;
+			IAR.GetAssets(Filter, Candidates);
+
+			// Hard cap per the plan — 5000 entries. Surfaced as ErrorMessage → job ends Failed,
+			// composite re-raises as RuntimeError with the cap message.
+			constexpr int32 kFindUnusedCap = 5000;
+			if (Candidates.Num() > kFindUnusedCap)
+			{
+				Job.ErrorMessage = FString::Printf(
+					TEXT("OVERLY_BROAD_QUERY: scope contains %d candidates (cap=%d) — narrow package_paths"),
+					Candidates.Num(), kFindUnusedCap);
+				return nullptr; // → Failed
+			}
+
+			TArray<TSharedPtr<FJsonValue>> Unused;
+			Unused.Reserve(Candidates.Num());
+
+			const int32 Total = Candidates.Num();
+			for (int32 i = 0; i < Total; ++i)
+			{
+				if (Job.bCancelRequested.load(std::memory_order_acquire))
+				{
+					Job.ErrorMessage = TEXT("cancelled");
+					return nullptr;
+				}
+				// Cheap progress update — Total may be small but the bridge still benefits from
+				// a non-zero progress reading for the polling client.
+				Job.Progress.store(static_cast<float>(i) / FMath::Max(1, Total),
+					std::memory_order_release);
+
+				const FAssetData& Data = Candidates[i];
+
+				// Skip excluded class kinds. Compare against the AssetClassPath string for portability
+				// (the user passes "/Script/Engine.World" etc.).
+				if (ExcludeClassesCap.Contains(Data.AssetClassPath.ToString()))
+				{
+					continue;
+				}
+
+				// Look up referencers via package-level GetReferencers. Empty result = unused per
+				// static analysis. The well-known caveat about runtime LoadClass / construction
+				// script refs being invisible to AR is documented in the tool description.
+				TArray<FName> Referencers;
+				IAR.GetReferencers(Data.PackageName, Referencers, UE::AssetRegistry::EDependencyCategory::Package);
+				if (Referencers.Num() == 0)
+				{
+					TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+					Obj->SetStringField(TEXT("asset_path"), Data.GetObjectPathString());
+					Obj->SetStringField(TEXT("class"),      Data.AssetClassPath.ToString());
+					Unused.Add(MakeShared<FJsonValueObject>(Obj));
+				}
+			}
+
+			Job.Progress.store(1.0f, std::memory_order_release);
+
+			TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+			Out->SetArrayField(TEXT("unused"), Unused);
+			Out->SetNumberField(TEXT("scanned_count"), Candidates.Num());
+			return MakeShared<FJsonValueObject>(Out);
+		},
+		/*bGameThreadRequired*/ true);
+
+	if (!JobId.IsValid())
+	{
+		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("unused"), Unused);
-	Out->SetNumberField(TEXT("scanned_count"), Candidates.Num());
+	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
 	return COMP_MakeSuccessObj(Request, Out);
 }
 
-// ─── asset._size_report_internal (Lane A post-hotfix — IAR.GetAssets unsafe on listener) ────
+// ─── asset._size_report_internal (HOTFIX 2 — async job pattern; sync handler is Lane B) ─────
+//
+// Identical deadlock-avoidance rationale as Tool_FindUnusedInternal above.
 FMCPResponse Tool_SizeReportInternal(const FMCPRequest& Request)
 {
 	TArray<FString> Scopes;
@@ -197,66 +254,98 @@ FMCPResponse Tool_SizeReportInternal(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("top_n"), TopN);
 	TopN = FMath::Clamp(TopN, 1, 1000);
 
-	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
-	FARFilter Filter;
-	Filter.bRecursivePaths = true;
-	for (const FString& S : Scopes) { Filter.PackagePaths.Add(FName(*S)); }
-
-	TArray<FAssetData> All;
-	IAR.GetAssets(Filter, All);
-
-	// Internal cap: 50,000 assets per call. Larger projects can still be analysed via per-folder
-	// subqueries; the cap is a defence against a runaway full-/Game/ scan.
-	constexpr int32 kSizeReportCap = 50000;
-	if (All.Num() > kSizeReportCap)
-	{
-		UE_LOG(LogMCP, Warning,
-			TEXT("asset._size_report_internal: scope contains %d assets, truncating to %d"),
-			All.Num(), kSizeReportCap);
-		All.SetNum(kSizeReportCap, EAllowShrinking::No);
-	}
-
-	// Pair: (size, idx-into-All). Sort descending by size, keep top N.
-	struct FEntry
-	{
-		int64 Bytes = 0;
-		int32 Index = INDEX_NONE;
-	};
-	TArray<FEntry> Entries;
-	Entries.Reserve(All.Num());
-
-	int64 TotalBytes = 0;
-	for (int32 i = 0; i < All.Num(); ++i)
-	{
-		FString PackageFilename;
-		if (!FPackageName::DoesPackageExist(All[i].PackageName.ToString(), &PackageFilename))
+	const FGuid JobId = FMCPJobRegistry::Get().SubmitJob(
+		TEXT("asset._size_report_internal"),
+		[ScopesCap = MoveTemp(Scopes), TopNCap = TopN]
+		(FMCPJob& Job) -> TSharedPtr<FJsonValue>
 		{
-			continue; // in-memory only
-		}
-		const int64 Size = IFileManager::Get().FileSize(*PackageFilename);
-		if (Size <= 0) { continue; }
-		TotalBytes += Size;
-		Entries.Add({ Size, i });
-	}
+			IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+			FARFilter Filter;
+			Filter.bRecursivePaths = true;
+			for (const FString& S : ScopesCap) { Filter.PackagePaths.Add(FName(*S)); }
 
-	Entries.Sort([](const FEntry& A, const FEntry& B) { return A.Bytes > B.Bytes; });
+			TArray<FAssetData> All;
+			IAR.GetAssets(Filter, All);
 
-	TArray<TSharedPtr<FJsonValue>> Top;
-	const int32 Limit = FMath::Min(TopN, Entries.Num());
-	Top.Reserve(Limit);
-	for (int32 i = 0; i < Limit; ++i)
+			// Internal cap: 50,000 assets per call. Larger projects can still be analysed via
+			// per-folder subqueries; the cap is a defence against a runaway full-/Game/ scan.
+			constexpr int32 kSizeReportCap = 50000;
+			if (All.Num() > kSizeReportCap)
+			{
+				UE_LOG(LogMCP, Warning,
+					TEXT("asset._size_report_internal: scope contains %d assets, truncating to %d"),
+					All.Num(), kSizeReportCap);
+				All.SetNum(kSizeReportCap, EAllowShrinking::No);
+			}
+
+			// Pair: (size, idx-into-All). Sort descending by size, keep top N.
+			struct FEntry
+			{
+				int64 Bytes = 0;
+				int32 Index = INDEX_NONE;
+			};
+			TArray<FEntry> Entries;
+			Entries.Reserve(All.Num());
+
+			int64 TotalBytes = 0;
+			const int32 Total = All.Num();
+			for (int32 i = 0; i < Total; ++i)
+			{
+				if (Job.bCancelRequested.load(std::memory_order_acquire))
+				{
+					Job.ErrorMessage = TEXT("cancelled");
+					return nullptr;
+				}
+				// Progress updates each 256 entries — file-size lookup is the slow part.
+				if ((i & 0xFF) == 0)
+				{
+					Job.Progress.store(static_cast<float>(i) / FMath::Max(1, Total),
+						std::memory_order_release);
+				}
+
+				FString PackageFilename;
+				if (!FPackageName::DoesPackageExist(All[i].PackageName.ToString(), &PackageFilename))
+				{
+					continue; // in-memory only
+				}
+				const int64 Size = IFileManager::Get().FileSize(*PackageFilename);
+				if (Size <= 0) { continue; }
+				TotalBytes += Size;
+				Entries.Add({ Size, i });
+			}
+
+			Entries.Sort([](const FEntry& A, const FEntry& B) { return A.Bytes > B.Bytes; });
+
+			TArray<TSharedPtr<FJsonValue>> Top;
+			const int32 Limit = FMath::Min(TopNCap, Entries.Num());
+			Top.Reserve(Limit);
+			for (int32 i = 0; i < Limit; ++i)
+			{
+				const FAssetData& Data = All[Entries[i].Index];
+				TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+				Obj->SetStringField(TEXT("asset_path"), Data.GetObjectPathString());
+				Obj->SetStringField(TEXT("class"),      Data.AssetClassPath.ToString());
+				Obj->SetNumberField(TEXT("bytes"),      static_cast<double>(Entries[i].Bytes));
+				Top.Add(MakeShared<FJsonValueObject>(Obj));
+			}
+
+			Job.Progress.store(1.0f, std::memory_order_release);
+
+			TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+			Out->SetArrayField(TEXT("top"), Top);
+			Out->SetNumberField(TEXT("total_bytes"), static_cast<double>(TotalBytes));
+			return MakeShared<FJsonValueObject>(Out);
+		},
+		/*bGameThreadRequired*/ true);
+
+	if (!JobId.IsValid())
 	{
-		const FAssetData& Data = All[Entries[i].Index];
-		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-		Obj->SetStringField(TEXT("asset_path"), Data.GetObjectPathString());
-		Obj->SetStringField(TEXT("class"),      Data.AssetClassPath.ToString());
-		Obj->SetNumberField(TEXT("bytes"),      static_cast<double>(Entries[i].Bytes));
-		Top.Add(MakeShared<FJsonValueObject>(Obj));
+		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("top"), Top);
-	Out->SetNumberField(TEXT("total_bytes"), static_cast<double>(TotalBytes));
+	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
 	return COMP_MakeSuccessObj(Request, Out);
 }
 
@@ -370,27 +459,24 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// HOTFIX 2026-05 (Plan R11 systemic-unsafe contingency): demoted to Lane A. Both internals
-	// call IAR.GetAssets(Filter) synchronously to walk the candidate set — same code path that
-	// asserts on listener thread in UE 5.7 ("Enumerating in-memory assets can only be done on
-	// the game thread or in the loader, there are too many GetAssetRegistryTags() still not
-	// thread-safe" — AssetRegistry.cpp:2906). See AssetRegistryTools.cpp registration block.
-	RegisterTool(TEXT("asset._find_unused_internal"),  &Tool_FindUnusedInternal,    /*Lane A (was B)*/ false);
-	RegisterTool(TEXT("asset._size_report_internal"),  &Tool_SizeReportInternal,    /*Lane A (was B)*/ false);
-
-	// _batch_metadata_internal: submits an async job, returns {job_id}. STAYS Lane B post-hotfix.
-	// The synchronous handler body does NOT enumerate AR — it only does (a) path-string Normalize
-	// + (b) FMCPJobRegistry::SubmitJob (thread-safe; no game-thread assert). The submitted lambda
-	// runs on the worker pool and calls IAR.GetAssetByObjectPath (a single point query, NOT the
-	// enumerating GetAssets path that triggers the UE 5.7 assert).
-	// MUST stay Lane B — the Python composite asset.batch_metadata_async calls this via
-	// dispatch_internal (TCP loopback), which itself runs inside FMCPPythonEval::CallPythonTool
-	// on the game thread. If this handler were Lane A it would queue back to the same game
-	// thread that's blocked on socket.recv() → 60s deadlock until socket timeout.
+	// HOTFIX 2 (2026-05): all three internals converted to the async-job pattern (validate args
+	// → FMCPJobRegistry::SubmitJob → return {job_id}). All three sync handlers are Lane B because
+	// the body only does string parsing + a thread-safe registry call; the actual AR work runs in
+	// the job body lambda. find_unused / size_report job bodies require bGameThreadRequired=true
+	// because IAR.GetAssets enumeration asserts on non-game-thread in UE 5.7 — the registry
+	// dispatches the body via AsyncTask(GameThread, …). batch_metadata uses bGameThreadRequired=false
+	// because it calls only GetAssetByObjectPath (single-point query, thread-safe).
+	//
+	// MUST be Lane B — the Python composites call these via dispatch_internal (TCP loopback)
+	// from inside FMCPPythonEval::CallPythonTool on the game thread. Lane A would queue back to
+	// the same game thread that's blocked on socket.recv() → 60s deadlock until socket timeout.
+	// The composites then poll job.result (also Lane B per hotfix 2 — see UnrealMCPBridge.cpp).
+	RegisterTool(TEXT("asset._find_unused_internal"),    &Tool_FindUnusedInternal,    /*Lane B*/ true);
+	RegisterTool(TEXT("asset._size_report_internal"),    &Tool_SizeReportInternal,    /*Lane B*/ true);
 	RegisterTool(TEXT("asset._batch_metadata_internal"), &Tool_BatchMetadataInternal, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 2 hotfix: registered 3 internal asset.* handlers (2 Lane A, 1 Lane B — batch_metadata stays B to avoid loopback deadlock)"));
+		TEXT("Phase 2 hotfix 2: registered 3 internal asset.* handlers (all Lane B, all async-job pattern; composites poll job.result)"));
 }
 
 } // namespace FAssetCompositeTools

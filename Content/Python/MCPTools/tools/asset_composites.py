@@ -21,7 +21,11 @@ import collections
 from typing import Any, Dict, List
 
 from MCPTools.registry import tool
-from MCPTools.tools.asset_tools import basename_no_class, dispatch_internal
+from MCPTools.tools.asset_tools import (
+    basename_no_class,
+    dispatch_internal,
+    wait_for_job_and_return_result,
+)
 
 
 # ─── asset.find_unused (thin wrapper around _find_unused_internal) ──────────────────────────
@@ -69,7 +73,11 @@ from MCPTools.tools.asset_tools import basename_no_class, dispatch_internal
 def find_unused(args: Dict[str, Any]) -> Dict[str, Any]:
     """Static-analysis only — see C++ Tool_FindUnusedInternal description for caveats.
 
-    Single round-trip to the C++ Lane B handler; the actual AR walk runs there.
+    Submits the AR-enumeration work as a game-thread-required job, polls ``job.result`` until
+    terminal, and returns the inner ``{unused, scanned_count}`` payload. The two-stage flow
+    (submit + poll) is required because the sync handler runs on the listener thread (Lane B)
+    while the actual enumeration must run on the game thread per UE 5.7's AR contract — and a
+    direct Lane-A handler would deadlock the composite (game thread blocked on socket.recv).
     """
     package_paths = args.get("package_paths")
     if not isinstance(package_paths, list) or not package_paths:
@@ -95,7 +103,13 @@ def find_unused(args: Dict[str, Any]) -> Dict[str, Any]:
             "/Script/Engine.SaveGame",
         ]
 
-    return dispatch_internal("asset._find_unused_internal", fwd)
+    submit_resp = dispatch_internal("asset._find_unused_internal", fwd)
+    job_id = submit_resp.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise RuntimeError(
+            f"asset.find_unused: handler returned no job_id (got {submit_resp!r})"
+        )
+    return wait_for_job_and_return_result(job_id, timeout_s=120.0)
 
 
 # ─── asset.size_report (thin wrapper around _size_report_internal) ──────────────────────────
@@ -123,7 +137,11 @@ def find_unused(args: Dict[str, Any]) -> Dict[str, Any]:
     ],
 )
 def size_report(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Returns top N largest assets by on-disk size + total. Single round-trip."""
+    """Returns top N largest assets by on-disk size + total.
+
+    Submits a game-thread-required AR-enumeration job, polls ``job.result`` until terminal.
+    Same submit + poll flow as ``find_unused`` for the same deadlock-avoidance reason.
+    """
     package_paths = args.get("package_paths")
     if not isinstance(package_paths, list) or not package_paths:
         raise ValueError("package_paths: required non-empty array")
@@ -131,7 +149,14 @@ def size_report(args: Dict[str, Any]) -> Dict[str, Any]:
     fwd: Dict[str, Any] = {"package_paths": package_paths}
     if "top_n" in args:
         fwd["top_n"] = args["top_n"]
-    return dispatch_internal("asset._size_report_internal", fwd)
+
+    submit_resp = dispatch_internal("asset._size_report_internal", fwd)
+    job_id = submit_resp.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise RuntimeError(
+            f"asset.size_report: handler returned no job_id (got {submit_resp!r})"
+        )
+    return wait_for_job_and_return_result(job_id, timeout_s=120.0)
 
 
 # ─── asset.batch_metadata (sync, ≤200 paths) ────────────────────────────────────────────────
