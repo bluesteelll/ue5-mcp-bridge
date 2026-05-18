@@ -1615,9 +1615,12 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 		return ACT_MakeError(Request, ErrCode, ErrMsg);
 	}
 
-	// Step 1: edit-const gate FIRST (early return, no transaction). Mirror FMCPMarshalling guard.
+	// Step 1: edit-const gate FIRST (early return, no transaction). Matches canonical 3-flag set
+	// per MCPReflection.h:192 + LevelTools.cpp pattern. CPF_DisableEditOnInstance is critical for
+	// actor.set_property because it operates on placed instances (not CDOs) — its omission lets
+	// the bridge silently overwrite values the editor's own property browser refuses.
 	const uint64 Flags = LeafProp->PropertyFlags;
-	if (Flags & (CPF_BlueprintReadOnly | CPF_EditConst))
+	if (Flags & (CPF_BlueprintReadOnly | CPF_EditConst | CPF_DisableEditOnInstance))
 	{
 		return ACT_MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(

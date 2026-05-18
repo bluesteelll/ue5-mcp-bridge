@@ -185,7 +185,7 @@ FMCPResponse FMCPMarshalling::WriteProperty(const FMCPRequest& Request)
 	const bool bBypassReadOnly = Request.Args->HasField(TEXT("bypass_readonly")) &&
 		Request.Args->GetBoolField(TEXT("bypass_readonly"));
 	const uint64 Flags = LeafProp->PropertyFlags;
-	if (!bBypassReadOnly && (Flags & (CPF_BlueprintReadOnly | CPF_EditConst)))
+	if (!bBypassReadOnly && (Flags & (CPF_BlueprintReadOnly | CPF_EditConst | CPF_DisableEditOnInstance)))
 	{
 		return MCP_MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
