@@ -374,9 +374,15 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("asset._find_unused_internal"),  &Tool_FindUnusedInternal,    /*Lane B*/ true);
 	// _size_report_internal: AR walk + FileSize — Lane B-safe.
 	RegisterTool(TEXT("asset._size_report_internal"),  &Tool_SizeReportInternal,    /*Lane B*/ true);
-	// _batch_metadata_internal: submits an async job, returns {job_id}. Lane A submit is fine
-	// (the work happens off-thread via the registry's worker pool).
-	RegisterTool(TEXT("asset._batch_metadata_internal"), &Tool_BatchMetadataInternal, /*Lane A*/ false);
+	// _batch_metadata_internal: submits an async job, returns {job_id}.
+	// MUST be Lane B — the Python composite asset.batch_metadata_async calls this via
+	// dispatch_internal (TCP loopback), which itself runs inside FMCPPythonEval::CallPythonTool
+	// on the game thread. If this handler were Lane A it would queue back to the same game
+	// thread that's blocked on socket.recv() → 60s deadlock until socket timeout.
+	// Lane B safety: handler body only does (a) AR string ops to validate paths and
+	// (b) FMCPJobRegistry::SubmitJob, which is thread-safe (FScopeLock(JobsLock), no game-thread
+	// assert). The submitted lambda runs on the worker pool — never on this handler thread.
+	RegisterTool(TEXT("asset._batch_metadata_internal"), &Tool_BatchMetadataInternal, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 2 Day 11: registered 3 internal asset.* handlers (hidden from tools.list)"));

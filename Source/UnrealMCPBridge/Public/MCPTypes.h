@@ -58,15 +58,20 @@ inline constexpr int32 kMCPErrorPropertyAccessDenied = -32007;
  *                                 Used by cb.save_all_dirty, cb.bulk_import, asset.batch_metadata_async.
  *   -32017 InputTooLarge          paths array exceeds the synchronous-batch limit (asset.batch_metadata
  *                                 cap = 200).
+ *   -32018 ThumbnailRenderFailed  asset.get_thumbnail / asset.get_thumbnail_to_disk could not render
+ *                                 the thumbnail bitmap (load failure, RenderThumbnail returned empty
+ *                                 result, PNG/JPG encode failed, output write failed, or encoded
+ *                                 payload exceeded 2 GiB limit).
  */
-inline constexpr int32 kMCPErrorInvalidPath          = -32010;
-inline constexpr int32 kMCPErrorWrongClass           = -32011;
-inline constexpr int32 kMCPErrorOverlyBroadQuery     = -32012;
-inline constexpr int32 kMCPErrorPathEscape           = -32013;
-inline constexpr int32 kMCPErrorPathInUse            = -32014;
-inline constexpr int32 kMCPErrorStaleCursor          = -32015;
-inline constexpr int32 kMCPErrorJobSubmitFailed      = -32016;
-inline constexpr int32 kMCPErrorInputTooLarge        = -32017;
+inline constexpr int32 kMCPErrorInvalidPath              = -32010;
+inline constexpr int32 kMCPErrorWrongClass               = -32011;
+inline constexpr int32 kMCPErrorOverlyBroadQuery         = -32012;
+inline constexpr int32 kMCPErrorPathEscape               = -32013;
+inline constexpr int32 kMCPErrorPathInUse                = -32014;
+inline constexpr int32 kMCPErrorStaleCursor              = -32015;
+inline constexpr int32 kMCPErrorJobSubmitFailed          = -32016;
+inline constexpr int32 kMCPErrorInputTooLarge            = -32017;
+inline constexpr int32 kMCPErrorThumbnailRenderFailed    = -32018;
 
 /**
  * Distinguishes the high-level kind of a wire request.

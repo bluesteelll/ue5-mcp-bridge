@@ -7,17 +7,17 @@ the editor for asset/level/blueprint authoring tasks.
 
 ## Status
 
-**Phase 2 complete — 30 user-visible tools + 3 internal C++ Lane B handlers.**
+**Phase 2 complete — 31 user-visible tools + 3 internal C++ Lane B handlers.**
 
 | Phase | Tools | Surface |
 |---|---|---|
 | Phase 1 | 16 | marshall.* (4), job.* (5), log.* (3), tools.list, editor.* (3) |
-| Phase 2 | 30 | asset.* (18), cb.* (12) |
-| **Total** | **46** | |
+| Phase 2 | 31 | asset.* (13 C++ + 6 Python composites = 19), cb.* (12) — plus 3 internal hidden handlers |
+| **Total** | **47** | (user-visible; 34 total handler registrations counting hidden internals) |
 
-11 of the 30 Phase 2 tools run on **Lane B** — the TCP listener thread bypasses
-the game-thread queue entirely for ~16× latency improvement on AR queries (see
-"Lane B contract" below).
+11 of the 31 user-visible Phase 2 tools run on **Lane B** — the TCP listener thread
+bypasses the game-thread queue entirely for ~16× latency improvement on AR queries
+(see "Lane B contract" below). All 3 internal `asset._*` handlers are Lane B too.
 
 ## Reference
 
@@ -66,9 +66,12 @@ UnrealMCPBridge/
     lane_b_spike.py      # Day 0 audit harness
 ```
 
-## Phase 2 tool catalogue (30 tools)
+## Phase 2 tool catalogue (31 user-visible tools)
 
-### Category A — Asset Registry queries (12 tools, mostly Lane B)
+Breakdown: **13 C++ asset.*** + **6 Python composite asset.*** + **12 cb.*** = 31 user-visible
+tools, plus **3 internal hidden** asset._*internal handlers (used by Python composites).
+
+### Category A — Asset Registry queries (13 C++ tools, mostly Lane B)
 
 ```
 asset.exists                  → {exists, asset_path_canonical}                    Lane B
@@ -80,7 +83,7 @@ asset.search_by_class         → {matches[], next_page_token, total_known}     
 asset.search_by_tag           → {matches[], next_page_token, total_known}         Lane B
 asset.search_by_name          → {matches[], next_page_token, total_known}         Lane B
 asset.get_class_hierarchy     → {chain[]}                                          Lane B
-asset.get_outermost_package   → {package_path, on_disk, package_flags}            Lane B
+asset.get_outermost_package   → {package_path, on_disk}                            Lane B
 asset.get_thumbnail           → {base64, mime, width, height, is_class_generic}   Lane A (RT enqueue)
 asset.get_thumbnail_to_disk   → {path, bytes, width, height}                       Lane A (RT enqueue)
 asset.is_dirty                → {dirty, in_memory}                                  Lane A (loaded-pkg map)

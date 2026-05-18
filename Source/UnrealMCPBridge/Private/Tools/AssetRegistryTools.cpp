@@ -20,6 +20,8 @@
 #include "Misc/Guid.h"
 #include "Misc/ObjectThumbnail.h"
 #include "ObjectTools.h"
+#include "ThumbnailRendering/ThumbnailManager.h"
+#include "ThumbnailRendering/ThumbnailRenderer.h"
 #include "UObject/Class.h"
 #include "Utils/MCPPathSandbox.h"
 #include "Dom/JsonObject.h"
@@ -535,21 +537,17 @@ FMCPResponse Tool_AssetGetOutermostPackage(const FMCPRequest& Request)
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
+	// Lane B contract: NO UObject access. FindPackage walks the global package hash and is
+	// game-thread-only — concurrent invocation during GC or async load → use-after-free. The
+	// `package_flags` field is dropped from the response (was documented as "0 if not loaded",
+	// utility for AI workflows was marginal). asset.is_dirty (Lane A) remains for callers that
+	// need live UPackage state.
 	const FString PackageNameStr = Data.PackageName.ToString();
 	const bool bOnDisk = FPackageName::DoesPackageExist(PackageNameStr);
-
-	// package_flags: read live UPackage if loaded; else 0 (we deliberately don't load — that
-	// would mutate in-memory state on a Lane B query).
-	uint32 Flags = 0;
-	if (UPackage* P = FindPackage(nullptr, *PackageNameStr))
-	{
-		Flags = P->GetPackageFlags();
-	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("package_path"), PackageNameStr);
 	Out->SetBoolField(TEXT("on_disk"), bOnDisk);
-	Out->SetNumberField(TEXT("package_flags"), static_cast<double>(Flags));
 	return AR_MakeSuccessObj(Request, Out);
 }
 
@@ -1130,15 +1128,13 @@ namespace
 			return false;
 		}
 
-		// Heuristic for class-generic detection: a class-generic icon for assets without their
-		// own renderer is conventionally returned at the requested size but with a uniform
-		// content pattern. We can't easily distinguish from the bitmap alone — instead we
-		// inspect whether the asset class has a registered specific renderer via
-		// IThumbnailManager. A simpler proxy: if RenderThumbnail had to fall back to its
-		// generic path the OBJECT thumbnail won't be cached. We surface bOutIsClassGeneric as
-		// "best-effort false" — clients that need a reliable signal should call
-		// asset.get_class_hierarchy and check whether the leaf class has a thumbnail renderer.
-		bOutIsClassGeneric = false;
+		// Class-generic detection via the thumbnail manager's renderer registry. When a class has
+		// no specific renderer registered, UThumbnailManager::GetRenderingInfo returns nullptr
+		// (the implementation maps the "&NotSupported" sentinel to nullptr at the end). A non-null
+		// Renderer means the class has a dedicated thumbnail renderer (e.g. StaticMesh, Texture2D);
+		// nullptr means RenderThumbnail produced the class-generic icon fallback instead.
+		FThumbnailRenderingInfo* RenderInfo = UThumbnailManager::Get().GetRenderingInfo(Asset);
+		bOutIsClassGeneric = (RenderInfo == nullptr || RenderInfo->Renderer == nullptr);
 
 		OutImageRGBA8 = RenderedThumbnail.GetUncompressedImageData();
 		OutWidth = RenderedThumbnail.GetImageWidth();
@@ -1193,14 +1189,14 @@ FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 	if (!AR_RenderAssetThumbnail(NormalizedPath, Size, RGBA8, Width, Height, bIsClassGeneric, RenderErr))
 	{
 		// Hard failure per the spec — no asset-specific bitmap AND no class-generic fallback.
-		return AR_MakeError(Request, -32000, // THUMBNAIL_RENDER_FAILED (no dedicated code; -32000 reserved)
+		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("thumbnail render failed: %s"), *RenderErr));
 	}
 
 	TArray64<uint8> PNGBytes;
 	if (!AR_EncodePNG(RGBA8, Width, Height, PNGBytes))
 	{
-		return AR_MakeError(Request, -32000,
+		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			TEXT("PNG encode failed (unexpected RGBA8 size mismatch)"));
 	}
 
@@ -1268,7 +1264,7 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	FString RenderErr;
 	if (!AR_RenderAssetThumbnail(NormalizedPath, Size, RGBA8, Width, Height, bIsClassGeneric, RenderErr))
 	{
-		return AR_MakeError(Request, -32000,
+		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("thumbnail render failed: %s"), *RenderErr));
 	}
 
@@ -1281,14 +1277,14 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 			reinterpret_cast<const FColor*>(RGBA8.GetData()), Width, Height, EGammaSpace::sRGB);
 		if (!FImageUtils::CompressImage(EncodedBytes, TEXT("jpg"), Src, /*Quality*/ 85))
 		{
-			return AR_MakeError(Request, -32000, TEXT("JPG encode failed"));
+			return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed, TEXT("JPG encode failed"));
 		}
 	}
 	else
 	{
 		if (!AR_EncodePNG(RGBA8, Width, Height, EncodedBytes))
 		{
-			return AR_MakeError(Request, -32000,
+			return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
 				TEXT("PNG encode failed (unexpected RGBA8 size mismatch)"));
 		}
 	}
@@ -1301,14 +1297,14 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	// 2048x2048 is ~10 MiB — comfortably under 2 GiB).
 	if (EncodedBytes.Num() > INT32_MAX)
 	{
-		return AR_MakeError(Request, -32000,
+		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			TEXT("encoded thumbnail exceeds 2 GiB — refusing to write"));
 	}
 	TArray<uint8> WriteBuf;
 	WriteBuf.Append(EncodedBytes.GetData(), static_cast<int32>(EncodedBytes.Num()));
 	if (!FFileHelper::SaveArrayToFile(WriteBuf, *AbsPath))
 	{
-		return AR_MakeError(Request, -32000,
+		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("could not write thumbnail to '%s'"), *AbsPath));
 	}
 
@@ -1333,50 +1329,41 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
-	// Resolve UClass* WITHOUT autoloading the asset. FAssetData::GetClass() autoloads via
-	// FindFirstObject<UClass>, so we use the lighter FindObject path on AssetClassPath.
-	UClass* StartClass = nullptr;
-	if (!Data.AssetClassPath.IsNull())
+	// Lane B contract: NO UObject access. Walk ancestors via the AR's documented thread-safe
+	// GetAncestorClassNames path — pure string-keyed lookup against the AR's class hierarchy
+	// cache. Native/Blueprint detection by package-name heuristic:
+	//   /Script/<Module>.<Class>  → native (the canonical native class path form)
+	//   /Game/... or /<MountedContent>/...  → Blueprint-generated class
+	auto MakeChainEntry = [](const FTopLevelAssetPath& ClassPath) -> TSharedPtr<FJsonValue>
 	{
-		// FindObject is a Lane-A operation (touches UObject globals). This whole tool is Lane B
-		// per the plan, but the FAssetData::GetClass call is documented thread-safe at
-		// READ-only level (no autoload triggered). We use the FindObject(nullptr, ...) overload
-		// which only checks already-loaded classes — Lane B-compatible.
-		StartClass = FindObject<UClass>(nullptr, *Data.AssetClassPath.ToString());
-	}
+		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("class_path"), ClassPath.ToString());
+		Entry->SetStringField(TEXT("class_name"), ClassPath.GetAssetName().ToString());
+		const bool bNative = ClassPath.GetPackageName().ToString().StartsWith(TEXT("/Script/"));
+		Entry->SetBoolField(TEXT("is_native"), bNative);
+		Entry->SetBoolField(TEXT("is_blueprint"), !bNative);
+		return MakeShared<FJsonValueObject>(Entry);
+	};
 
 	TArray<TSharedPtr<FJsonValue>> Chain;
-	if (StartClass != nullptr)
+	if (Data.AssetClassPath.IsNull())
 	{
-		for (UClass* Cur = StartClass; Cur != nullptr; Cur = Cur->GetSuperClass())
-		{
-			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
-			Entry->SetStringField(TEXT("class_path"), Cur->GetPathName());
-			Entry->SetStringField(TEXT("class_name"), Cur->GetName());
-			const bool bNative = (Cur->ClassGeneratedBy == nullptr);
-			Entry->SetBoolField(TEXT("is_native"), bNative);
-			Entry->SetBoolField(TEXT("is_blueprint"), !bNative);
-			Chain.Add(MakeShared<FJsonValueObject>(Entry));
-		}
+		// AR entry exists but its class path is unknown — cannot build a hierarchy at all.
+		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		Out->SetArrayField(TEXT("chain"), Chain);
+		return AR_MakeSuccessObj(Request, Out);
 	}
-	else
+
+	// Leaf entry (the asset's own class) is always included — even if GetAncestorClassNames
+	// returns false for unloaded class trees, the caller still gets the leaf identity.
+	Chain.Add(MakeChainEntry(Data.AssetClassPath));
+
+	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+	TArray<FTopLevelAssetPath> AncestorPaths;
+	IAR.GetAncestorClassNames(Data.AssetClassPath, AncestorPaths);
+	for (const FTopLevelAssetPath& AncestorPath : AncestorPaths)
 	{
-		// Class entry exists in AR but the UClass isn't loaded — return a single-entry chain
-		// describing what we DO know. Caller can load the module/plugin and retry for the full
-		// hierarchy.
-		if (!Data.AssetClassPath.IsNull())
-		{
-			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
-			Entry->SetStringField(TEXT("class_path"), Data.AssetClassPath.ToString());
-			Entry->SetStringField(TEXT("class_name"), Data.AssetClassPath.GetAssetName().ToString());
-			// Heuristic: native classes live under /Script/<Module>.<ClassName>; Blueprint classes
-			// live under /Game/... or another content mount. AssetClassPath.GetPackageName starts
-			// with /Script for native.
-			const bool bNative = Data.AssetClassPath.GetPackageName().ToString().StartsWith(TEXT("/Script/"));
-			Entry->SetBoolField(TEXT("is_native"), bNative);
-			Entry->SetBoolField(TEXT("is_blueprint"), !bNative);
-			Chain.Add(MakeShared<FJsonValueObject>(Entry));
-		}
+		Chain.Add(MakeChainEntry(AncestorPath));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
