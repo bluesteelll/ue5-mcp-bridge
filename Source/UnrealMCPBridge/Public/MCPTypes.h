@@ -74,8 +74,8 @@ inline constexpr int32 kMCPErrorInputTooLarge            = -32017;
 inline constexpr int32 kMCPErrorThumbnailRenderFailed    = -32018;
 
 /**
- * Phase 3 — Level + Actor + Component surface. 10 of 11 codes wired in Days 1-8 (-32024 lands
- * in Days 9-10 with the Component tools that surface the ambiguity case).
+ * Phase 3 — Level + Actor + Component surface. All 11 codes wired by end of Days 9-10 (-32024
+ * was the last to land alongside the Component tools' ambiguity case).
  *
  *   -32019 LevelNotFound                Map asset path resolves to no UWorld (level.load /
  *                                       level.save / level.unload / level.set_streaming_state).
@@ -111,12 +111,22 @@ inline constexpr int32 kMCPErrorThumbnailRenderFailed    = -32018;
  *                                       fundamentally different streaming model (cells, not
  *                                       ULevelStreamingDynamic) and Phase 5 will ship a dedicated
  *                                       wp.* surface for them. Detected via UWorld::IsPartitionedWorld().
+ *
+ * Phase 3 Days 9-10 — Component tools. The 11th and final Phase 3 error code lands here.
+ *
+ *   -32024 AmbiguousComponent           component.* tools (Days 9-10): an actor has multiple
+ *                                       components with the same internal FName (rare SCS rename
+ *                                       collision). FMCPComponentPathUtils::ResolveComponent sets
+ *                                       its ``bOutAmbiguous`` flag and returns null; tools surface
+ *                                       this code with a class-name list so the caller can
+ *                                       disambiguate (e.g. pick by class, or rename via the editor).
  */
 inline constexpr int32 kMCPErrorLevelNotFound               = -32019;
 inline constexpr int32 kMCPErrorClassNotFound               = -32020;
 inline constexpr int32 kMCPErrorClassAbstract               = -32021;
 inline constexpr int32 kMCPErrorWrongClassFamily            = -32022;
 inline constexpr int32 kMCPErrorInvalidClassPath            = -32023;
+inline constexpr int32 kMCPErrorAmbiguousComponent          = -32024;
 inline constexpr int32 kMCPErrorPropertyPathTooDeep         = -32025;
 inline constexpr int32 kMCPErrorPropertyIndexOOB            = -32026;
 inline constexpr int32 kMCPErrorPIEActive                   = -32027;
