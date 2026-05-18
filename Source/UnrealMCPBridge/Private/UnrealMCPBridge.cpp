@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPPythonBootstrap.h"
+#include "FMCPPythonEval.h"
 #include "FMCPServer.h"
 #include "MCPTypes.h"
 
@@ -15,7 +16,7 @@ DEFINE_LOG_CATEGORY(LogMCP);
 
 void FUnrealMCPBridgeModule::StartupModule()
 {
-	UE_LOG(LogMCP, Log, TEXT("MCP bridge module starting (Phase 1 Day 2 — TCP listener + dispatch queue)"));
+	UE_LOG(LogMCP, Log, TEXT("MCP bridge module starting (Phase 1 Day 3 — Python tool dispatch)"));
 
 	// 1. Open the TCP listener. Failure here does not abort module load; we log + continue so the
 	//    user can MCP.RestartListener after fixing the port conflict.
@@ -27,7 +28,16 @@ void FUnrealMCPBridgeModule::StartupModule()
 			*StartErr);
 	}
 
-	// 2. Register default game-thread handlers (editor.ping for Day 2).
+	// 2. Register Python eval bridge handlers. These self-check IsPythonInitialized() and return
+	//    structured -32603 errors if Python isn't up, so installing eagerly (before Python init)
+	//    is safe — early requests just get a deterministic "python not initialised" surface.
+	//
+	//    Day 2 had a hard-coded C++ editor.ping handler here; Day 3 deletes it because Python
+	//    serves editor.ping via the @tool decorator in smoke_tools.py. Dispatch precedence is:
+	//        (kind=ExecPython?) → ExecPythonHandler
+	//        else (Method ∈ C++ handler map?) → C++ handler
+	//        else (UnknownMethodFallback installed?) → Python registry lookup
+	//        else → -32601 method not found
 	RegisterDefaultDispatchHandlers();
 
 	// 3. Hook the OnEndFrame drain.
@@ -85,26 +95,49 @@ void FUnrealMCPBridgeModule::OnEndFrame()
 
 void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 {
-	const FString PingMethod = TEXT("editor.ping");
-	FMCPDispatchQueue::Get().RegisterHandler(PingMethod,
+	// kind=ExecPython → arbitrary Python expression evaluator.
+	// The wrapper reads Request.Args->"expression"; missing/empty produces -32602.
+	FMCPDispatchQueue::Get().SetExecPythonHandler(
 		[](const FMCPRequest& Req) -> FMCPResponse
 		{
-			FMCPResponse Resp;
-			Resp.RequestId = Req.RequestId;
-			Resp.OriginalIdString = Req.OriginalIdString;
-			Resp.bIsError = false;
-
-			TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-			Payload->SetBoolField(TEXT("pong"), true);
-			Resp.Result = MakeShared<FJsonValueObject>(Payload);
-			return Resp;
+			FString Expression;
+			if (Req.Args.IsValid())
+			{
+				Req.Args->TryGetStringField(TEXT("expression"), Expression);
+			}
+			if (Expression.IsEmpty())
+			{
+				FMCPResponse Err;
+				Err.RequestId = Req.RequestId;
+				Err.OriginalIdString = Req.OriginalIdString;
+				Err.bIsError = true;
+				Err.ErrorCode = -32602;
+				Err.ErrorMessage = TEXT("exec_python requires args.expression (string)");
+				return Err;
+			}
+			return FMCPPythonEval::EvalExpression(Req, Expression);
 		});
-	RegisteredMethodNames.Add(PingMethod);
-	UE_LOG(LogMCP, Log, TEXT("Registered dispatch handler: %s"), *PingMethod);
+
+	// Unknown-method fallback → Python registry. Once installed, ANY unmatched CallFunction
+	// request gets routed to MCPTools.registry.get_tool(method). The handler itself emits a
+	// JSON-RPC -32601 if the tool isn't registered Python-side either.
+	FMCPDispatchQueue::Get().SetUnknownMethodFallback(
+		[](const FMCPRequest& Req) -> FMCPResponse
+		{
+			return FMCPPythonEval::CallPythonTool(Req);
+		});
+
+	UE_LOG(LogMCP, Log,
+		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
+		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()
 {
+	// Drop the Python eval handlers + any explicit C++ method handlers we accumulated.
+	FMCPDispatchQueue::Get().SetExecPythonHandler({});
+	FMCPDispatchQueue::Get().SetUnknownMethodFallback({});
+
 	for (const FString& Method : RegisteredMethodNames)
 	{
 		FMCPDispatchQueue::Get().UnregisterHandler(Method);

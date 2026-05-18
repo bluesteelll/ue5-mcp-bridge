@@ -11,9 +11,10 @@ DECLARE_LOG_CATEGORY_EXTERN(LogMCP, Log, All);
 /**
  * Public module interface for the Unreal MCP Bridge.
  *
- * Phase 1 Day 2: TCP listener live on 127.0.0.1:30020, game-thread dispatch queue drained on
- * OnEndFrame, single demo handler `editor.ping`. See `D:/tmp/mcp_unreal_blueprint_v2_patch.md` for
- * the full architectural plan.
+ * Phase 1 Day 3: TCP listener live on 127.0.0.1:30020, game-thread dispatch queue drained on
+ * OnEndFrame, Python @tool dispatch via fallback (MCPTools.registry.get_tool), and
+ * kind=ExecPython evaluator wired to IPythonScriptPlugin::ExecPythonCommandEx. See
+ * `D:/tmp/mcp_unreal_blueprint_v2_patch.md` for the full architectural plan.
  */
 class IUnrealMCPBridgeModule : public IModuleInterface
 {
@@ -59,7 +60,13 @@ public:
 	virtual int64 GetDispatchedRequestCount() const override;
 
 private:
-	/** Handler bag: Day 2 registers only editor.ping. Day 3+ adds Python eval + CallFunction routing. */
+	/**
+	 * Handler bag setup. Day 3 installs:
+	 *   - kind=ExecPython handler  → FMCPPythonEval::EvalExpression
+	 *   - unknown-method fallback  → FMCPPythonEval::CallPythonTool (routes to Python @tool registry)
+	 * No explicit C++ method handlers are registered by default — editor.ping is now Python-served.
+	 * Append RegisteredMethodNames if you ever ADD a C++-side handler so Shutdown can clean up.
+	 */
 	void RegisterDefaultDispatchHandlers();
 	void UnregisterDefaultDispatchHandlers();
 

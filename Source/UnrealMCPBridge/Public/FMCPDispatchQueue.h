@@ -13,16 +13,23 @@
  *
  * **Producer:** TCP worker threads (FMCPConnection::Run) call Push().
  * **Consumer:** game thread (FCoreDelegates::OnEndFrame) calls Drain() — pops every pending request,
- * looks up a handler by `Method`, runs it synchronously, and ships the response back to the
- * originating connection via FMCPServer::SendResponse.
+ * routes it through the precedence chain below, runs the selected handler synchronously, and
+ * ships the response back to the originating connection via FMCPServer::SendResponse.
  *
- * Phase 1 Day 2 scope:
- * - Single handler registered: `editor.ping` (returns `{"pong":true}`).
- * - No Python eval yet (Day 3).
- * - No async / job system (Day 5+).
+ * Dispatch precedence (per request, evaluated in order):
+ *   1. Request.Kind == EMCPRequestKind::ExecPython → ExecPythonHandler (Day 3: FMCPPythonEval::EvalExpression).
+ *   2. CallFunction with Method in Handlers map  → that explicit C++ handler.
+ *   3. CallFunction otherwise, UnknownMethodFallback installed → fallback (Day 3: Python registry).
+ *   4. Else                                       → JSON-RPC -32601 method-not-found error.
+ *
+ * Phase 1 Day 3 scope:
+ * - Python @tool dispatch via the unknown-method fallback (MCPTools.registry.get_tool).
+ * - kind=ExecPython evaluates arbitrary single-statement Python expressions.
+ * - No async / job system yet (Day 5+).
  *
  * Handlers run on the GAME THREAD. They can safely touch UObjects, GWorld, asset registry, etc.
- * Long-running work MUST be promoted to a job — Day 2 handlers are expected to be < 1 ms.
+ * Long-running work MUST be promoted to a job — synchronous handlers are expected to be < 5 ms
+ * each (Python wrapper-invoke overhead is currently ~1-2 ms per CallPythonTool).
  */
 class UNREALMCPBRIDGE_API FMCPDispatchQueue
 {
@@ -58,11 +65,39 @@ public:
 	/** Remove a handler. No-op if not registered. */
 	void UnregisterHandler(const FString& Method);
 
+	/**
+	 * Install a fallback invoked by Drain() when no C++ handler claims Method for a CallFunction
+	 * request.
+	 *
+	 * Day 3 use: the bridge module installs FMCPPythonEval::CallPythonTool here so unknown
+	 * methods are routed to the Python registry before we emit -32601. Pass a
+	 * default-constructed FHandler to clear the fallback. Only one fallback may be installed
+	 * at a time; re-registering replaces (logged at Verbose). Thread-safe — guarded by
+	 * HandlersLock.
+	 */
+	void SetUnknownMethodFallback(FHandler&& Fallback);
+
+	/**
+	 * Install the kind=ExecPython handler. Invoked by Drain() for requests where
+	 * Request.Kind == EMCPRequestKind::ExecPython BEFORE the Method-based handler-map lookup.
+	 *
+	 * The handler receives the raw FMCPRequest — it reads the Python source from
+	 * Request.Args->"expression" and returns the eval result. Day 3 binds
+	 * FMCPPythonEval::EvalExpression here.
+	 *
+	 * Pass a default-constructed FHandler to clear. Re-registering replaces (logged at Verbose).
+	 * Thread-safe.
+	 */
+	void SetExecPythonHandler(FHandler&& Handler);
+
 	/** Diagnostic counter — total requests successfully dispatched since process start. */
 	int64 GetDispatchedCount() const { return DispatchedCount.load(std::memory_order_relaxed); }
 
 	/** Diagnostic counter — total requests enqueued (including unknown methods). */
 	int64 GetEnqueuedCount() const { return EnqueuedCount.load(std::memory_order_relaxed); }
+
+	/** Snapshot copy of currently-registered C++ method names. Allocates — call on demand only. */
+	TArray<FString> GetRegisteredMethodNames() const;
 
 private:
 	FMCPDispatchQueue() = default;
@@ -77,6 +112,13 @@ private:
 
 	/** Method → handler table. Read on game thread (Drain), written from any thread (RegisterHandler). */
 	TMap<FString, FHandler> Handlers;
+
+	/** Fallback invoked when Method has no entry in Handlers. Day 3: Python registry dispatch. */
+	FHandler UnknownMethodFallback;
+
+	/** Kind=ExecPython handler. Day 3: FMCPPythonEval::EvalExpression. */
+	FHandler ExecPythonHandler;
+
 	mutable FCriticalSection HandlersLock;
 
 	std::atomic<int64> EnqueuedCount{0};
