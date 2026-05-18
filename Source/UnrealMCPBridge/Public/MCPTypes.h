@@ -74,15 +74,29 @@ inline constexpr int32 kMCPErrorInputTooLarge            = -32017;
 inline constexpr int32 kMCPErrorThumbnailRenderFailed    = -32018;
 
 /**
- * Phase 3 — Level + Actor + Component surface. 5 of 11 codes wired in Days 1-3 (remaining 6 land
- * Days 4+ when their consuming tools ship).
+ * Phase 3 — Level + Actor + Component surface. 10 of 11 codes wired in Days 1-8 (-32024 lands
+ * in Days 9-10 with the Component tools that surface the ambiguity case).
  *
  *   -32019 LevelNotFound                Map asset path resolves to no UWorld (level.load /
  *                                       level.save / level.unload / level.set_streaming_state).
- *   -32020 ClassNotFound                Reserved for Phase 3 Day 4+ actor.spawn — class path doesn't
- *                                       resolve to a UClass after best-effort autoload. Declared now
- *                                       since the cost is one constexpr line and the symbol is
- *                                       referenced by smoke tests that probe error-code symmetry.
+ *                                       Also used for "actor's owning sublevel not visible/loaded"
+ *                                       by every actor mutator (D18 sublevel-visibility guard).
+ *   -32020 ClassNotFound                Phase 3 Day 4+ actor.spawn — class path resolved but failed
+ *                                       autoload OR the class is abstract / wrong family. Subcodes
+ *                                       -32021/-32022/-32023 narrow the diagnosis.
+ *   -32021 ClassAbstract                actor.spawn target UClass has CLASS_Abstract — cannot be
+ *                                       instantiated. Caller picks a concrete subclass.
+ *   -32022 WrongClassFamily             actor.spawn class_path resolves to a UClass that is NOT a
+ *                                       subclass of AActor (e.g. UActorComponent path passed).
+ *   -32023 InvalidClassPath             actor.spawn class_path is syntactically malformed — bare
+ *                                       name without /Script/... or /Game/... mount, missing
+ *                                       leading slash, contains backslash, etc.
+ *   -32025 PropertyPathTooDeep          Property path nesting exceeds the hard cap (16 segments).
+ *                                       Prevents pathological recursion / OOM on user-supplied
+ *                                       paths. Mirrors the FMCPPropertyPathParser depth check.
+ *   -32026 PropertyIndexOOB             Property path used [N] indexing past the array's bounds.
+ *                                       Surfaced by actor.get_property / actor.set_property when
+ *                                       the indexed segment is out of range.
  *   -32027 PIEActive                    Editor-world mutator refused because GEditor->PlayWorld is
  *                                       non-null. Message is frozen verbatim (see D10 in the plan):
  *                                       "editor-world mutators are unavailable during PIE; Phase 5
@@ -91,6 +105,8 @@ inline constexpr int32 kMCPErrorThumbnailRenderFailed    = -32018;
  *   -32028 LevelNotStreamingEntry       level.set_streaming_state target is loaded but is NOT in
  *                                       World->GetStreamingLevels() (e.g. the persistent level
  *                                       itself, or a level loaded by some other code path).
+ *                                       Also used by actor.attach when child + parent live in
+ *                                       different sublevels (cross-level attach hazard).
  *   -32029 WorldPartitionNotSupported   Phase 3 hard-rejects World Partition maps — they have a
  *                                       fundamentally different streaming model (cells, not
  *                                       ULevelStreamingDynamic) and Phase 5 will ship a dedicated
@@ -98,6 +114,11 @@ inline constexpr int32 kMCPErrorThumbnailRenderFailed    = -32018;
  */
 inline constexpr int32 kMCPErrorLevelNotFound               = -32019;
 inline constexpr int32 kMCPErrorClassNotFound               = -32020;
+inline constexpr int32 kMCPErrorClassAbstract               = -32021;
+inline constexpr int32 kMCPErrorWrongClassFamily            = -32022;
+inline constexpr int32 kMCPErrorInvalidClassPath            = -32023;
+inline constexpr int32 kMCPErrorPropertyPathTooDeep         = -32025;
+inline constexpr int32 kMCPErrorPropertyIndexOOB            = -32026;
 inline constexpr int32 kMCPErrorPIEActive                   = -32027;
 inline constexpr int32 kMCPErrorLevelNotStreamingEntry      = -32028;
 inline constexpr int32 kMCPErrorWorldPartitionNotSupported  = -32029;

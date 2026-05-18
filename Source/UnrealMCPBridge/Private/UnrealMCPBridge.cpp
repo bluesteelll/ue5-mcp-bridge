@@ -11,6 +11,7 @@
 #include "FMCPPythonEval.h"
 #include "FMCPServer.h"
 #include "MCPTypes.h"
+#include "Tools/ActorTools.h"
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
 #include "Tools/ContentBrowserTools.h"
@@ -203,10 +204,13 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// landed in the dispatch table this StartupModule pass.
 	FLevelTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 3 Days 4-8: Actor operations surface (20 user-visible tools, all Lane A).
+	FActorTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()
