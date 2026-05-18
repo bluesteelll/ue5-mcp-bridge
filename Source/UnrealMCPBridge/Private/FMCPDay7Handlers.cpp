@@ -24,11 +24,16 @@
 
 namespace
 {
-	// Same JSON-RPC error codes used elsewhere in the bridge. Keep these in sync if you ever
-	// centralise — Day 7 is small enough that a private copy is clearer than a header dance.
-	constexpr int32 kErrorInvalidParams  = -32602;
-	constexpr int32 kErrorObjectNotFound = -32004;
-	constexpr int32 kErrorInternal       = -32603;
+	// Same JSON-RPC error codes used elsewhere in the bridge. Day7_ prefix on the constants and
+	// helpers below is required (NOT cosmetic) because UBT's unity-build groups multiple .cpp
+	// files into a single TU, and anonymous namespaces do NOT isolate symbols across files that
+	// end up in the same TU. FMCPPythonEval.cpp defines identical names — without the prefix,
+	// MSVC reports C2374/C2086/C2084 redefinition errors whenever the two files share a unity.
+	// Same rationale as FMCPMarshalling.cpp's MCP_MakeError / MCP_MakeSuccess. See also the
+	// comment on Day7_MakeError below.
+	constexpr int32 kDay7ErrorInvalidParams  = -32602;
+	constexpr int32 kDay7ErrorObjectNotFound = -32004;
+	constexpr int32 kDay7ErrorInternal       = -32603;
 
 	void StampResponseId(const FMCPRequest& Request, FMCPResponse& Response)
 	{
@@ -60,8 +65,9 @@ namespace
 		return R;
 	}
 
-	/** Compact-serialise a JSON object. Null/empty becomes "{}". */
-	FString JsonObjectToCompactString(const TSharedPtr<FJsonObject>& Object)
+	/** Compact-serialise a JSON object. Null/empty becomes "{}". Day7_ prefix per the unity-
+	 *  build symbol-collision note above. */
+	FString Day7_JsonObjectToCompactString(const TSharedPtr<FJsonObject>& Object)
 	{
 		if (!Object.IsValid())
 		{
@@ -77,8 +83,9 @@ namespace
 		return Out;
 	}
 
-	/** Parse a JSON value (any top-level type). Returns null on failure. */
-	TSharedPtr<FJsonValue> ParseJsonValue(const FString& Json)
+	/** Parse a JSON value (any top-level type). Returns null on failure. Day7_ prefix per the
+	 *  unity-build symbol-collision note above. */
+	TSharedPtr<FJsonValue> Day7_ParseJsonValue(const FString& Json)
 	{
 		TSharedPtr<FJsonValue> Value;
 		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
@@ -154,7 +161,7 @@ namespace
 	{
 		// Snapshot args into a string so the body lambda doesn't capture a TSharedPtr (which would
 		// need extra care for thread safety if Args is mutated upstream).
-		const FString ArgsJson = JsonObjectToCompactString(Args);
+		const FString ArgsJson = Day7_JsonObjectToCompactString(Args);
 
 		return [Method = MoveTemp(Method), ArgsJson](FMCPJob& Job) -> TSharedPtr<FJsonValue>
 		{
@@ -165,7 +172,7 @@ namespace
 			Synth.OriginalIdString = TEXT("(job)");
 			if (!ArgsJson.IsEmpty() && ArgsJson != TEXT("{}"))
 			{
-				TSharedPtr<FJsonValue> Parsed = ParseJsonValue(ArgsJson);
+				TSharedPtr<FJsonValue> Parsed = Day7_ParseJsonValue(ArgsJson);
 				if (Parsed.IsValid() && Parsed->Type == EJson::Object)
 				{
 					Synth.Args = Parsed->AsObject();
@@ -204,12 +211,12 @@ FMCPResponse FMCPDay7Handlers::JobSubmit(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.submit requires args.method (string)"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.submit requires args.method (string)"));
 	}
 	FString Method;
 	if (!Request.Args->TryGetStringField(TEXT("method"), Method) || Method.IsEmpty())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.submit: args.method (non-empty string) required"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.submit: args.method (non-empty string) required"));
 	}
 
 	FString Description;
@@ -238,7 +245,7 @@ FMCPResponse FMCPDay7Handlers::JobSubmit(const FMCPRequest& Request)
 	const FGuid JobId = FMCPJobRegistry::Get().SubmitJob(Description, MoveTemp(Body), bGameThreadRequired);
 	if (!JobId.IsValid())
 	{
-		return Day7_MakeError(Request, kErrorInternal, TEXT("job registry refused submit (shutdown?)"));
+		return Day7_MakeError(Request, kDay7ErrorInternal, TEXT("job registry refused submit (shutdown?)"));
 	}
 
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -252,23 +259,23 @@ FMCPResponse FMCPDay7Handlers::JobStatus(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.status requires args.job_id (string)"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.status requires args.job_id (string)"));
 	}
 	FString IdStr;
 	if (!Request.Args->TryGetStringField(TEXT("job_id"), IdStr) || IdStr.IsEmpty())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.status: args.job_id (non-empty string) required"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.status: args.job_id (non-empty string) required"));
 	}
 	FGuid Id;
 	if (!TryParseJobId(IdStr, Id))
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, FString::Printf(TEXT("job.status: malformed job_id '%s'"), *IdStr));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, FString::Printf(TEXT("job.status: malformed job_id '%s'"), *IdStr));
 	}
 
 	FMCPJobRegistry::FStatusSnapshot Snap;
 	if (!FMCPJobRegistry::Get().GetStatus(Id, Snap))
 	{
-		return Day7_MakeError(Request, kErrorObjectNotFound, FString::Printf(TEXT("job not found: %s"), *IdStr));
+		return Day7_MakeError(Request, kDay7ErrorObjectNotFound, FString::Printf(TEXT("job not found: %s"), *IdStr));
 	}
 
 	return Day7_MakeSuccess(Request, StatusSnapshotToJson(Snap));
@@ -280,17 +287,17 @@ FMCPResponse FMCPDay7Handlers::JobResult(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.result requires args.job_id (string)"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.result requires args.job_id (string)"));
 	}
 	FString IdStr;
 	if (!Request.Args->TryGetStringField(TEXT("job_id"), IdStr) || IdStr.IsEmpty())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.result: args.job_id (non-empty string) required"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.result: args.job_id (non-empty string) required"));
 	}
 	FGuid Id;
 	if (!TryParseJobId(IdStr, Id))
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, FString::Printf(TEXT("job.result: malformed job_id '%s'"), *IdStr));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, FString::Printf(TEXT("job.result: malformed job_id '%s'"), *IdStr));
 	}
 
 	double WaitTimeoutS = 0.0;
@@ -307,7 +314,7 @@ FMCPResponse FMCPDay7Handlers::JobResult(const FMCPRequest& Request)
 	{
 		if (!FMCPJobRegistry::Get().GetStatus(Id, Snap))
 		{
-			return Day7_MakeError(Request, kErrorObjectNotFound, FString::Printf(TEXT("job not found: %s"), *IdStr));
+			return Day7_MakeError(Request, kDay7ErrorObjectNotFound, FString::Printf(TEXT("job not found: %s"), *IdStr));
 		}
 		const bool bTerminal =
 			Snap.State == EMCPJobState::Succeeded
@@ -376,17 +383,17 @@ FMCPResponse FMCPDay7Handlers::JobCancel(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.cancel requires args.job_id (string)"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.cancel requires args.job_id (string)"));
 	}
 	FString IdStr;
 	if (!Request.Args->TryGetStringField(TEXT("job_id"), IdStr) || IdStr.IsEmpty())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("job.cancel: args.job_id (non-empty string) required"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("job.cancel: args.job_id (non-empty string) required"));
 	}
 	FGuid Id;
 	if (!TryParseJobId(IdStr, Id))
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, FString::Printf(TEXT("job.cancel: malformed job_id '%s'"), *IdStr));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, FString::Printf(TEXT("job.cancel: malformed job_id '%s'"), *IdStr));
 	}
 
 	const bool bAccepted = FMCPJobRegistry::Get().RequestCancel(Id);
@@ -487,12 +494,12 @@ FMCPResponse FMCPDay7Handlers::LogSearch(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("log.search requires args.pattern (regex string)"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("log.search requires args.pattern (regex string)"));
 	}
 	FString Pattern;
 	if (!Request.Args->TryGetStringField(TEXT("pattern"), Pattern) || Pattern.IsEmpty())
 	{
-		return Day7_MakeError(Request, kErrorInvalidParams, TEXT("log.search: args.pattern (non-empty regex) required"));
+		return Day7_MakeError(Request, kDay7ErrorInvalidParams, TEXT("log.search: args.pattern (non-empty regex) required"));
 	}
 	int32 MaxResults = 100;
 	Request.Args->TryGetNumberField(TEXT("max_results"), MaxResults);
@@ -591,7 +598,7 @@ namespace
 			return nullptr;
 		}
 
-		TSharedPtr<FJsonValue> Parsed = ParseJsonValue(PayloadJson);
+		TSharedPtr<FJsonValue> Parsed = Day7_ParseJsonValue(PayloadJson);
 		if (!Parsed.IsValid() || Parsed->Type != EJson::Object)
 		{
 			UE_LOG(LogMCP, Warning, TEXT("tools.list: Python wrapper result was not a JSON object | %s"), *PayloadJson);

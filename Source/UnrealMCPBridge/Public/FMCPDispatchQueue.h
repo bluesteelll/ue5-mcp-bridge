@@ -9,14 +9,21 @@
 #include "Templates/Function.h"
 
 /**
- * Game-thread dispatch queue for inbound MCP requests.
+ * Dispatch queue for inbound MCP requests.
  *
- * **Producer:** TCP worker threads (FMCPConnection::Run) call Push().
- * **Consumer:** game thread (FCoreDelegates::OnEndFrame) calls Drain() — pops every pending request,
- * routes it through the precedence chain below, runs the selected handler synchronously, and
- * ships the response back to the originating connection via FMCPServer::SendResponse.
+ * **Producer:** TCP worker threads (FMCPConnection::Run) call Push() (Lane A) OR call DispatchInline()
+ * directly when the method is registered as Lane B (Phase 2 Day 0).
  *
- * Dispatch precedence (per request, evaluated in order):
+ * **Consumer (Lane A):** game thread (FCoreDelegates::OnEndFrame) calls Drain() — pops every pending
+ * request, routes it through the precedence chain below, runs the selected handler synchronously,
+ * and ships the response back to the originating connection via FMCPServer::SendResponse.
+ *
+ * **Consumer (Lane B):** the TCP listener thread itself invokes DispatchInline() for handlers
+ * registered with `bThreadSafe=true`, then sends the response directly on the connection. The
+ * game-thread Drain queue is bypassed entirely. See the Lane B contract block in the public
+ * section below for the rules Lane B handlers MUST follow.
+ *
+ * Dispatch precedence (Lane A, per request, evaluated in order):
  *   1. Request.Kind == EMCPRequestKind::ExecPython → ExecPythonHandler (Day 3: FMCPPythonEval::EvalExpression).
  *   2. CallFunction with Method in Handlers map  → that explicit C++ handler.
  *   3. CallFunction otherwise, UnknownMethodFallback installed → fallback (Day 3: Python registry).
@@ -27,7 +34,7 @@
  * - kind=ExecPython evaluates arbitrary single-statement Python expressions.
  * - No async / job system yet (Day 5+).
  *
- * Handlers run on the GAME THREAD. They can safely touch UObjects, GWorld, asset registry, etc.
+ * Lane A handlers run on the GAME THREAD. They can safely touch UObjects, GWorld, asset registry, etc.
  * Long-running work MUST be promoted to a job — synchronous handlers are expected to be < 5 ms
  * each (Python wrapper-invoke overhead is currently ~1-2 ms per CallPythonTool).
  */
@@ -36,6 +43,35 @@ class UNREALMCPBRIDGE_API FMCPDispatchQueue
 public:
 	/** Method dispatch signature: takes the parsed Args object (may be null), returns a populated response. */
 	using FHandler = TFunction<FMCPResponse(const FMCPRequest&)>;
+
+	// ─── Lane B contract (Phase 2 Day 0) ────────────────────────────────────────────────────────
+	//
+	// Handlers registered with `bThreadSafe=true` (Lane B) run on the TCP listener thread that
+	// received the request, NOT on the game thread. This bypasses the OnEndFrame Drain queue and
+	// removes the per-call ~16ms tick-quantization latency, but imposes strict rules:
+	//
+	// Lane B handlers MUST NOT:
+	//   - Touch UObjects (no LoadObject, no FindObject, no GetClass()/GetOuter() walks)
+	//   - Touch GWorld, GEngine, or any UEngineSubsystem / UEditorSubsystem
+	//   - Modify any state (no Set*, no AR mutations, no editor commands, no UPackage::SetDirty)
+	//   - Allocate persistent UObjects or call NewObject
+	//   - Hold the GC lock or interact with FUObjectGlobals
+	//
+	// Lane B handlers MAY:
+	//   - Call IAssetRegistry::Get()->GetAssets, GetReferencers, GetDependencies, GetSubPaths,
+	//     IsLoadingAssets, GetAssetByObjectPath, GetAssetsByTags, GetAssetsByTagValues, GetAssetsByPath
+	//     (the AR read API is documented thread-safe since UE 5.0)
+	//   - Call FPackageName::DoesPackageExist (filesystem-only)
+	//   - Call IFileManager::FileSize
+	//   - Perform pure math / string / JSON serialization
+	//
+	// If a tool's Lane B audit (lane_b_spike.py) fails — sporadic asserts, crashes, or any
+	// non-NOT_REGISTERED failure across 1000 hot-loop iterations — DEMOTE the tool by passing
+	// `bThreadSafe=false` to RegisterHandler. The infrastructure stays in place; only the per-tool
+	// flag changes.
+	//
+	// Phase 1 callers (marshall.*, job.*, log.*, tools.list) continue to use the default
+	// `bThreadSafe=false` overload — they remain Lane A and run on the game thread unchanged.
 
 	/** Singleton accessor. The instance lives for the lifetime of the bridge module. */
 	static FMCPDispatchQueue& Get();
@@ -55,15 +91,47 @@ public:
 	void Drain();
 
 	/**
-	 * Register a synchronous game-thread handler for the given dotted method name.
+	 * Register a synchronous handler for the given dotted method name.
 	 * Replaces any existing handler with the same name (last-writer-wins; logs a warning on overwrite).
 	 * Thread-safe — guarded by HandlersLock so it can be called during module bring-up while the
 	 * listener is already accepting.
+	 *
+	 * @param Method        Dotted method name (e.g. "asset.exists"). Must be non-empty.
+	 * @param Handler       Body invoked with the parsed request. Returns the response payload.
+	 * @param bThreadSafe   When true, the handler is eligible for Lane B execution on the TCP
+	 *                      listener thread (bypasses the game-thread Drain queue). See the Lane B
+	 *                      contract block above for the rules the handler MUST follow. Default
+	 *                      false preserves Phase 1 behavior — handler always runs on game thread
+	 *                      via Drain().
 	 */
-	void RegisterHandler(const FString& Method, FHandler&& Handler);
+	void RegisterHandler(const FString& Method, FHandler&& Handler, bool bThreadSafe = false);
 
-	/** Remove a handler. No-op if not registered. */
+	/** Remove a handler. No-op if not registered. Also clears the per-method thread-safety flag. */
 	void UnregisterHandler(const FString& Method);
+
+	/**
+	 * Returns true iff Method was registered with bThreadSafe=true (Lane B). Returns false for
+	 * unregistered methods. Thread-safe (read under HandlersLock). Called by FMCPConnection on
+	 * the listener thread to decide between inline dispatch and game-thread enqueue.
+	 */
+	bool IsThreadSafe(const FString& Method) const;
+
+	/**
+	 * Synchronous dispatch on the calling thread. Used by FMCPConnection to invoke Lane B
+	 * handlers inline on the listener thread, bypassing the game-thread Drain queue entirely.
+	 *
+	 * Behavior mirrors a single iteration of Drain()'s body for a CallFunction request:
+	 *   - Look up Handlers[Method] under HandlersLock, copy the handler out, release the lock
+	 *     before invoking (so a long-running handler does not block concurrent RegisterHandler
+	 *     calls from other threads).
+	 *   - Invoke the handler, re-stamp RequestId / OriginalIdString on the response.
+	 *   - Bump DispatchedCount exactly like Drain does (telemetry parity).
+	 *   - If no handler is registered, return a -32601 method-not-found error.
+	 *
+	 * The caller is responsible for sending the response back to the client. ExecPython / the
+	 * unknown-method fallback are NOT invoked from here — they remain game-thread-only via Drain.
+	 */
+	FMCPResponse DispatchInline(const FMCPRequest& Request) const;
 
 	/**
 	 * Install a fallback invoked by Drain() when no C++ handler claims Method for a CallFunction
@@ -110,8 +178,16 @@ private:
 
 	TQueue<FMCPRequest, EQueueMode::Mpsc> InboundQueue;
 
-	/** Method → handler table. Read on game thread (Drain), written from any thread (RegisterHandler). */
+	/** Method → handler table. Read on game thread (Drain) AND listener thread (DispatchInline);
+	 *  written from any thread (RegisterHandler). All accesses guarded by HandlersLock. */
 	TMap<FString, FHandler> Handlers;
+
+	/**
+	 * Method → Lane B eligibility. Same key set as Handlers (entry added/removed in lockstep
+	 * inside RegisterHandler / UnregisterHandler). Read by FMCPConnection on the listener thread
+	 * via IsThreadSafe() to decide between Lane B inline dispatch and Lane A Push().
+	 */
+	TMap<FString, bool> MethodThreadSafety;
 
 	/** Fallback invoked when Method has no entry in Handlers. Day 3: Python registry dispatch. */
 	FHandler UnknownMethodFallback;
@@ -121,6 +197,9 @@ private:
 
 	mutable FCriticalSection HandlersLock;
 
+	// `mutable` because DispatchInline() is const (it's a pure dispatch query from the caller's
+	// perspective) but still needs to bump the diagnostic counter for parity with Drain. The
+	// counter is observable only through GetDispatchedCount() — not part of the public state.
 	std::atomic<int64> EnqueuedCount{0};
-	std::atomic<int64> DispatchedCount{0};
+	mutable std::atomic<int64> DispatchedCount{0};
 };

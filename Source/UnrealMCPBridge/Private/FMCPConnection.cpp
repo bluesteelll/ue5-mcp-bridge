@@ -253,6 +253,20 @@ void FMCPConnection::HandleFrame(const FString& FrameJson)
 	Request.ReceivedAtSeconds = FPlatformTime::Seconds();
 	Request.OriginalIdString = IdStr; // Round-trip echo — preserve opaque (non-GUID) client ids verbatim.
 
+	// Lane B short-circuit (Phase 2 Day 0): thread-safe CallFunction handlers run inline on the
+	// listener thread, bypassing the game-thread Drain queue entirely. This is the latency win
+	// motivating Phase 2's Lane B audit. The kind check is kept even though only CallFunction
+	// handlers are register-able as Lane B today — it future-proofs against accidentally short-
+	// circuiting a kind that later gains its own dispatch path (Ping, JobSubmit, etc.).
+	// See FMCPDispatchQueue.h for the Lane B contract handlers MUST follow.
+	if (Request.Kind == EMCPRequestKind::CallFunction &&
+		FMCPDispatchQueue::Get().IsThreadSafe(Request.Method))
+	{
+		const FMCPResponse Response = FMCPDispatchQueue::Get().DispatchInline(Request);
+		SendResponse(Response);
+		return;
+	}
+
 	FMCPDispatchQueue::Get().Push(MoveTemp(Request));
 }
 
