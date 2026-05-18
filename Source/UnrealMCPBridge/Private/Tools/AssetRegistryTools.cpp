@@ -10,8 +10,11 @@
 
 #include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetIdentifier.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Misc/AssetRegistryInterface.h"
+#include "UObject/Class.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "HAL/FileManager.h"
@@ -279,6 +282,179 @@ namespace
 		}
 		return FMath::Clamp(Out, 1, 1000);
 	}
+
+	/**
+	 * Build the EDependencyCategory + FDependencyQuery from the include_hard / include_soft /
+	 * include_searchable_names boolean trio used by find_references / find_dependents.
+	 *
+	 * Returns the category mask (Package OR Package|SearchableName); query expresses the hard/soft
+	 * split inside the Package category.
+	 */
+	void AR_BuildDependencyQuery(
+		bool bIncludeHard, bool bIncludeSoft, bool bIncludeSearchableNames,
+		UE::AssetRegistry::EDependencyCategory& OutCategory,
+		UE::AssetRegistry::FDependencyQuery& OutQuery)
+	{
+		OutCategory = UE::AssetRegistry::EDependencyCategory::Package;
+		if (bIncludeSearchableNames)
+		{
+			OutCategory = OutCategory | UE::AssetRegistry::EDependencyCategory::SearchableName;
+		}
+
+		// Default = unfiltered Package query (both hard and soft come back). If only one of the
+		// two flags is true, ask the registry to filter for us via Hard/NotHard.
+		OutQuery = UE::AssetRegistry::FDependencyQuery();
+		if (bIncludeHard && !bIncludeSoft)
+		{
+			OutQuery = UE::AssetRegistry::FDependencyQuery(UE::AssetRegistry::EDependencyQuery::Hard);
+		}
+		else if (!bIncludeHard && bIncludeSoft)
+		{
+			OutQuery = UE::AssetRegistry::FDependencyQuery(UE::AssetRegistry::EDependencyQuery::NotHard);
+		}
+		// If both true (the typical case) leave default. If both false the caller wants no
+		// results — we still issue the query and let the returned set be empty.
+	}
+
+	/**
+	 * Classify a returned ``FAssetDependency`` as ``"Hard"`` / ``"Soft"`` / ``"SearchableName"``.
+	 * Used for the per-entry ``dependency_kind`` field on find_references / find_dependents.
+	 */
+	const TCHAR* AR_ClassifyDependency(const FAssetDependency& Dep)
+	{
+		if (Dep.Category == UE::AssetRegistry::EDependencyCategory::SearchableName)
+		{
+			return TEXT("SearchableName");
+		}
+		return EnumHasAnyFlags(Dep.Properties, UE::AssetRegistry::EDependencyProperty::Hard)
+			? TEXT("Hard") : TEXT("Soft");
+	}
+
+	/**
+	 * BFS over GetReferencers / GetDependencies starting at ``RootPackage`` (the asset's
+	 * package-name). Visited-set capped at 10k entries per D11; exceeding the cap returns false
+	 * with OutError populated — caller surfaces as OVERLY_BROAD_QUERY.
+	 *
+	 * Returns the accumulated dependency list flat (not the BFS tree). Output is unsorted; caller
+	 * sorts via the same lex-by-PackageName scheme used elsewhere for cursor stability.
+	 *
+	 * The ``bReferencers`` flag selects direction: true = walk who-points-to-me;
+	 * false = walk who-do-I-point-to.
+	 */
+	bool AR_WalkDependencyGraph(
+		IAssetRegistry& IAR,
+		const FName& RootPackage,
+		bool bReferencers,
+		UE::AssetRegistry::EDependencyCategory Category,
+		const UE::AssetRegistry::FDependencyQuery& Query,
+		bool bRecursive,
+		int32 MaxVisited,
+		TArray<FAssetDependency>& OutAll,
+		FString& OutError)
+	{
+		TSet<FName> Visited;
+		Visited.Reserve(64);
+		TQueue<FName> Frontier;
+		Visited.Add(RootPackage);
+		Frontier.Enqueue(RootPackage);
+
+		while (!Frontier.IsEmpty())
+		{
+			FName Cur;
+			Frontier.Dequeue(Cur);
+
+			TArray<FAssetDependency> ThisHop;
+			const FAssetIdentifier Id(Cur);
+			if (bReferencers)
+			{
+				IAR.GetReferencers(Id, ThisHop, Category, Query);
+			}
+			else
+			{
+				IAR.GetDependencies(Id, ThisHop, Category, Query);
+			}
+
+			for (const FAssetDependency& Dep : ThisHop)
+			{
+				const FName Next = Dep.AssetId.PackageName;
+				if (Next.IsNone()) { continue; }
+
+				// Per-hop output is the FAssetDependency itself (preserves kind). Append
+				// unconditionally so caller sees direct + indirect links separately.
+				OutAll.Add(Dep);
+
+				if (bRecursive && !Visited.Contains(Next))
+				{
+					Visited.Add(Next);
+					if (Visited.Num() > MaxVisited)
+					{
+						OutError = FString::Printf(
+							TEXT("graph walk visited %d entries, exceeding the %d cap; "
+								 "non-recursive query or narrower root recommended"),
+							Visited.Num(), MaxVisited);
+						return false;
+					}
+					Frontier.Enqueue(Next);
+				}
+			}
+
+			if (!bRecursive)
+			{
+				// Single-hop request: drain the frontier without enqueuing children. We already
+				// processed the root; bail.
+				break;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Sort FAssetDependency array lex by PackageName for cursor stability + slice by sentinel.
+	 * Mirrors AR_SortByObjectPath + AR_SlicePage but for the dependency-list shape.
+	 */
+	void AR_SortDependenciesByPackageName(TArray<FAssetDependency>& Deps)
+	{
+		Deps.StableSort([](const FAssetDependency& A, const FAssetDependency& B)
+		{
+			return A.AssetId.PackageName.ToString().Compare(
+				B.AssetId.PackageName.ToString(), ESearchCase::IgnoreCase) < 0;
+		});
+	}
+
+	void AR_SliceDependencyPage(
+		const TArray<FAssetDependency>& Sorted,
+		const FString& LastKey,
+		int32 PageSize,
+		TArray<FAssetDependency>& OutPage,
+		FString& OutNextSentinel)
+	{
+		OutPage.Reset();
+		OutNextSentinel.Reset();
+
+		int32 StartIdx = 0;
+		if (!LastKey.IsEmpty())
+		{
+			while (StartIdx < Sorted.Num())
+			{
+				const FString Cur = Sorted[StartIdx].AssetId.PackageName.ToString();
+				if (Cur.Compare(LastKey, ESearchCase::IgnoreCase) > 0)
+				{
+					break;
+				}
+				++StartIdx;
+			}
+		}
+		const int32 EndIdxExcl = FMath::Min(Sorted.Num(), StartIdx + PageSize);
+		OutPage.Reserve(EndIdxExcl - StartIdx);
+		for (int32 i = StartIdx; i < EndIdxExcl; ++i)
+		{
+			OutPage.Add(Sorted[i]);
+		}
+		if (EndIdxExcl < Sorted.Num() && OutPage.Num() > 0)
+		{
+			OutNextSentinel = OutPage.Last().AssetId.PackageName.ToString();
+		}
+	}
 }
 
 namespace FAssetRegistryTools
@@ -459,13 +635,111 @@ FMCPResponse Tool_AssetList(const FMCPRequest& Request)
 	return AR_BuildPaginatedResponse(Request, TEXT("assets"), Page, All.Num(), NextSentinel,
 		FilterHash, /*bIncludeTags*/ true, /*bIncludeColdCacheFlag*/ true);
 }
+// ─── asset.find_references / asset.find_dependents — shared body ─────────────────────────────
+namespace
+{
+	FMCPResponse AR_RunDependencyQuery(const FMCPRequest& Request, bool bReferencers, const TCHAR* ItemsFieldName)
+	{
+		FString NormalizedPath;
+		FMCPResponse Err;
+		if (!AR_RequirePath(Request, NormalizedPath, Err)) { return Err; }
+
+		FAssetData RootData;
+		if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, RootData))
+		{
+			return AR_MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
+		}
+
+		bool bRecursive   = false;
+		bool bIncludeSoft = true;
+		bool bIncludeHard = true;
+		bool bIncludeSN   = false;
+		Request.Args->TryGetBoolField(TEXT("recursive"), bRecursive);
+		Request.Args->TryGetBoolField(TEXT("include_soft"), bIncludeSoft);
+		Request.Args->TryGetBoolField(TEXT("include_hard"), bIncludeHard);
+		Request.Args->TryGetBoolField(TEXT("include_searchable_names"), bIncludeSN);
+
+		UE::AssetRegistry::EDependencyCategory Category;
+		UE::AssetRegistry::FDependencyQuery Query;
+		AR_BuildDependencyQuery(bIncludeHard, bIncludeSoft, bIncludeSN, Category, Query);
+
+		IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+		TArray<FAssetDependency> All;
+		FString WalkErr;
+		if (!AR_WalkDependencyGraph(IAR, RootData.PackageName, bReferencers, Category, Query,
+			bRecursive, /*MaxVisited*/ 10000, All, WalkErr))
+		{
+			return AR_MakeError(Request, kMCPErrorOverlyBroadQuery, WalkErr);
+		}
+
+		AR_SortDependenciesByPackageName(All);
+
+		// Filter-hash: incorporate root + flags so changing any of them invalidates the cursor.
+		FARFilter HashFilter;
+		HashFilter.PackageNames.Add(RootData.PackageName);
+		HashFilter.TagsAndValues.Add(FName(TEXT("__direction__")),
+			TOptional<FString>(bReferencers ? TEXT("ref") : TEXT("dep")));
+		HashFilter.TagsAndValues.Add(FName(TEXT("__recursive__")),
+			TOptional<FString>(bRecursive ? TEXT("1") : TEXT("0")));
+		HashFilter.TagsAndValues.Add(FName(TEXT("__hard__")),
+			TOptional<FString>(bIncludeHard ? TEXT("1") : TEXT("0")));
+		HashFilter.TagsAndValues.Add(FName(TEXT("__soft__")),
+			TOptional<FString>(bIncludeSoft ? TEXT("1") : TEXT("0")));
+		HashFilter.TagsAndValues.Add(FName(TEXT("__sn__")),
+			TOptional<FString>(bIncludeSN ? TEXT("1") : TEXT("0")));
+		const uint64 FilterHash = FMCPARFilterParser::ComputeFilterHash(HashFilter);
+
+		const int32 PageSize = AR_ClampPageSize(Request.Args, TEXT("page_size"), 200);
+		FString PageTokenWire;
+		Request.Args->TryGetStringField(TEXT("page_token"), PageTokenWire);
+		FMCPPageCursor Cursor;
+		FMCPResponse CursorErr;
+		if (!AR_DecodeCursor(Request, PageTokenWire, FilterHash, Cursor, CursorErr))
+		{
+			return CursorErr;
+		}
+
+		TArray<FAssetDependency> Page;
+		FString NextSentinel;
+		AR_SliceDependencyPage(All, Cursor.LastAssetPath, PageSize, Page, NextSentinel);
+
+		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Items;
+		Items.Reserve(Page.Num());
+		for (const FAssetDependency& Dep : Page)
+		{
+			TSharedPtr<FJsonObject> ItemObj = MakeShared<FJsonObject>();
+			ItemObj->SetStringField(TEXT("package_path"), Dep.AssetId.PackageName.ToString());
+			ItemObj->SetStringField(TEXT("dependency_kind"), AR_ClassifyDependency(Dep));
+			Items.Add(MakeShared<FJsonValueObject>(ItemObj));
+		}
+		Out->SetArrayField(ItemsFieldName, Items);
+		Out->SetNumberField(TEXT("total_known"), static_cast<double>(All.Num()));
+		if (NextSentinel.IsEmpty())
+		{
+			Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
+		}
+		else
+		{
+			FMCPPageCursor NewCursor;
+			NewCursor.FilterHash = FilterHash;
+			NewCursor.LastAssetPath = NextSentinel;
+			NewCursor.TotalKnownSnapshot = All.Num();
+			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+		}
+		return AR_MakeSuccessObj(Request, Out);
+	}
+}
+
 FMCPResponse Tool_AssetFindReferences(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.find_references — Day 4 stub"));
+	return AR_RunDependencyQuery(Request, /*bReferencers*/ true, TEXT("referencers"));
 }
+
 FMCPResponse Tool_AssetFindDependents(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.find_dependents — Day 4 stub"));
+	return AR_RunDependencyQuery(Request, /*bReferencers*/ false, TEXT("dependents"));
 }
 // ─── asset.search_by_class ───────────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
@@ -802,9 +1076,69 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 {
 	return AR_MakeError(Request, -32601, TEXT("asset.get_thumbnail_to_disk — Day 5 stub"));
 }
+// ─── asset.get_class_hierarchy ───────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 {
-	return AR_MakeError(Request, -32601, TEXT("asset.get_class_hierarchy — Day 4 stub"));
+	FString NormalizedPath;
+	FMCPResponse Err;
+	if (!AR_RequirePath(Request, NormalizedPath, Err)) { return Err; }
+
+	FAssetData Data;
+	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
+	{
+		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
+	}
+
+	// Resolve UClass* WITHOUT autoloading the asset. FAssetData::GetClass() autoloads via
+	// FindFirstObject<UClass>, so we use the lighter FindObject path on AssetClassPath.
+	UClass* StartClass = nullptr;
+	if (!Data.AssetClassPath.IsNull())
+	{
+		// FindObject is a Lane-A operation (touches UObject globals). This whole tool is Lane B
+		// per the plan, but the FAssetData::GetClass call is documented thread-safe at
+		// READ-only level (no autoload triggered). We use the FindObject(nullptr, ...) overload
+		// which only checks already-loaded classes — Lane B-compatible.
+		StartClass = FindObject<UClass>(nullptr, *Data.AssetClassPath.ToString());
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Chain;
+	if (StartClass != nullptr)
+	{
+		for (UClass* Cur = StartClass; Cur != nullptr; Cur = Cur->GetSuperClass())
+		{
+			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("class_path"), Cur->GetPathName());
+			Entry->SetStringField(TEXT("class_name"), Cur->GetName());
+			const bool bNative = (Cur->ClassGeneratedBy == nullptr);
+			Entry->SetBoolField(TEXT("is_native"), bNative);
+			Entry->SetBoolField(TEXT("is_blueprint"), !bNative);
+			Chain.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+	}
+	else
+	{
+		// Class entry exists in AR but the UClass isn't loaded — return a single-entry chain
+		// describing what we DO know. Caller can load the module/plugin and retry for the full
+		// hierarchy.
+		if (!Data.AssetClassPath.IsNull())
+		{
+			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("class_path"), Data.AssetClassPath.ToString());
+			Entry->SetStringField(TEXT("class_name"), Data.AssetClassPath.GetAssetName().ToString());
+			// Heuristic: native classes live under /Script/<Module>.<ClassName>; Blueprint classes
+			// live under /Game/... or another content mount. AssetClassPath.GetPackageName starts
+			// with /Script for native.
+			const bool bNative = Data.AssetClassPath.GetPackageName().ToString().StartsWith(TEXT("/Script/"));
+			Entry->SetBoolField(TEXT("is_native"), bNative);
+			Entry->SetBoolField(TEXT("is_blueprint"), !bNative);
+			Chain.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetArrayField(TEXT("chain"), Chain);
+	return AR_MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
