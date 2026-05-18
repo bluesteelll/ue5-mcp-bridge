@@ -16,6 +16,7 @@
 #include "Tools/AssetRegistryTools.h"
 #include "Tools/ComponentTools.h"
 #include "Tools/ContentBrowserTools.h"
+#include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
 
 #include "Dom/JsonObject.h"
@@ -211,10 +212,17 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Phase 3 Days 9-10: Component operations surface (8 user-visible tools, all Lane A).
 	FComponentTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 3 Days 11-14: 5 internal Lane-B composite handlers backing the 5 Python composites in
+	// MCPTools/tools/level_composites.py (level.full_actor_dump / find_actors_with_class +
+	// actor.batch_spawn / batch_destroy / batch_set_property). Same async-only pattern as the
+	// Phase 2 asset.* composites — sync handler is Lane B, body runs via FMCPJobRegistry, AI
+	// client polls job.status / job.result externally.
+	FLevelCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()
