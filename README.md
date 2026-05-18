@@ -7,15 +7,15 @@ the editor for asset/level/blueprint authoring tasks.
 
 ## Status
 
-**Phase 2 complete — 31 user-visible tools + 3 internal C++ handlers.**
+**Phase 2 complete — 31 user-visible tools + 5 internal C++ handlers (post-Hotfix-3).**
 
 | Phase | Tools | Surface |
 |---|---|---|
 | Phase 1 | 16 | marshall.* (4), job.* (5), log.* (3), tools.list, editor.* (3) |
-| Phase 2 | 31 | asset.* (13 C++ + 6 Python composites = 19), cb.* (12) — plus 3 internal hidden handlers |
-| **Total** | **47** | (user-visible; 34 total handler registrations counting hidden internals) |
+| Phase 2 | 31 | asset.* (13 C++ + 6 Python composites = 19), cb.* (12) — plus 5 internal hidden handlers |
+| **Total** | **47** | (user-visible; 36 total handler registrations counting hidden internals) |
 
-### Known limitation — Phase 2 ships all tools Lane A (hotfix 2026-05)
+### Known limitation — Phase 2 ships all tools Lane A (Hotfix 1, 2026-05)
 
 The original Phase 2 design registered 11 user-visible AR-query tools (plus 2 internal
 helpers) on **Lane B** (TCP listener thread, bypassing the game-thread `Drain` queue) for
@@ -36,16 +36,29 @@ phase-2 plan's R11 contingency ("> 5 Lane B demotions → Lane B becomes a no-op
 infrastructure remains for Phase 3+"), every AR query tool was demoted to **Lane A** (game
 thread, processed in the `OnEndFrame` drain). The Lane B router infrastructure
 (`FMCPDispatchQueue::IsThreadSafe` + `DispatchInline`, `FMCPConnection` listener-thread
-short-circuit) stays in place — only the per-tool registration flag changes. The single
-exception is `asset._batch_metadata_internal` whose synchronous body does NOT call
-`IAR.GetAssets` (only string normalisation + `FMCPJobRegistry::SubmitJob`); it stays on
-Lane B to avoid a TCP-loopback deadlock from the Python composite.
+short-circuit) stays in place — only the per-tool registration flag changes.
 
 Phase 3+ may revisit Lane B promotion by passing
 `FARFilter::bIncludeOnlyOnDiskAssets=true` per call, which should skip the in-memory
 enumeration path that hits the assert. The handler bodies are already authored to the Lane B
 contract (no UObject access, no GWorld), so flipping the flag is a one-line revival per tool
 after the filter change is verified stand-alone.
+
+### Hotfix 2 → Hotfix 3 evolution (2026-05) — Python composites became fully async-only
+
+**Hotfix 2** promoted the 3 internal composite handlers (``_find_unused_internal``,
+``_size_report_internal``, ``_batch_metadata_internal``) plus ``job.status`` /
+``job.result`` to Lane B, on the assumption that the composite could safely block on its
+own job's poll loop if the polling endpoint was off-game-thread. This did NOT fix the
+deadlock because the composite STILL owns the GT while sleeping between polls — a
+GT-required job body can never run while the GT is sleeping in the composite.
+
+**Hotfix 3** converts every composite to async-only — they return ``{job_id}`` and the AI
+client polls externally. The C++ internal handler set grew from 3 to 5 (added
+``_find_broken_references_internal`` and ``_find_duplicates_by_name_internal``); all 5 use
+the same async-job pattern. ``asset.batch_metadata`` collapsed its sync/async split into a
+single async tool (the 200-cap was removed; the 5000-cap matches the previous async variant).
+See "Why composites are async" under Category D for the full deadlock pattern explanation.
 
 ## Reference
 
@@ -75,7 +88,7 @@ UnrealMCPBridge/
       Tools/
         AssetRegistryTools.h/.cpp   # Category A — 13 AR reads (all Lane A post-hotfix; was 10 Lane B)
         ContentBrowserTools.h/.cpp  # Category B — 12 CB writes (all Lane A; list_folders was Lane B)
-        AssetCompositeTools.h/.cpp  # Category D — 3 internal C++ helpers (1 Lane B, 2 Lane A)
+        AssetCompositeTools.h/.cpp  # Category D — 5 internal C++ helpers (all Lane B, all async-job)
       Utils/
         MCPAssetPathUtils.h/.cpp    # Path canonicalisation
         MCPARFilterParser.h/.cpp    # FARFilter JSON ↔ struct + hash
@@ -97,7 +110,8 @@ UnrealMCPBridge/
 ## Phase 2 tool catalogue (31 user-visible tools)
 
 Breakdown: **13 C++ asset.*** + **6 Python composite asset.*** + **12 cb.*** = 31 user-visible
-tools, plus **3 internal hidden** asset._*internal handlers (used by Python composites).
+tools, plus **5 internal hidden** asset._*internal handlers (used by Python composites — all
+async-job pattern post-Hotfix-3).
 
 ### Category A — Asset Registry queries (13 C++ tools, all Lane A post-hotfix)
 
@@ -149,22 +163,75 @@ Example:
          "dest_folder":"/Game/New"}}
 ```
 
-### Category D — Python composites (6 user-visible + 3 internal C++)
+### Category D — Python composites (6 user-visible + 5 internal C++) — ALL ASYNC
+
+**HOTFIX 3 (2026-05): every composite is async-only — they return ``{job_id}`` and the AI
+client polls externally via ``job.status`` / ``job.result``.** See "Why composites are async"
+below for the deadlock pattern this resolves.
 
 ```
-asset.find_unused              → {unused[], scanned_count}      → asset._find_unused_internal (1 RT)
-asset.size_report              → {top[], total_bytes}           → asset._size_report_internal (1 RT)
-asset.batch_metadata           → {assets[], failed[]}            sync ≤200, loops asset.metadata
-asset.batch_metadata_async     → {job_id}                        → asset._batch_metadata_internal (async)
-asset.find_broken_references   → {broken[], scanned_count}      Python: list → find_dependents → exists
-asset.find_duplicates_by_name  → {duplicates[]}                 Python: list per scope + groupby
+asset.find_unused              → {job_id}  → asset._find_unused_internal             (Lane B, async, GT)
+asset.size_report              → {job_id}  → asset._size_report_internal             (Lane B, async, GT)
+asset.batch_metadata           → {job_id}  → asset._batch_metadata_internal          (Lane B, async, worker pool)
+asset.batch_metadata_async     → {job_id}  → asset._batch_metadata_internal          (Lane B, async — alias)
+asset.find_broken_references   → {job_id}  → asset._find_broken_references_internal  (Lane B, async, GT)
+asset.find_duplicates_by_name  → {job_id}  → asset._find_duplicates_by_name_internal (Lane B, async, GT)
 ```
 
-Example:
+Inner result schemas (returned by ``job.result`` once Succeeded):
+
+```
+asset.find_unused              → {unused[{asset_path, class}], scanned_count}
+asset.size_report              → {top[{asset_path, class, bytes}], total_bytes}
+asset.batch_metadata           → {assets[{asset_path, package_path, class, tags}], failed[{path, error}], duration_ms}
+asset.batch_metadata_async     → (same as asset.batch_metadata)
+asset.find_broken_references   → {broken[{asset_path, missing_paths[]}], scanned_count}
+asset.find_duplicates_by_name  → {duplicates[{name, paths[{asset_path, class}]}], scanned_count}
+```
+
+Example (submit + poll):
 ```jsonc
+// 1. submit
 {"id":"u1","kind":"call_function","method":"asset.find_unused",
  "args":{"package_paths":["/Game/Untracked"]}}
+// → response: {"ok":true, "result":{"job_id":"abc-123-..."}}
+
+// 2. poll until terminal (off-game-thread)
+{"id":"u2","kind":"call_function","method":"job.result",
+ "args":{"job_id":"abc-123-...","wait_timeout_s":30}}
+// → response on Succeeded: {"ok":true, "result":{"state":"Succeeded", "result":{"unused":[...], "scanned_count":...}}}
 ```
+
+### Why composites are async (Hotfix 3 deadlock pattern)
+
+The pre-Hotfix-3 composites tried to be synchronous: submit a job + poll ``job.result`` from
+inside the composite body, return the inner result to the caller. This deadlocked under three
+constraints that conspired against the design:
+
+  1. **Composite owns the game thread.** Python composites run inside
+     ``FMCPPythonEval::CallPythonTool`` which executes on the GT (Python GIL is pinned to GT).
+     Once the composite enters, the GT is blocked until it returns.
+  2. **AR enumeration requires GT (UE 5.7).** ``IAR.GetAssets`` asserts off-GT —
+     ``AssetRegistry.cpp:2906`` "Enumerating in-memory assets can only be done on the game
+     thread or in the loader, there are too many GetAssetRegistryTags() still not thread-safe."
+     This was the Hotfix 1 finding.
+  3. **Game-thread-required jobs need GT to run.** A job submitted with
+     ``bGameThreadRequired=true`` is dispatched via ``AsyncTask(ENamedThreads::GameThread, ...)``
+     — it cannot execute while the GT is owned by the composite.
+
+Combine all three: composite owns GT → polls job.result → job body waits for GT → never gets
+it → 60s deadlock until TCP timeout. Promoting ``job.result`` to Lane B (Hotfix 2 attempt)
+removed the *outer* loopback queue, but the inner GT-required job body still couldn't drain
+because the composite kept sleeping in ``time.sleep`` between polls while holding GT.
+
+Resolution: composites NEVER poll. They return ``{job_id}`` immediately. The AI client polls
+``job.status`` / ``job.result`` from outside the GT (its own thread on the external TCP socket).
+The composite call exits in <1ms, GT becomes free, GT-required job body drains in the
+next tick. This is the pattern ``asset.batch_metadata_async`` has used since Day 12 and which
+always worked correctly.
+
+The bridge-level helper ``wait_for_job_and_return_result`` (in ``asset_tools.py``) remains
+available for future tooling that runs off-GT, but NO production composite uses it.
 
 ## Common patterns
 

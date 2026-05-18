@@ -23,11 +23,16 @@ Sub-test outline (34 total — matches plan §"Smoke test plan"):
   20-22 Save + redirectors + is_dirty
   23-25 Import / export round-trip + SOURCE_NOT_FOUND
   26-28 Async jobs (save_all_dirty / bulk_import / batch_metadata_async)
-  29-31 Composites (find_unused / size_report / list_folders)
-  32-33 Sync batch_metadata + 200-cap
+  29-31 Composites — ALL ASYNC POST-HOTFIX-3 (find_unused / size_report / list_folders)
+  32-33 batch_metadata async (Option A merged) + 5000-cap rejection
   34    Lane B latency verification (50 calls < 200ms)
 
 Exit 0 on all 34 pass; exit 1 on first failure (prints `[SMOKE_PHASE2] FAIL ...`).
+
+HOTFIX 3 NOTE (2026-05): sub-tests 29 / 30 / 32 now expect ``{job_id}`` response (composites
+are async-only — they return immediately, AI polls externally). Each uses
+``poll_job_until_terminal`` like sub-test 28. Sub-test 33 was repurposed from "200-cap"
+to "5000-cap" since the sync/async split was collapsed into a single async tool.
 
 Usage:
   python smoke_phase2.py [--host HOST] [--port PORT] [--test-asset PATH]
@@ -147,6 +152,32 @@ def poll_job_until_terminal(host: str, port: int, label_prefix: str, job_id: str
             return snap
         time.sleep(poll_interval)
     return None
+
+
+def poll_job_and_fetch_result(host: str, port: int, label_prefix: str, job_id: str,
+                              max_polls: int = 120, poll_interval: float = 0.5) -> Optional[Dict[str, Any]]:
+    """Poll job.status until Succeeded, then call job.result to fetch the inner payload.
+
+    Returns the inner result dict on Succeeded, None on failure/timeout (with fail() printed).
+    Used by sub-tests 29 / 30 / 32 (composites are async-only post-Hotfix-3, so the smoke must
+    poll externally rather than expecting a synchronous result).
+    """
+    snap = poll_job_until_terminal(host, port, label_prefix, job_id, max_polls, poll_interval)
+    if snap is None:
+        fail(f"{label_prefix}: job did not reach terminal state within {max_polls * poll_interval:.0f}s")
+        return None
+    state = snap.get("state")
+    if state != "Succeeded":
+        fail(f"{label_prefix}: expected Succeeded got state={state!r} error={snap.get('error_message')!r}")
+        return None
+    res = call(host, port, f"{label_prefix}-fetch", "job.result", {"job_id": job_id, "wait_timeout_s": 0})
+    if res is None:
+        return None
+    inner = res.get("result")
+    if not isinstance(inner, dict):
+        fail(f"{label_prefix}: job.result returned non-object inner result got {res!r}")
+        return None
+    return inner
 
 
 def main() -> int:
@@ -482,24 +513,34 @@ def main() -> int:
             return fail(f"28c: batch_metadata_async did not Succeed got snap={snap!r}")
         print(f"[SMOKE_PHASE2]   28/asset.batch_metadata_async OK ({len(paths)} paths processed)")
 
-    # ─── 29. asset.find_unused ───────────────────────────────────────────────────────────────
-    r = call(host, port, "29/asset.find_unused", "asset.find_unused", {
+    # ─── 29. asset.find_unused (HOTFIX 3: async — submit + poll job.result) ──────────────────
+    r = call(host, port, "29a/asset.find_unused.submit", "asset.find_unused", {
         "package_paths": [SCRATCH],
     })
     if r is None: return 1
-    if not isinstance(r.get("unused"), list):
-        return fail(f"29/asset.find_unused: expected unused list got {r!r}")
-    print(f"[SMOKE_PHASE2]   29/asset.find_unused OK ({len(r['unused'])} unused; scanned={r.get('scanned_count')})")
+    fu_job_id = r.get("job_id")
+    if not isinstance(fu_job_id, str) or len(fu_job_id) < 30:
+        return fail(f"29a: expected uuid-shaped job_id got {r!r}")
+    inner = poll_job_and_fetch_result(host, port, "29b/asset.find_unused", fu_job_id, max_polls=120)
+    if inner is None: return 1
+    if not isinstance(inner.get("unused"), list):
+        return fail(f"29b/asset.find_unused: expected unused list got {inner!r}")
+    print(f"[SMOKE_PHASE2]   29/asset.find_unused OK ({len(inner['unused'])} unused; scanned={inner.get('scanned_count')})")
 
-    # ─── 30. asset.size_report ───────────────────────────────────────────────────────────────
-    r = call(host, port, "30/asset.size_report", "asset.size_report", {
+    # ─── 30. asset.size_report (HOTFIX 3: async — submit + poll job.result) ──────────────────
+    r = call(host, port, "30a/asset.size_report.submit", "asset.size_report", {
         "package_paths": ["/Game/MCPTest"],
         "top_n": 10,
     })
     if r is None: return 1
-    if not isinstance(r.get("top"), list):
-        return fail(f"30/asset.size_report: expected top list got {r!r}")
-    print(f"[SMOKE_PHASE2]   30/asset.size_report OK (top={len(r['top'])}; total_bytes={r.get('total_bytes')})")
+    sr_job_id = r.get("job_id")
+    if not isinstance(sr_job_id, str) or len(sr_job_id) < 30:
+        return fail(f"30a: expected uuid-shaped job_id got {r!r}")
+    inner = poll_job_and_fetch_result(host, port, "30b/asset.size_report", sr_job_id, max_polls=120)
+    if inner is None: return 1
+    if not isinstance(inner.get("top"), list):
+        return fail(f"30b/asset.size_report: expected top list got {inner!r}")
+    print(f"[SMOKE_PHASE2]   30/asset.size_report OK (top={len(inner['top'])}; total_bytes={inner.get('total_bytes')})")
 
     # ─── 31. cb.list_folders ─────────────────────────────────────────────────────────────────
     r = call(host, port, "31/cb.list_folders", "cb.list_folders", {
@@ -512,23 +553,32 @@ def main() -> int:
         return fail(f"31/cb.list_folders: expected folders list got {r!r}")
     print(f"[SMOKE_PHASE2]   31/cb.list_folders OK ({len(folders)} folders)")
 
-    # ─── 32. asset.batch_metadata (sync, ≤200) ───────────────────────────────────────────────
+    # ─── 32. asset.batch_metadata (HOTFIX 3: Option A — async-only — submit + poll) ──────────
+    # The pre-Hotfix-3 sync/async split was collapsed into a single async tool. Both
+    # asset.batch_metadata and asset.batch_metadata_async route through the same internal handler.
     sample_paths = paths[:20] if paths else [test_asset]
-    r = call(host, port, "32/asset.batch_metadata", "asset.batch_metadata", {"paths": sample_paths})
+    r = call(host, port, "32a/asset.batch_metadata.submit", "asset.batch_metadata", {"paths": sample_paths})
     if r is None: return 1
-    if not isinstance(r.get("assets"), list) or not isinstance(r.get("failed"), list):
-        return fail(f"32/asset.batch_metadata: expected assets+failed lists got {r!r}")
-    print(f"[SMOKE_PHASE2]   32/asset.batch_metadata OK ({len(r['assets'])} OK, {len(r['failed'])} failed)")
+    bm_job_id = r.get("job_id")
+    if not isinstance(bm_job_id, str) or len(bm_job_id) < 30:
+        return fail(f"32a: expected uuid-shaped job_id got {r!r}")
+    inner = poll_job_and_fetch_result(host, port, "32b/asset.batch_metadata", bm_job_id, max_polls=60)
+    if inner is None: return 1
+    if not isinstance(inner.get("assets"), list) or not isinstance(inner.get("failed"), list):
+        return fail(f"32b/asset.batch_metadata: expected assets+failed lists got {inner!r}")
+    print(f"[SMOKE_PHASE2]   32/asset.batch_metadata OK ({len(inner['assets'])} OK, {len(inner['failed'])} failed)")
 
-    # ─── 33. asset.batch_metadata > 200 → INPUT_TOO_LARGE (Python raises ValueError) ─────────
-    # The Python wrapper raises; this surfaces via the unknown-method fallback as a non-OK
-    # response. We don't assert on a specific code (Python-tier errors don't have a numeric
-    # code mapping) — just verify it's a failure response.
-    fake_paths = [f"/Game/Fake/{i}" for i in range(250)]
+    # ─── 33. asset.batch_metadata > 5000 → INPUT_TOO_LARGE (Python raises ValueError) ───────
+    # HOTFIX 3 collapsed the 200-cap into the 5000-cap (matching the previous async variant).
+    # The Python wrapper raises ValueError with the INPUT_TOO_LARGE prefix; CallPythonTool
+    # surfaces it via the marker payload as a non-OK response. We don't assert on a specific
+    # numeric code (Python-tier errors don't have a numeric code mapping) — just verify it's
+    # a failure response.
+    fake_paths = [f"/Game/Fake/{i}" for i in range(5050)]
     resp = call_raw(host, port, "33/batch_metadata.toolarge", "asset.batch_metadata", {"paths": fake_paths})
     if resp is None or resp.get("ok") is not False:
         return fail(f"33/asset.batch_metadata.toolarge: expected error got {resp!r}")
-    print(f"[SMOKE_PHASE2]   33/asset.batch_metadata.toolarge OK (250 paths rejected)")
+    print(f"[SMOKE_PHASE2]   33/asset.batch_metadata.toolarge OK (5050 paths rejected — 5000-cap)")
 
     # ─── 34. Lane B latency verification (50 calls < 200ms) ─────────────────────────────────
     t0 = time.monotonic()

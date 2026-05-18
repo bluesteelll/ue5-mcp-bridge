@@ -1,34 +1,56 @@
 """Phase 2 Days 11-12 — Category D Python composite tools (6 tools).
 
-These are THIN wrappers around the C++ Asset Registry / Content Browser tools
-registered in `AssetRegistryTools.cpp` / `ContentBrowserTools.cpp` / `AssetCompositeTools.cpp`.
+**HOTFIX 3 (2026-05): ALL composites are async-only — they return ``{job_id}`` and the AI
+client polls externally via ``job.status`` / ``job.result``.**
 
-Composites either:
-  (a) Route to a single C++ internal handler in one round-trip (find_unused,
-      size_report, batch_metadata_async) — recommended path for any composite that
-      would otherwise need per-asset iteration.
-  (b) Loop over a small bounded set of C++ calls in pure Python (batch_metadata sync,
-      find_broken_references, find_duplicates_by_name) — acceptable for sub-200
-      iteration counts where Lane B latency keeps round-trip cost down.
+These are THIN wrappers around the C++ Asset Registry internal handlers registered in
+``AssetCompositeTools.cpp``. Each composite is one line: validate args (when necessary) +
+``dispatch_internal('asset._..._internal', args)`` + return the ``{job_id}`` envelope.
 
-All composites are registered as ``thread_safe=False`` because they may invoke
-asynchronous tools (batch_metadata_async returns a job_id) or chain multiple round-trips.
+Why all-async?
+==============
+
+The composite Python function runs inside ``FMCPPythonEval::CallPythonTool`` which executes on
+the **game thread** (Python's GIL is pinned to the GT). Three things conspire to require the
+all-async pattern:
+
+  1. Game thread ownership — once the composite enters, the GT is blocked until the composite
+     returns.
+  2. UE 5.7 AR off-GT assert — ``IAR.GetAssets`` requires the GT (Hotfix 1 finding).
+  3. Job-body GT dispatch — a job submitted with ``bGameThreadRequired=true`` cannot run while
+     the GT is still owned by the composite.
+
+If a composite tries to block on its OWN job's result (the pre-Hotfix-3 ``wait_for_job_and_
+return_result`` pattern), the GT can never drain the job body → 60s timeout deadlock. Promoting
+``job.result`` to Lane B (Hotfix 2) didn't help because the composite STILL owns the GT while
+sleeping between polls.
+
+Resolution: composites NEVER poll. They submit + return ``{job_id}``. The AI client polls
+``job.status`` / ``job.result`` from outside the GT (external TCP socket on its own thread).
+This is the pattern ``asset.batch_metadata_async`` has used since Day 12 — it always worked.
+
+Output schemas
+==============
+
+Every composite returns the SAME shape:
+
+  ``{"job_id": "<uuid>"}``
+
+The AI client then calls ``job.result {"job_id": ..., "wait_timeout_s": <N>}`` (Lane B, returns
+when the job reaches terminal state) and reads ``.result`` from the response. Inner result
+payloads match the schema documented on each composite below — that's what the AI client gets
+back from ``job.result``, not from this composite call directly.
 """
 
 from __future__ import annotations
 
-import collections
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from MCPTools.registry import tool
-from MCPTools.tools.asset_tools import (
-    basename_no_class,
-    dispatch_internal,
-    wait_for_job_and_return_result,
-)
+from MCPTools.tools.asset_tools import dispatch_internal
 
 
-# ─── asset.find_unused (thin wrapper around _find_unused_internal) ──────────────────────────
+# ─── asset.find_unused (async-only — submits job, returns {job_id}) ─────────────────────────
 @tool(
     name="asset.find_unused",
     schema_in={
@@ -57,27 +79,34 @@ from MCPTools.tools.asset_tools import (
     },
     schema_out={
         "type": "object",
-        "properties": {
-            "unused": {"type": "array"},
-            "scanned_count": {"type": "integer"},
-        },
-        "required": ["unused", "scanned_count"],
+        "properties": {"job_id": {"type": "string"}},
+        "required": ["job_id"],
     },
     thread_safe=False,
     failure_modes=[
         {"code": "INVALID_PATH", "when": "any package_paths malformed", "recovery": "/Game/..."},
-        {"code": "QUERY_TOO_LARGE", "when": "scope contains more than 5000 entries",
-         "recovery": "Narrow package_paths or run multiple smaller calls"},
+        {"code": "JOB_SUBMIT_FAILED", "when": "Job registry not initialized",
+         "recovery": "Retry after 1s"},
     ],
 )
 def find_unused(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Static-analysis only — see C++ Tool_FindUnusedInternal description for caveats.
+    """Async-only: submits job, returns {job_id}. Poll via job.status / job.result.
 
-    Submits the AR-enumeration work as a game-thread-required job, polls ``job.result`` until
-    terminal, and returns the inner ``{unused, scanned_count}`` payload. The two-stage flow
-    (submit + poll) is required because the sync handler runs on the listener thread (Lane B)
-    while the actual enumeration must run on the game thread per UE 5.7's AR contract — and a
-    direct Lane-A handler would deadlock the composite (game thread blocked on socket.recv).
+    Composite cannot run synchronously because:
+
+      1. Composite runs on the game thread (Python GIL is pinned to GT).
+      2. AR enumeration in UE 5.7 requires the game thread (Hotfix 1 finding).
+      3. If composite blocks on poll, game thread can't drain job body → deadlock.
+
+    Always-async resolves all three: composite returns immediately, AI client polls
+    via external TCP socket (off GT), job body runs when GT is free.
+
+    Inner result (returned by ``job.result`` once Succeeded):
+      ``{"unused": [{"asset_path", "class"}, ...], "scanned_count": int}``
+
+    STATIC-analysis only — runtime references (LoadClass, GameMode default-pawn refs,
+    data-table cells, savegame string refs) are invisible to the Asset Registry. Always
+    confirm via in-editor Reference Viewer before deleting.
     """
     package_paths = args.get("package_paths")
     if not isinstance(package_paths, list) or not package_paths:
@@ -102,17 +131,10 @@ def find_unused(args: Dict[str, Any]) -> Dict[str, Any]:
             "/Script/Engine.GameUserSettings",
             "/Script/Engine.SaveGame",
         ]
-
-    submit_resp = dispatch_internal("asset._find_unused_internal", fwd)
-    job_id = submit_resp.get("job_id")
-    if not isinstance(job_id, str) or not job_id:
-        raise RuntimeError(
-            f"asset.find_unused: handler returned no job_id (got {submit_resp!r})"
-        )
-    return wait_for_job_and_return_result(job_id, timeout_s=120.0)
+    return dispatch_internal("asset._find_unused_internal", fwd)
 
 
-# ─── asset.size_report (thin wrapper around _size_report_internal) ──────────────────────────
+# ─── asset.size_report (async-only — submits job, returns {job_id}) ─────────────────────────
 @tool(
     name="asset.size_report",
     schema_in={
@@ -125,22 +147,23 @@ def find_unused(args: Dict[str, Any]) -> Dict[str, Any]:
     },
     schema_out={
         "type": "object",
-        "properties": {
-            "top": {"type": "array"},
-            "total_bytes": {"type": "integer"},
-        },
-        "required": ["top", "total_bytes"],
+        "properties": {"job_id": {"type": "string"}},
+        "required": ["job_id"],
     },
     thread_safe=False,
     failure_modes=[
         {"code": "INVALID_PATH", "when": "malformed", "recovery": "/Game/..."},
+        {"code": "JOB_SUBMIT_FAILED", "when": "Job registry not initialized",
+         "recovery": "Retry after 1s"},
     ],
 )
 def size_report(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Returns top N largest assets by on-disk size + total.
+    """Async-only: submits job, returns {job_id}. Poll via job.status / job.result.
 
-    Submits a game-thread-required AR-enumeration job, polls ``job.result`` until terminal.
-    Same submit + poll flow as ``find_unused`` for the same deadlock-avoidance reason.
+    Same deadlock-avoidance rationale as ``find_unused`` — see that docstring.
+
+    Inner result (returned by ``job.result`` once Succeeded):
+      ``{"top": [{"asset_path", "class", "bytes"}, ...], "total_bytes": int}``
     """
     package_paths = args.get("package_paths")
     if not isinstance(package_paths, list) or not package_paths:
@@ -149,70 +172,64 @@ def size_report(args: Dict[str, Any]) -> Dict[str, Any]:
     fwd: Dict[str, Any] = {"package_paths": package_paths}
     if "top_n" in args:
         fwd["top_n"] = args["top_n"]
-
-    submit_resp = dispatch_internal("asset._size_report_internal", fwd)
-    job_id = submit_resp.get("job_id")
-    if not isinstance(job_id, str) or not job_id:
-        raise RuntimeError(
-            f"asset.size_report: handler returned no job_id (got {submit_resp!r})"
-        )
-    return wait_for_job_and_return_result(job_id, timeout_s=120.0)
+    return dispatch_internal("asset._size_report_internal", fwd)
 
 
-# ─── asset.batch_metadata (sync, ≤200 paths) ────────────────────────────────────────────────
+# ─── asset.batch_metadata (Option A: async-only — submits job, returns {job_id}) ────────────
 @tool(
     name="asset.batch_metadata",
     schema_in={
         "type": "object",
         "properties": {
-            "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 200},
+            "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5000},
         },
         "required": ["paths"],
     },
     schema_out={
         "type": "object",
-        "properties": {
-            "assets": {"type": "array"},
-            "failed": {"type": "array"},
-        },
-        "required": ["assets", "failed"],
+        "properties": {"job_id": {"type": "string"}},
+        "required": ["job_id"],
     },
     thread_safe=False,
     failure_modes=[
         {"code": "INVALID_PATH", "when": "any path malformed", "recovery": "/Game/..."},
-        {"code": "INPUT_TOO_LARGE", "when": "paths.length > 200",
-         "recovery": "Use asset.batch_metadata_async for larger batches"},
+        {"code": "INPUT_TOO_LARGE", "when": "paths.length > 5000",
+         "recovery": "Split into multiple smaller batches and merge results"},
+        {"code": "JOB_SUBMIT_FAILED", "when": "Job registry not initialized",
+         "recovery": "Retry after 1s"},
     ],
 )
 def batch_metadata(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronous metadata fetch for ≤200 paths. Loops asset.metadata per path."""
+    """Async-only: submits worker-pool job, returns {job_id}.
+
+    HOTFIX 3 (2026-05): merged the previous sync/async split into a single async tool.
+    The previous sync ``asset.batch_metadata`` looped ``asset.metadata`` per path via TCP
+    loopback (Lane A) which deadlocked the composite for the same reason ``find_unused`` did
+    pre-Hotfix-2. The async-job pattern resolves it: validate paths upfront in C++, push the
+    worker-pool job that does the AR-only lookups (no GT requirement, thread-safe), return
+    ``{job_id}`` immediately.
+
+    ``asset.batch_metadata_async`` is kept as an alias for backward compatibility; both go
+    through the same ``asset._batch_metadata_internal`` handler.
+
+    Inner result (returned by ``job.result`` once Succeeded):
+      ``{"assets": [{"asset_path", "package_path", "class", "tags"}, ...],
+         "failed": [{"path", "error"}, ...], "duration_ms": float}``
+    """
     paths = args.get("paths")
     if not isinstance(paths, list) or not paths:
         raise ValueError("paths: required non-empty array")
-    if len(paths) > 200:
-        # Hard cap surfaced as INPUT_TOO_LARGE per the schema. Python doesn't have direct
-        # access to MCP error codes, so raise an exception whose message is recognised by
-        # the CallPythonTool wrapper as INPUT_TOO_LARGE.
+    # Runtime enforcer for the schema's maxItems=5000 (schema is documentation, not enforced
+    # by the dispatcher). Surfaced as INPUT_TOO_LARGE per the failure_modes contract.
+    if len(paths) > 5000:
         raise ValueError(
-            f"INPUT_TOO_LARGE: paths.length={len(paths)} > 200 — use asset.batch_metadata_async"
+            f"INPUT_TOO_LARGE: paths.length={len(paths)} > 5000 — split into smaller batches"
         )
 
-    assets: List[Dict[str, Any]] = []
-    failed: List[Dict[str, Any]] = []
-    for path in paths:
-        if not isinstance(path, str):
-            failed.append({"path": str(path), "error": "non-string entry"})
-            continue
-        try:
-            entry = dispatch_internal("asset.metadata", {"path": path})
-            assets.append(entry)
-        except RuntimeError as exc:
-            failed.append({"path": path, "error": str(exc)})
-
-    return {"assets": assets, "failed": failed}
+    return dispatch_internal("asset._batch_metadata_internal", {"paths": paths})
 
 
-# ─── asset.batch_metadata_async (returns {job_id}) ──────────────────────────────────────────
+# ─── asset.batch_metadata_async (backward-compat alias for asset.batch_metadata) ────────────
 @tool(
     name="asset.batch_metadata_async",
     schema_in={
@@ -235,15 +252,23 @@ def batch_metadata(args: Dict[str, Any]) -> Dict[str, Any]:
     ],
 )
 def batch_metadata_async(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Async variant: submits a worker-pool job, returns job_id. Lane B-safe body."""
+    """Backward-compat alias: identical to ``asset.batch_metadata`` post-Hotfix-3.
+
+    Both tools route to ``asset._batch_metadata_internal`` and return ``{job_id}``. Kept as a
+    distinct tool entry so existing call sites continue to work.
+    """
     paths = args.get("paths")
     if not isinstance(paths, list) or not paths:
         raise ValueError("paths: required non-empty array")
+    if len(paths) > 5000:
+        raise ValueError(
+            f"INPUT_TOO_LARGE: paths.length={len(paths)} > 5000 — split into smaller batches"
+        )
 
     return dispatch_internal("asset._batch_metadata_internal", {"paths": paths})
 
 
-# ─── asset.find_broken_references (Day 12, Python iteration is acceptable) ──────────────────
+# ─── asset.find_broken_references (async-only — submits job, returns {job_id}) ──────────────
 @tool(
     name="asset.find_broken_references",
     schema_in={
@@ -255,116 +280,41 @@ def batch_metadata_async(args: Dict[str, Any]) -> Dict[str, Any]:
     },
     schema_out={
         "type": "object",
-        "properties": {
-            "broken": {"type": "array"},
-            "scanned_count": {"type": "integer"},
-        },
-        "required": ["broken", "scanned_count"],
+        "properties": {"job_id": {"type": "string"}},
+        "required": ["job_id"],
     },
     thread_safe=False,
     failure_modes=[
         {"code": "INVALID_PATH", "when": "malformed paths", "recovery": "/Game/..."},
-        {"code": "QUERY_TOO_LARGE", "when": "scan would exceed 5000 entries",
-         "recovery": "Narrow package_paths"},
+        {"code": "JOB_SUBMIT_FAILED", "when": "Job registry not initialized",
+         "recovery": "Retry after 1s"},
     ],
 )
 def find_broken_references(args: Dict[str, Any]) -> Dict[str, Any]:
-    """For each asset in scope: walk hard deps; flag any dep whose package is missing from AR.
+    """Async-only: submits job, returns {job_id}. Poll via job.status / job.result.
 
-    Per-asset round-trips — acceptable because scope is typically narrow (recent subfolder)
-    and Lane B keeps each round-trip sub-millisecond. If profiling shows it's slow in
-    practice, promote to C++ internal `asset._find_broken_references_internal` later.
+    HOTFIX 3 (2026-05): converted from per-asset Python loop (``asset.list`` → per-asset
+    ``asset.find_dependents`` → per-dep ``asset.exists``) to a single C++ internal handler.
+    The previous loop deadlocked the composite for the same reason ``find_unused`` did
+    pre-Hotfix-2 — every TCP loopback call queued back to the GT that was blocked on the
+    composite's outer socket.
+
+    For each asset in scope: walks HARD dependencies (soft deps may legitimately be unloaded),
+    checks each dep package exists in the AR. Native ``/Script/`` deps are skipped (always
+    present).
+
+    Inner result (returned by ``job.result`` once Succeeded):
+      ``{"broken": [{"asset_path", "missing_paths": [...]}, ...], "scanned_count": int}``
     """
     package_paths = args.get("package_paths")
     if not isinstance(package_paths, list) or not package_paths:
         raise ValueError("package_paths: required non-empty array")
 
-    # First: enumerate all assets in scope using asset.list with recursive_paths=true.
-    # Page through until cursor exhausted, accumulating up to a 5000-entry cap.
-    all_assets: List[Dict[str, Any]] = []
-    next_token = None
-    cap = 5000
-
-    while True:
-        list_args: Dict[str, Any] = {
-            "filter": {
-                "package_paths": package_paths,
-                "recursive_paths": True,
-            },
-            "page_size": 200,
-        }
-        if next_token is not None:
-            list_args["page_token"] = next_token
-
-        try:
-            page = dispatch_internal("asset.list", list_args)
-        except RuntimeError as exc:
-            # Surface the underlying error verbatim (OVERLY_BROAD_QUERY etc.)
-            raise
-
-        page_assets = page.get("assets", [])
-        all_assets.extend(page_assets)
-        if len(all_assets) > cap:
-            raise ValueError(
-                f"QUERY_TOO_LARGE: scope exceeds {cap} entries (currently {len(all_assets)})"
-            )
-
-        next_token = page.get("next_page_token")
-        if not next_token:
-            break
-
-    # For each asset, query hard dependents and check each dep package exists.
-    broken: List[Dict[str, Any]] = []
-    for asset in all_assets:
-        asset_path = asset.get("asset_path")
-        if not isinstance(asset_path, str):
-            continue
-
-        missing_paths: List[str] = []
-        # Page through dependents.
-        dep_token = None
-        while True:
-            dep_args: Dict[str, Any] = {
-                "path": asset_path,
-                "include_hard": True,
-                "include_soft": False,
-                "page_size": 200,
-            }
-            if dep_token is not None:
-                dep_args["page_token"] = dep_token
-
-            try:
-                dep_page = dispatch_internal("asset.find_dependents", dep_args)
-            except RuntimeError:
-                # If find_dependents fails for this asset, treat as zero deps; skip.
-                break
-
-            for dep_entry in dep_page.get("dependents", []):
-                dep_pkg = dep_entry.get("package_path")
-                if not isinstance(dep_pkg, str) or not dep_pkg:
-                    continue
-                # /Script/ dependencies are native classes — always present, skip.
-                if dep_pkg.startswith("/Script/"):
-                    continue
-                try:
-                    exists_result = dispatch_internal("asset.exists", {"path": dep_pkg})
-                    if not exists_result.get("exists", False):
-                        missing_paths.append(dep_pkg)
-                except RuntimeError:
-                    # If asset.exists itself errors (malformed dep path), treat as missing.
-                    missing_paths.append(dep_pkg)
-
-            dep_token = dep_page.get("next_page_token")
-            if not dep_token:
-                break
-
-        if missing_paths:
-            broken.append({"asset_path": asset_path, "missing_paths": missing_paths})
-
-    return {"broken": broken, "scanned_count": len(all_assets)}
+    return dispatch_internal("asset._find_broken_references_internal",
+                             {"package_paths": package_paths})
 
 
-# ─── asset.find_duplicates_by_name (Day 12, Python group-by) ────────────────────────────────
+# ─── asset.find_duplicates_by_name (async-only — submits job, returns {job_id}) ─────────────
 @tool(
     name="asset.find_duplicates_by_name",
     schema_in={
@@ -377,59 +327,36 @@ def find_broken_references(args: Dict[str, Any]) -> Dict[str, Any]:
     },
     schema_out={
         "type": "object",
-        "properties": {"duplicates": {"type": "array"}},
-        "required": ["duplicates"],
+        "properties": {"job_id": {"type": "string"}},
+        "required": ["job_id"],
     },
     thread_safe=False,
     failure_modes=[
         {"code": "INVALID_PATH", "when": "malformed paths", "recovery": "/Game/..."},
+        {"code": "JOB_SUBMIT_FAILED", "when": "Job registry not initialized",
+         "recovery": "Retry after 1s"},
     ],
 )
 def find_duplicates_by_name(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Group assets by short-name across scopes; emit groups with count>1."""
+    """Async-only: submits job, returns {job_id}. Poll via job.status / job.result.
+
+    HOTFIX 3 (2026-05): converted from a per-scope Python loop (``asset.list`` paginated
+    per scope) to a single C++ internal handler. Same deadlock-avoidance rationale as
+    ``find_broken_references``.
+
+    Groups assets by short basename across all scopes. With ``ignore_class=true`` (default),
+    two assets with the same short name but different classes count as duplicates. Emits only
+    groups with count > 1.
+
+    Inner result (returned by ``job.result`` once Succeeded):
+      ``{"duplicates": [{"name", "paths": [{"asset_path", "class"}, ...]}, ...],
+         "scanned_count": int}``
+    """
     package_paths = args.get("package_paths")
     if not isinstance(package_paths, list) or not package_paths:
         raise ValueError("package_paths: required non-empty array")
 
-    ignore_class = bool(args.get("ignore_class", True))
-
-    # Enumerate all assets in all scopes via paginated asset.list.
-    all_assets: List[Dict[str, Any]] = []
-    next_token = None
-    while True:
-        list_args: Dict[str, Any] = {
-            "filter": {
-                "package_paths": package_paths,
-                "recursive_paths": True,
-            },
-            "page_size": 500,
-        }
-        if next_token is not None:
-            list_args["page_token"] = next_token
-
-        page = dispatch_internal("asset.list", list_args)
-        all_assets.extend(page.get("assets", []))
-        next_token = page.get("next_page_token")
-        if not next_token:
-            break
-
-    # Group by basename. If ignore_class=False, the key includes the class path.
-    groups: Dict[str, List[Dict[str, str]]] = collections.defaultdict(list)
-    for asset in all_assets:
-        asset_path = asset.get("asset_path")
-        class_path = asset.get("class")
-        if not isinstance(asset_path, str) or not isinstance(class_path, str):
-            continue
-        base = basename_no_class(asset_path)
-        key = base if ignore_class else f"{base}::{class_path}"
-        groups[key].append({"asset_path": asset_path, "class": class_path})
-
-    duplicates: List[Dict[str, Any]] = []
-    for key, entries in groups.items():
-        if len(entries) <= 1:
-            continue
-        # When ignore_class=False, strip the class suffix back off for the wire `name` field.
-        name = key.split("::", 1)[0] if "::" in key else key
-        duplicates.append({"name": name, "paths": entries})
-
-    return {"duplicates": duplicates}
+    fwd: Dict[str, Any] = {"package_paths": package_paths}
+    if "ignore_class" in args:
+        fwd["ignore_class"] = bool(args["ignore_class"])
+    return dispatch_internal("asset._find_duplicates_by_name_internal", fwd)

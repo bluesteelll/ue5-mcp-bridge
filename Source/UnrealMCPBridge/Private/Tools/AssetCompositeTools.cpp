@@ -450,6 +450,258 @@ FMCPResponse Tool_BatchMetadataInternal(const FMCPRequest& Request)
 	return COMP_MakeSuccessObj(Request, Out);
 }
 
+// ─── asset._find_broken_references_internal (Hotfix 3 — Lane B, async-job pattern) ───────────
+//
+// Walks the AR for every asset in scope, collects hard dependencies via GetDependencies, then
+// checks each dep package against the AR (GetAssetsByPackageName non-empty). Accumulates broken
+// refs in a {asset_path, missing_paths[]} list. Game-thread-required because IAR.GetAssets
+// + IAR.GetDependencies + IAR.GetAssetsByPackageName all touch the AR in-memory tables that
+// UE 5.7 asserts on off-GT.
+//
+// Hotfix 3 rationale: the previous Python implementation looped via TCP loopback (asset.list →
+// asset.find_dependents → asset.exists per asset × N), which deadlocked the same way as
+// find_unused did before hotfix 2 — composite runs on GT, every loopback call queues back to GT
+// behind composite's blocked socket. C++ promotion executes the whole walk inside ONE job body.
+FMCPResponse Tool_FindBrokenReferencesInternal(const FMCPRequest& Request)
+{
+	TArray<FString> Scopes;
+	FMCPResponse Err;
+	if (!COMP_ParsePackagePaths(Request, Scopes, Err)) { return Err; }
+
+	const FGuid JobId = FMCPJobRegistry::Get().SubmitJob(
+		TEXT("asset._find_broken_references_internal"),
+		[ScopesCap = MoveTemp(Scopes)]
+		(FMCPJob& Job) -> TSharedPtr<FJsonValue>
+		{
+			IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+
+			// Enumerate every asset across all scopes recursively (single AR call — same pattern
+			// as Tool_FindUnusedInternal).
+			FARFilter Filter;
+			Filter.bRecursivePaths = true;
+			for (const FString& S : ScopesCap) { Filter.PackagePaths.Add(FName(*S)); }
+
+			TArray<FAssetData> All;
+			IAR.GetAssets(Filter, All);
+
+			constexpr int32 kFindBrokenCap = 5000;
+			if (All.Num() > kFindBrokenCap)
+			{
+				Job.ErrorMessage = FString::Printf(
+					TEXT("OVERLY_BROAD_QUERY: scope contains %d candidates (cap=%d) — narrow package_paths"),
+					All.Num(), kFindBrokenCap);
+				return nullptr;
+			}
+
+			// Hard-only dependency query (mirrors the Python fallback flags: include_hard=true,
+			// include_soft=false). Soft refs by definition may legitimately be missing at editor time.
+			UE::AssetRegistry::EDependencyCategory Category = UE::AssetRegistry::EDependencyCategory::Package;
+			UE::AssetRegistry::FDependencyQuery Query(UE::AssetRegistry::EDependencyQuery::Hard);
+
+			TArray<TSharedPtr<FJsonValue>> Broken;
+			const int32 Total = All.Num();
+			for (int32 i = 0; i < Total; ++i)
+			{
+				if (Job.bCancelRequested.load(std::memory_order_acquire))
+				{
+					Job.ErrorMessage = TEXT("cancelled");
+					return nullptr;
+				}
+				Job.Progress.store(static_cast<float>(i) / FMath::Max(1, Total),
+					std::memory_order_release);
+
+				const FAssetData& Data = All[i];
+				const FAssetIdentifier RootId(Data.PackageName);
+
+				TArray<FAssetDependency> Deps;
+				IAR.GetDependencies(RootId, Deps, Category, Query);
+
+				TArray<TSharedPtr<FJsonValue>> MissingPaths;
+				for (const FAssetDependency& Dep : Deps)
+				{
+					const FName DepPackage = Dep.AssetId.PackageName;
+					if (DepPackage.IsNone()) { continue; }
+					const FString DepPackageStr = DepPackage.ToString();
+					// /Script/ deps are native classes — always present, never broken.
+					if (DepPackageStr.StartsWith(TEXT("/Script/"))) { continue; }
+
+					// Existence check via package-name lookup. GetAssetsByPackageName returns true
+					// iff the registry has ANY asset entry for that package name (in-memory OR disk).
+					TArray<FAssetData> DepAssets;
+					IAR.GetAssetsByPackageName(DepPackage, DepAssets, /*bIncludeOnlyOnDiskAssets*/ false);
+					if (DepAssets.Num() == 0)
+					{
+						MissingPaths.Add(MakeShared<FJsonValueString>(DepPackageStr));
+					}
+				}
+
+				if (MissingPaths.Num() > 0)
+				{
+					TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+					Obj->SetStringField(TEXT("asset_path"), Data.GetObjectPathString());
+					Obj->SetArrayField(TEXT("missing_paths"), MissingPaths);
+					Broken.Add(MakeShared<FJsonValueObject>(Obj));
+				}
+			}
+
+			Job.Progress.store(1.0f, std::memory_order_release);
+
+			TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+			Out->SetArrayField(TEXT("broken"), Broken);
+			Out->SetNumberField(TEXT("scanned_count"), All.Num());
+			return MakeShared<FJsonValueObject>(Out);
+		},
+		/*bGameThreadRequired*/ true);
+
+	if (!JobId.IsValid())
+	{
+		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
+	return COMP_MakeSuccessObj(Request, Out);
+}
+
+// ─── asset._find_duplicates_by_name_internal (Hotfix 3 — Lane B, async-job pattern) ──────────
+//
+// Walks the AR for every asset in scope, groups by short basename (last path segment, stripped of
+// class suffix), emits groups with count>1. Game-thread-required because IAR.GetAssets asserts
+// off-GT in UE 5.7.
+//
+// Hotfix 3 rationale: same as Tool_FindBrokenReferencesInternal — Python loopback to asset.list
+// per scope deadlocked the composite. Promoted to a single C++ job body.
+FMCPResponse Tool_FindDuplicatesByNameInternal(const FMCPRequest& Request)
+{
+	TArray<FString> Scopes;
+	FMCPResponse Err;
+	if (!COMP_ParsePackagePaths(Request, Scopes, Err)) { return Err; }
+
+	bool bIgnoreClass = true;
+	Request.Args->TryGetBoolField(TEXT("ignore_class"), bIgnoreClass);
+
+	const FGuid JobId = FMCPJobRegistry::Get().SubmitJob(
+		TEXT("asset._find_duplicates_by_name_internal"),
+		[ScopesCap = MoveTemp(Scopes), bIgnoreClassCap = bIgnoreClass]
+		(FMCPJob& Job) -> TSharedPtr<FJsonValue>
+		{
+			IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+
+			FARFilter Filter;
+			Filter.bRecursivePaths = true;
+			for (const FString& S : ScopesCap) { Filter.PackagePaths.Add(FName(*S)); }
+
+			TArray<FAssetData> All;
+			IAR.GetAssets(Filter, All);
+
+			// Cap matches find_unused — keeps memory and lock-hold time bounded.
+			constexpr int32 kFindDupCap = 5000;
+			if (All.Num() > kFindDupCap)
+			{
+				Job.ErrorMessage = FString::Printf(
+					TEXT("OVERLY_BROAD_QUERY: scope contains %d candidates (cap=%d) — narrow package_paths"),
+					All.Num(), kFindDupCap);
+				return nullptr;
+			}
+
+			// Group by basename (with optional class suffix). Stores parallel arrays so we can emit
+			// stable {name, paths[]} groups after the walk.
+			struct FGroupEntry
+			{
+				FString AssetPath;
+				FString ClassPath;
+			};
+			TMap<FString, TArray<FGroupEntry>> Groups;
+			Groups.Reserve(All.Num());
+
+			const int32 Total = All.Num();
+			for (int32 i = 0; i < Total; ++i)
+			{
+				if (Job.bCancelRequested.load(std::memory_order_acquire))
+				{
+					Job.ErrorMessage = TEXT("cancelled");
+					return nullptr;
+				}
+				if ((i & 0xFF) == 0)
+				{
+					Job.Progress.store(static_cast<float>(i) / FMath::Max(1, Total),
+						std::memory_order_release);
+				}
+
+				const FAssetData& Data = All[i];
+				const FString AssetPath = Data.GetObjectPathString();
+				const FString ClassPath = Data.AssetClassPath.ToString();
+
+				// Basename = leaf after last '/', strip optional '.SubObject' suffix.
+				FString Leaf = AssetPath;
+				int32 LastSlash = INDEX_NONE;
+				if (AssetPath.FindLastChar(TEXT('/'), LastSlash))
+				{
+					Leaf = AssetPath.Mid(LastSlash + 1);
+				}
+				int32 LastDot = INDEX_NONE;
+				if (Leaf.FindLastChar(TEXT('.'), LastDot))
+				{
+					Leaf = Leaf.Left(LastDot);
+				}
+
+				const FString Key = bIgnoreClassCap
+					? Leaf
+					: FString::Printf(TEXT("%s::%s"), *Leaf, *ClassPath);
+
+				Groups.FindOrAdd(Key).Add({ AssetPath, ClassPath });
+			}
+
+			// Emit groups with >1 entry. Strip the class suffix back off the wire name when present.
+			TArray<TSharedPtr<FJsonValue>> Duplicates;
+			for (const TPair<FString, TArray<FGroupEntry>>& Pair : Groups)
+			{
+				if (Pair.Value.Num() <= 1) { continue; }
+
+				FString Name = Pair.Key;
+				int32 Sep = INDEX_NONE;
+				if (Name.FindChar(TEXT(':'), Sep))
+				{
+					Name = Name.Left(Sep);
+				}
+
+				TArray<TSharedPtr<FJsonValue>> Paths;
+				Paths.Reserve(Pair.Value.Num());
+				for (const FGroupEntry& E : Pair.Value)
+				{
+					TSharedRef<FJsonObject> EntryObj = MakeShared<FJsonObject>();
+					EntryObj->SetStringField(TEXT("asset_path"), E.AssetPath);
+					EntryObj->SetStringField(TEXT("class"),      E.ClassPath);
+					Paths.Add(MakeShared<FJsonValueObject>(EntryObj));
+				}
+
+				TSharedRef<FJsonObject> GroupObj = MakeShared<FJsonObject>();
+				GroupObj->SetStringField(TEXT("name"), Name);
+				GroupObj->SetArrayField(TEXT("paths"), Paths);
+				Duplicates.Add(MakeShared<FJsonValueObject>(GroupObj));
+			}
+
+			Job.Progress.store(1.0f, std::memory_order_release);
+
+			TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+			Out->SetArrayField(TEXT("duplicates"), Duplicates);
+			Out->SetNumberField(TEXT("scanned_count"), All.Num());
+			return MakeShared<FJsonValueObject>(Out);
+		},
+		/*bGameThreadRequired*/ true);
+
+	if (!JobId.IsValid())
+	{
+		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
+	return COMP_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -459,24 +711,32 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// HOTFIX 2 (2026-05): all three internals converted to the async-job pattern (validate args
-	// → FMCPJobRegistry::SubmitJob → return {job_id}). All three sync handlers are Lane B because
-	// the body only does string parsing + a thread-safe registry call; the actual AR work runs in
-	// the job body lambda. find_unused / size_report job bodies require bGameThreadRequired=true
-	// because IAR.GetAssets enumeration asserts on non-game-thread in UE 5.7 — the registry
-	// dispatches the body via AsyncTask(GameThread, …). batch_metadata uses bGameThreadRequired=false
-	// because it calls only GetAssetByObjectPath (single-point query, thread-safe).
+	// HOTFIX 3 (2026-05): added 2 more internals (_find_broken_references, _find_duplicates_by_name),
+	// converted ALL Python composites to async-only (return {job_id}, no in-composite polling).
+	// Previous hotfix-2 design still deadlocked because the composite kept ownership of the game
+	// thread while polling its own job.result — even with both endpoints Lane B, the game-thread-
+	// required job body couldn't drain. Resolution: composites NEVER poll; AI client polls externally
+	// via TCP from off-game-thread. The composite path is now identical to asset.batch_metadata_async
+	// which has always worked correctly.
+	//
+	// All 5 sync handlers are Lane B because the body only does string parsing + a thread-safe
+	// registry call; the actual AR work runs in the job body lambda. Job bodies require
+	// bGameThreadRequired=true when they call IAR.GetAssets enumeration (find_unused, size_report,
+	// find_broken_references, find_duplicates_by_name) — UE 5.7 asserts off-GT. batch_metadata
+	// uses bGameThreadRequired=false because it calls only GetAssetByObjectPath (single-point query,
+	// thread-safe).
 	//
 	// MUST be Lane B — the Python composites call these via dispatch_internal (TCP loopback)
 	// from inside FMCPPythonEval::CallPythonTool on the game thread. Lane A would queue back to
 	// the same game thread that's blocked on socket.recv() → 60s deadlock until socket timeout.
-	// The composites then poll job.result (also Lane B per hotfix 2 — see UnrealMCPBridge.cpp).
-	RegisterTool(TEXT("asset._find_unused_internal"),    &Tool_FindUnusedInternal,    /*Lane B*/ true);
-	RegisterTool(TEXT("asset._size_report_internal"),    &Tool_SizeReportInternal,    /*Lane B*/ true);
-	RegisterTool(TEXT("asset._batch_metadata_internal"), &Tool_BatchMetadataInternal, /*Lane B*/ true);
+	RegisterTool(TEXT("asset._find_unused_internal"),            &Tool_FindUnusedInternal,            /*Lane B*/ true);
+	RegisterTool(TEXT("asset._size_report_internal"),            &Tool_SizeReportInternal,            /*Lane B*/ true);
+	RegisterTool(TEXT("asset._batch_metadata_internal"),         &Tool_BatchMetadataInternal,         /*Lane B*/ true);
+	RegisterTool(TEXT("asset._find_broken_references_internal"), &Tool_FindBrokenReferencesInternal,  /*Lane B*/ true);
+	RegisterTool(TEXT("asset._find_duplicates_by_name_internal"),&Tool_FindDuplicatesByNameInternal,  /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 2 hotfix 2: registered 3 internal asset.* handlers (all Lane B, all async-job pattern; composites poll job.result)"));
+		TEXT("Phase 2 hotfix 3: registered 5 internal asset.* handlers (all Lane B, all async-job pattern; composites are async-only, return {job_id})"));
 }
 
 } // namespace FAssetCompositeTools
