@@ -21,6 +21,7 @@
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
 #include "Tools/MaterialTools.h"
+#include "Tools/PIETools.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -239,10 +240,17 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// enforced — base UMaterial mutations would need graph edits (out of Phase 4 scope).
 	FMaterialTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
+	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
+	// PIENotActive + frozen kMCPMessagePIENotActive text otherwise. Lifecycle (start/stop/pause/
+	// resume/step_frame) + introspection (is_running/console_exec) + actor identity
+	// (get_player_controller/get_pawn/focus_actor).
+	FPIETools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

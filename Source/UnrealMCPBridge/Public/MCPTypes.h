@@ -176,12 +176,31 @@ inline constexpr int32 kMCPErrorParameterNotFound           = -32036;
 inline constexpr int32 kMCPErrorVariableNotFound            = -32037;
 
 /**
+ * Phase 5 — PIE + Editor utilities + UMG/Niagara/Physics/Sequencer surface.
+ *
+ *   -32038 PIENotActive    Inverse of -32027 PIEActive. Returned by ``pie.*`` tools that require an
+ *                          active PIE session (every pie.* tool except ``pie.start`` and the always-
+ *                          callable ``pie.is_running``). Caller's recovery: ``pie.start`` first OR
+ *                          use ``editor.*`` tools for editor-world operations. Message is frozen
+ *                          verbatim (see ``kMCPMessagePIENotActive``).
+ */
+inline constexpr int32 kMCPErrorPIENotActive                = -32038;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */
 inline const TCHAR* const kMCPMessagePIEActive = TEXT(
 	"editor-world mutators are unavailable during PIE; Phase 5 will add pie.* tools for PIE world; "
 	"otherwise stop PIE first if you meant the editor world.");
+
+/**
+ * Frozen wire message returned by every Phase 5 ``pie.*`` tool that requires an active PIE session
+ * when no PIE is currently running. **Do NOT edit this string** — Phase 5 smoke tests assert the
+ * substrings ``"PIE is not running"`` AND ``"pie.start"`` AND ``"editor.*"``.
+ */
+inline const TCHAR* const kMCPMessagePIENotActive = TEXT(
+	"PIE is not running; pie.start first (or use editor.* tools for editor-world ops)");
 
 /**
  * Distinguishes the high-level kind of a wire request.
