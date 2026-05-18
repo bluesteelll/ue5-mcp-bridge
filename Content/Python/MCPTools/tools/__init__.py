@@ -18,3 +18,9 @@ from MCPTools.tools import asset_composites  # noqa: F401
 # 5 wrappers are async-only — they call dispatch_internal('..._internal', args) and return the
 # {job_id} envelope; AI client polls job.status / job.result externally.
 from MCPTools.tools import level_composites  # noqa: F401
+
+# Phase 4 Day 10 — Category C Blueprint Python composite (bp.compile_all_dirty). Same
+# async-only pattern as Phase 3 level_composites — submits a job that walks AssetRegistry by
+# scope_paths + compiles each UBlueprint, aggregates per-BP failures into {compiled, succeeded,
+# failed, duration_ms}.
+from MCPTools.tools import blueprint_composites  # noqa: F401

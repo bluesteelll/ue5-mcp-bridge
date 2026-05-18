@@ -14,6 +14,7 @@
 #include "Tools/ActorTools.h"
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
+#include "Tools/BlueprintCompositeTools.h"
 #include "Tools/BlueprintTools.h"
 #include "Tools/ComponentTools.h"
 #include "Tools/ContentBrowserTools.h"
@@ -220,15 +221,22 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// client polls job.status / job.result externally.
 	FLevelCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
-	// Phase 4 Days 1-5: Blueprint reads (6 tools, all Lane A, no PIE guard). bp.exists +
-	// bp.{list,get}_{variables,functions} + bp.list_nodes_in_function. Days 6-10 will add
-	// bp.* writes + bp.compile + bp.compile_all_dirty; Days 11-15 add material.* surface.
+	// Phase 4 Days 1-10: Blueprint reads (6 tools) + writes (6 tools) + bp.compile sync. All
+	// 13 user-visible tools are Lane A. Reads bypass PIE guard (assets are PIE-safe); writes +
+	// compile refuse PIE with -32027 + frozen kMCPMessagePIEActive text. bp.reparent (write 6)
+	// is experimental + requires args.confirm_dangerous=true. Days 11-15 add material.* surface.
 	FBlueprintTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Phase 4 Day 10: 1 internal Lane-B composite handler backing the single Python composite
+	// bp.compile_all_dirty in blueprint_composites.py. Walks AR by scope_paths, loads each BP,
+	// compiles each, aggregates {compiled, succeeded, failed[{path, errors[]}], duration_ms}.
+	// Cooperative cancel every 16 BPs (heavier than Phase 3 default 256 because compile is heavy).
+	FBlueprintCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* reads (6) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

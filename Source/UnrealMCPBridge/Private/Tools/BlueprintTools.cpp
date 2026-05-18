@@ -7,21 +7,33 @@
 #include "Utils/MCPBlueprintUtils.h"
 #include "Utils/MCPPageCursor.h"
 #include "Utils/MCPPinTypeUtils.h"
+#include "Utils/MCPWorldContext.h"
 
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
+#include "Editor.h"
 #include "Engine/Blueprint.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/CompilerResultsLog.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Logging/TokenizedMessage.h"
+#include "ScopedTransaction.h"
 #include "UObject/Class.h"
 #include "UObject/Script.h"
+#include "UObject/UnrealType.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "HAL/PlatformTime.h"
+
+#define LOCTEXT_NAMESPACE "MCPBridge"
 
 namespace
 {
@@ -472,6 +484,225 @@ namespace
 		}
 		Obj->SetArrayField(TEXT("pins"), PinArr);
 		return Obj;
+	}
+
+	// ─── Days 6-10: write-side helpers ────────────────────────────────────────────────────────────
+
+	/** Frozen PIE-mutator refusal — every BP write surfaces this exact pair (smoke asserts substrings). */
+	FMCPResponse BP_MakePIEError(const FMCPRequest& Request)
+	{
+		return BP_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	/** True if PIE is running. Centralised so write tools share one call site. */
+	bool BP_IsPIEActive()
+	{
+		return FMCPWorldContext::IsPIEActive();
+	}
+
+	/**
+	 * Resolve a UClass from a class path arg. Returns nullptr + populates OutError on:
+	 *   - empty path / no leading slash → -32023 InvalidClassPath
+	 *   - LoadObject failure even after ``_C`` retry → -32020 ClassNotFound
+	 *
+	 * Distinct from ActorTools's helper because we use the kMCPErrorBlueprintTypeMismatch /
+	 * kMCPErrorWrongClassFamily codes specific to BP surface diagnostics. Callers post-validate
+	 * IsChildOf as appropriate (e.g. reparent's AActor-family check).
+	 */
+	UClass* BP_ResolveClassOrError(
+		const FMCPRequest& Request,
+		const FString& ClassPath,
+		FMCPResponse& OutError)
+	{
+		if (ClassPath.IsEmpty() || ClassPath[0] != TEXT('/'))
+		{
+			OutError = BP_MakeError(Request, kMCPErrorInvalidClassPath,
+				FString::Printf(
+					TEXT("class_path '%s' invalid — must start with '/' (e.g. '/Script/Engine.Pawn')"),
+					*ClassPath));
+			return nullptr;
+		}
+		if (ClassPath.Contains(TEXT("\\")))
+		{
+			OutError = BP_MakeError(Request, kMCPErrorInvalidClassPath,
+				FString::Printf(TEXT("class_path '%s' contains backslash"), *ClassPath));
+			return nullptr;
+		}
+		UClass* Class = LoadObject<UClass>(nullptr, *ClassPath);
+		if (!Class && !ClassPath.EndsWith(TEXT("_C")))
+		{
+			const FString Retry = ClassPath + TEXT("_C");
+			Class = LoadObject<UClass>(nullptr, *Retry);
+		}
+		if (!Class)
+		{
+			OutError = BP_MakeError(Request, kMCPErrorClassNotFound,
+				FString::Printf(
+					TEXT("class_path '%s' could not be resolved (LoadObject returned null); ")
+					TEXT("Blueprint paths usually need trailing '_C'"),
+					*ClassPath));
+			return nullptr;
+		}
+		return Class;
+	}
+
+	/**
+	 * Parse the ``pin_type`` JSON object arg, propagating -32004 / -32032 errors. Returns true on
+	 * success; populates OutError + returns false on failure.
+	 */
+	bool BP_RequirePinTypeArg(
+		const FMCPRequest& Request,
+		const TCHAR* FieldName,
+		FEdGraphPinType& OutPinType,
+		FMCPResponse& OutError)
+	{
+		const TSharedPtr<FJsonObject>* PinTypeObjPtr = nullptr;
+		if (!Request.Args->TryGetObjectField(FieldName, PinTypeObjPtr) || !PinTypeObjPtr || !PinTypeObjPtr->IsValid())
+		{
+			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+				FString::Printf(TEXT("missing required object field '%s'"), FieldName));
+			return false;
+		}
+		int32 ErrCode = 0;
+		FString ErrMsg;
+		if (!FMCPPinTypeUtils::FromJson(*PinTypeObjPtr, OutPinType, ErrCode, ErrMsg))
+		{
+			OutError = BP_MakeError(Request, ErrCode, ErrMsg);
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Convert an FBPVariableDescription JSON ``default_value`` arg into an FBPVariableDescription
+	 * DefaultValue string (UE's ExportText form).
+	 *
+	 * Strategy:
+	 *   - null / missing  → empty string (UE will use the type's natural default)
+	 *   - string          → returned verbatim (caller-supplied ExportText)
+	 *   - bool/number     → printf to text (matches what UE itself emits for primitive defaults)
+	 *   - object/array    → JSON re-serialised — supports {x,y,z} vector defaults, etc. This is a
+	 *                       BEST-EFFORT path: ExportText for structs is not perfectly JSON-compatible,
+	 *                       so callers wanting precise struct defaults should pass the verbatim
+	 *                       ExportText string (e.g. "(X=1.0,Y=2.0,Z=3.0)").
+	 *
+	 * Phase 4 Days 1-5 reads ship FBPVariableDescription::DefaultValue verbatim; this writer keeps
+	 * the contract simple by accepting either the verbatim text OR JSON-likely-correct primitives.
+	 */
+	FString BP_ConvertJsonDefaultToText(const TSharedPtr<FJsonValue>& Value)
+	{
+		if (!Value.IsValid() || Value->Type == EJson::Null)
+		{
+			return FString();
+		}
+		switch (Value->Type)
+		{
+		case EJson::String:
+			return Value->AsString();
+		case EJson::Boolean:
+			return Value->AsBool() ? TEXT("true") : TEXT("false");
+		case EJson::Number:
+			// FString::SanitizeFloat trims trailing zeros + uses %f. Matches int values too because
+			// double 42 → "42.000000" → trimmed to "42".
+			return FString::SanitizeFloat(Value->AsNumber());
+		case EJson::Object:
+		case EJson::Array:
+		{
+			FString Out;
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+			FJsonSerializer::Serialize(Value.ToSharedRef(), TEXT(""), Writer);
+			return Out;
+		}
+		default:
+			return FString();
+		}
+	}
+
+	// NOTE: A future bp.set_variable_default tool will need a helper to look up an FProperty by
+	// name on the BP's SkeletonGeneratedClass (or GeneratedClass fallback). The plan calls for
+	// running the canonical 3-flag edit-const gate before the write. That helper lives here when
+	// the tool lands. Phase 4 Days 6-10 ships with the helper UNimplemented — see Tool_AddVariable
+	// for the rationale (CPF_DisableEditOnInstance is default on every new BP var; the gate would
+	// false-positive every default_value during add).
+
+	/**
+	 * Walk a UClass's TFieldIterator and collect the member variable FNames declared on the
+	 * BLUEPRINT (CPF_BlueprintVisible). Used by bp.reparent to diff lost members.
+	 *
+	 * Iteration uses ExcludeSuper so we capture only what the parent itself declares — exactly the
+	 * set the reparented child loses if it doesn't appear on the new parent.
+	 */
+	void BP_CollectClassDeclaredVariableNames(const UClass* Class, TSet<FString>& OutNames)
+	{
+		OutNames.Reset();
+		if (!Class) { return; }
+		for (TFieldIterator<FProperty> It(Class, EFieldIteratorFlags::ExcludeSuper); It; ++It)
+		{
+			const FProperty* Prop = *It;
+			if (!Prop) { continue; }
+			// Skip parameters / internal / delegates — only surface user-visible BP variables.
+			if (Prop->HasAnyPropertyFlags(CPF_Parm)) { continue; }
+			OutNames.Add(Prop->GetName());
+		}
+	}
+
+	/**
+	 * Walk a UClass's UFunctions and collect the function FNames declared on it (ExcludeSuper).
+	 * Used by bp.reparent to diff lost functions.
+	 */
+	void BP_CollectClassDeclaredFunctionNames(const UClass* Class, TSet<FString>& OutNames)
+	{
+		OutNames.Reset();
+		if (!Class) { return; }
+		for (TFieldIterator<UFunction> It(Class, EFieldIteratorFlags::ExcludeSuper); It; ++It)
+		{
+			const UFunction* Fn = *It;
+			if (!Fn) { continue; }
+			OutNames.Add(Fn->GetName());
+		}
+	}
+
+	/** Build a JSON array of strings from a TSet<FString> with deterministic ordering. */
+	TArray<TSharedPtr<FJsonValue>> BP_StringSetToJsonArray(const TSet<FString>& Strings)
+	{
+		TArray<FString> Sorted = Strings.Array();
+		Sorted.Sort();
+		TArray<TSharedPtr<FJsonValue>> Out;
+		Out.Reserve(Sorted.Num());
+		for (const FString& S : Sorted)
+		{
+			Out.Add(MakeShared<FJsonValueString>(S));
+		}
+		return Out;
+	}
+
+	/**
+	 * Tokenize a Phase 4 compile result via the supplied FCompilerResultsLog. Splits messages into
+	 * errors[] + warnings[] arrays in the response (note + perf-warning collapse to warnings;
+	 * everything below Info is dropped).
+	 */
+	void BP_SplitCompileMessages(
+		const FCompilerResultsLog& Log,
+		TArray<TSharedPtr<FJsonValue>>& OutErrors,
+		TArray<TSharedPtr<FJsonValue>>& OutWarnings)
+	{
+		OutErrors.Reset();
+		OutWarnings.Reset();
+		for (const TSharedRef<FTokenizedMessage>& Msg : Log.Messages)
+		{
+			const FString Text = Msg->ToText().ToString();
+			const EMessageSeverity::Type Severity = Msg->GetSeverity();
+			if (Severity == EMessageSeverity::Error)
+			{
+				OutErrors.Add(MakeShared<FJsonValueString>(Text));
+			}
+			else if (Severity == EMessageSeverity::Warning
+				|| Severity == EMessageSeverity::PerformanceWarning)
+			{
+				OutWarnings.Add(MakeShared<FJsonValueString>(Text));
+			}
+			// Info / Notes silently dropped — they're advisory noise that AI clients don't action.
+		}
 	}
 } // namespace
 
@@ -967,6 +1198,757 @@ FMCPResponse Tool_ListNodesInFunction(const FMCPRequest& Request)
 	return BP_MakeSuccessObj(Request, Out);
 }
 
+// ─── bp.add_variable (Lane A, PIE-guarded — edit-const gate carve-out) ───────────────────────
+//
+// Adds a member variable to the blueprint with optional default_value, category, tooltip,
+// exposed_on_spawn, replicated flags. Auto-triggers Blueprint recompile (UE's AddMemberVariable
+// internally calls FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified).
+//
+// Args:    { blueprint_path, variable_name, pin_type: { ...MCPPinTypeUtils JSON... },
+//            default_value?: any, category?: string, tooltip?: string,
+//            exposed_on_spawn?: bool, replicated?: bool, bypass_readonly?: bool }
+// Result:  { added: bool, variable_name: string }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 InvalidPath / -32004 ObjectNotFound / -32031 BlueprintTypeMismatch (resolve)
+//   -32602 InvalidParams                — missing variable_name OR missing pin_type object
+//   -32032 PinTypeUnsupported           — pin_type cannot be parsed by MCPPinTypeUtils
+//   -32014 PathInUse                    — variable name already exists on this BP (or on a base
+//                                         class — AddMemberVariable refuses to mask inherited vars)
+//
+// Edit-const gate carve-out: UE defaults every new BP variable to CPF_DisableEditOnInstance, so
+// the canonical 3-flag gate (CPF_BlueprintReadOnly | CPF_EditConst | CPF_DisableEditOnInstance)
+// would false-positive every add. The default_value passed here lands in FBPVariableDescription::
+// DefaultValue — that's the CDO authoring path, NOT a runtime placed-instance write, so the gate
+// is semantically wrong. The plan reserves the gate for the future bp.set_variable_default tool.
+// args.bypass_readonly is accepted but currently a no-op (forward-compat for when the carve-out
+// is re-tightened).
+//
+// Default value note (D7): if default_value is a string the bridge passes it verbatim into UE's
+// AddMemberVariable as the ExportText default. JSON primitive types (bool/number) get a sensible
+// printf conversion. Objects/arrays serialise back to JSON — usable for primitive struct defaults
+// but not perfectly compatible with all UE struct ExportText forms; callers wanting precise
+// struct defaults should pass the verbatim "(X=1.0,Y=2.0,Z=3.0)" string.
+FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FString VarNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'variable_name'"));
+	}
+
+	FEdGraphPinType NewPinType;
+	FMCPResponse PinTypeErr;
+	if (!BP_RequirePinTypeArg(Request, TEXT("pin_type"), NewPinType, PinTypeErr))
+	{
+		return PinTypeErr;
+	}
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	const FName VarName(*VarNameStr);
+
+	// Pre-check name collision so we surface -32014 BEFORE any UE work (AddMemberVariable returns
+	// false silently on collision — same surface but losing the per-tool error code).
+	if (FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName) != INDEX_NONE)
+	{
+		return BP_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(
+				TEXT("variable '%s' already exists on blueprint '%s'; use bp.remove_variable + bp.add_variable to replace"),
+				*VarNameStr, *Path));
+	}
+
+	const TSharedPtr<FJsonValue> DefaultValueField = Request.Args->TryGetField(TEXT("default_value"));
+	const FString DefaultValueText = BP_ConvertJsonDefaultToText(DefaultValueField);
+
+	// FScopedTransaction owns the undo group; AddMemberVariable internally calls Modify+Mark.
+	const FScopedTransaction Transaction(LOCTEXT("BPAddVariable", "MCP: add blueprint variable"));
+
+	const bool bAdded = FBlueprintEditorUtils::AddMemberVariable(
+		Blueprint, VarName, NewPinType, DefaultValueText);
+	if (!bAdded)
+	{
+		// Fall-through: UE rejected the add for an internal reason we didn't pre-screen. Most
+		// common is a colliding parent-class variable (we only checked the BP's own NewVariables).
+		return BP_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(
+				TEXT("AddMemberVariable failed for '%s' on '%s' — likely masks a variable in a base class"),
+				*VarNameStr, *Path));
+	}
+
+	// Apply optional metadata fields. Each writes through FBlueprintEditorUtils so the BP is
+	// flagged dirty for the next compile pass.
+	FString CategoryStr;
+	if (Request.Args->TryGetStringField(TEXT("category"), CategoryStr) && !CategoryStr.IsEmpty())
+	{
+		FBlueprintEditorUtils::SetBlueprintVariableCategory(Blueprint, VarName, /*InScope*/ nullptr,
+			FText::FromString(CategoryStr));
+	}
+	FString TooltipStr;
+	if (Request.Args->TryGetStringField(TEXT("tooltip"), TooltipStr) && !TooltipStr.IsEmpty())
+	{
+		FBlueprintEditorUtils::SetBlueprintVariableMetaData(Blueprint, VarName, /*InScope*/ nullptr,
+			TEXT("Tooltip"), TooltipStr);
+	}
+	bool bExposeOnSpawn = false;
+	if (Request.Args->TryGetBoolField(TEXT("exposed_on_spawn"), bExposeOnSpawn) && bExposeOnSpawn)
+	{
+		FBlueprintEditorUtils::SetBlueprintVariableMetaData(Blueprint, VarName, /*InScope*/ nullptr,
+			TEXT("ExposeOnSpawn"), TEXT("true"));
+	}
+	bool bReplicated = false;
+	if (Request.Args->TryGetBoolField(TEXT("replicated"), bReplicated) && bReplicated)
+	{
+		const int32 Idx = FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName);
+		if (Idx != INDEX_NONE)
+		{
+			// Flip the CPF_Net bit on the BP variable's PropertyFlags. The recompile triggered
+			// downstream will materialise this on the UClass.
+			FBPVariableDescription& Var = Blueprint->NewVariables[Idx];
+			Var.PropertyFlags |= CPF_Net;
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		}
+	}
+
+	// NOTE: The Phase 4 plan's edit-const 3-flag gate (CPF_BlueprintReadOnly | CPF_EditConst |
+	// CPF_DisableEditOnInstance) is INTENTIONALLY OMITTED here. That gate is for runtime mutation
+	// of placed instances (actor.set_property semantics) — but UE's AddMemberVariable defaults
+	// every new BP variable to CPF_DisableEditOnInstance + CPF_BlueprintVisible + CPF_Edit. The
+	// default_value we pass becomes the CDO authoring default (FBPVariableDescription::DefaultValue),
+	// not a runtime write to a placed instance, so the gate would falsely reject every add.
+	// The plan reserves the gate for the future bp.set_variable_default tool that mutates an
+	// existing variable's default on a CDO post-creation — that one would correctly apply.
+	// args.bypass_readonly is accepted but currently a no-op (forward-compat).
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("added"), true);
+	Out->SetStringField(TEXT("variable_name"), VarNameStr);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.remove_variable (Lane A, PIE-guarded, idempotent) ────────────────────────────────────
+//
+// Removes a member variable by name. Idempotent — if the variable doesn't exist returns
+// {removed: false, was_present: false} as a SUCCESS (matches Phase 3 actor.destroy idempotency).
+// UE's RemoveMemberVariable also strips dependent variable nodes from all graphs.
+//
+// Args:    { blueprint_path, variable_name }
+// Result:  { removed: bool, was_present: bool }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams
+FMCPResponse Tool_RemoveVariable(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FString VarNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'variable_name'"));
+	}
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	const FName VarName(*VarNameStr);
+	const bool bWasPresent = (FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName) != INDEX_NONE);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	if (!bWasPresent)
+	{
+		Out->SetBoolField(TEXT("removed"), false);
+		Out->SetBoolField(TEXT("was_present"), false);
+		return BP_MakeSuccessObj(Request, Out);
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("BPRemoveVariable", "MCP: remove blueprint variable"));
+	FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, VarName);
+
+	Out->SetBoolField(TEXT("removed"), true);
+	Out->SetBoolField(TEXT("was_present"), true);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.change_variable_type (Lane A, PIE-guarded) ───────────────────────────────────────────
+//
+// Changes a member variable's pin type. ALWAYS returns a non-empty warning describing graph-ref
+// invalidation risk (UE's ChangeMemberVariableType may turn references in graphs into red error
+// nodes that need manual reconnection). With ``drop_default_value=true`` the variable's default
+// string is cleared; otherwise the (possibly type-mismatched) default is retained.
+//
+// Args:    { blueprint_path, variable_name, new_pin_type: { ...MCPPinTypeUtils JSON... },
+//            drop_default_value?: bool }
+// Result:  { changed: bool, prior_pin_type: { ... }, warning: string }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams
+//   -32037 VariableNotFound
+//   -32032 PinTypeUnsupported (both new type and prior type round-trips)
+FMCPResponse Tool_ChangeVariableType(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FString VarNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'variable_name'"));
+	}
+
+	FEdGraphPinType NewPinType;
+	FMCPResponse PinTypeErr;
+	if (!BP_RequirePinTypeArg(Request, TEXT("new_pin_type"), NewPinType, PinTypeErr))
+	{
+		return PinTypeErr;
+	}
+
+	bool bDropDefault = false;
+	Request.Args->TryGetBoolField(TEXT("drop_default_value"), bDropDefault);
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	const FName VarName(*VarNameStr);
+	const int32 Idx = FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName);
+	if (Idx == INDEX_NONE)
+	{
+		return BP_MakeError(Request, kMCPErrorVariableNotFound,
+			FString::Printf(TEXT("variable '%s' not found on blueprint '%s'"),
+				*VarNameStr, *Path));
+	}
+
+	// Snapshot prior pin type BEFORE the mutation so we can echo it. ChangeMemberVariableType may
+	// reset the FBPVariableDescription's VarType in place.
+	FMCPResponse PriorErr;
+	TSharedPtr<FJsonObject> PriorPinTypeObj = BP_PinTypeToJsonOrError(
+		Request, Blueprint->NewVariables[Idx].VarType, PriorErr);
+	if (!PriorPinTypeObj.IsValid()) { return PriorErr; }
+
+	const FScopedTransaction Transaction(LOCTEXT("BPChangeVariableType", "MCP: change blueprint variable type"));
+
+	if (bDropDefault)
+	{
+		// Clear the default BEFORE the type change so UE doesn't try to import the now-wrongly-typed
+		// default during recompile. UE accepts an empty string as "use type's natural default".
+		Blueprint->NewVariables[Idx].DefaultValue = FString();
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	}
+
+	FBlueprintEditorUtils::ChangeMemberVariableType(Blueprint, VarName, NewPinType);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("changed"), true);
+	Out->SetObjectField(TEXT("prior_pin_type"), PriorPinTypeObj);
+	Out->SetStringField(TEXT("warning"),
+		TEXT("changing variable type may invalidate graph references to this variable — UE replaces "
+			 "incompatible nodes with red error nodes that need manual reconnection. Recompile "
+			 "and inspect the graph after this call. Pass drop_default_value=true if the prior "
+			 "default is no longer type-compatible."));
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.add_function (Lane A, PIE-guarded) ───────────────────────────────────────────────────
+//
+// Creates a new user function graph on the Blueprint with optional input/output signatures. The
+// function entry node receives one UserDefinedPin per input; the function result node (lazily
+// created when outputs are present) receives one per output.
+//
+// Args:    { blueprint_path, function_name,
+//            inputs?:  [ { name, pin_type } ],
+//            outputs?: [ { name, pin_type } ],
+//            category?: string }
+// Result:  { added: bool, function_name: string }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams
+//   -32014 PathInUse                   — function name collides with an existing function graph
+//   -32032 PinTypeUnsupported          — any input/output pin_type fails to parse
+//
+// Note: ``access_specifier`` arg from the plan is intentionally OMITTED here. The function entry
+// node defaults to Public; changing access requires writing FUNC_Private / FUNC_Protected onto
+// Entry->ExtraFlags through UK2Node_FunctionEntry's API which is intricate enough to defer to a
+// future bp.set_function_access tool. Callers post-create via that future tool.
+FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FString FnNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("function_name"), FnNameStr) || FnNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'function_name'"));
+	}
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	const FName FnName(*FnNameStr);
+	if (FMCPBlueprintUtils::FindFunctionGraphIndex(Blueprint, FnName) != INDEX_NONE)
+	{
+		return BP_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(
+				TEXT("function '%s' already exists on blueprint '%s'; use bp.remove_function first"),
+				*FnNameStr, *Path));
+	}
+
+	// Parse inputs[] + outputs[] arrays up-front so we can fail fast on bad pin types BEFORE
+	// creating the graph. Each entry: { name: string, pin_type: object }.
+	struct FParsedSignaturePin
+	{
+		FName Name;
+		FEdGraphPinType Type;
+	};
+	TArray<FParsedSignaturePin> Inputs;
+	TArray<FParsedSignaturePin> Outputs;
+
+	auto ParseSignatureArray = [&Request](const TCHAR* FieldName, TArray<FParsedSignaturePin>& Out,
+		FMCPResponse& OutError) -> bool
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!Request.Args->TryGetArrayField(FieldName, Arr) || !Arr)
+		{
+			return true; // optional field
+		}
+		Out.Reserve(Arr->Num());
+		for (int32 i = 0; i < Arr->Num(); ++i)
+		{
+			const TSharedPtr<FJsonValue>& V = (*Arr)[i];
+			if (!V.IsValid() || V->Type != EJson::Object)
+			{
+				OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+					FString::Printf(TEXT("%s[%d] is not an object"), FieldName, i));
+				return false;
+			}
+			const TSharedPtr<FJsonObject>& Item = V->AsObject();
+			FString PinNameStr;
+			if (!Item->TryGetStringField(TEXT("name"), PinNameStr) || PinNameStr.IsEmpty())
+			{
+				OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+					FString::Printf(TEXT("%s[%d] missing 'name'"), FieldName, i));
+				return false;
+			}
+			const TSharedPtr<FJsonObject>* PinTypeObjPtr = nullptr;
+			if (!Item->TryGetObjectField(TEXT("pin_type"), PinTypeObjPtr) || !PinTypeObjPtr || !PinTypeObjPtr->IsValid())
+			{
+				OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+					FString::Printf(TEXT("%s[%d] missing 'pin_type' object"), FieldName, i));
+				return false;
+			}
+			FParsedSignaturePin Pin;
+			Pin.Name = FName(*PinNameStr);
+			int32 ErrCode = 0;
+			FString ErrMsg;
+			if (!FMCPPinTypeUtils::FromJson(*PinTypeObjPtr, Pin.Type, ErrCode, ErrMsg))
+			{
+				OutError = BP_MakeError(Request, ErrCode,
+					FString::Printf(TEXT("%s[%d]: %s"), FieldName, i, *ErrMsg));
+				return false;
+			}
+			Out.Add(Pin);
+		}
+		return true;
+	};
+
+	FMCPResponse SignatureErr;
+	if (!ParseSignatureArray(TEXT("inputs"), Inputs, SignatureErr))   { return SignatureErr; }
+	if (!ParseSignatureArray(TEXT("outputs"), Outputs, SignatureErr)) { return SignatureErr; }
+
+	const FScopedTransaction Transaction(LOCTEXT("BPAddFunction", "MCP: add blueprint function"));
+
+	// Create the empty function graph. UEdGraphSchema_K2 is the schema for K2 (Blueprint) graphs.
+	UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+		Blueprint, FnName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+	if (!NewGraph)
+	{
+		return BP_MakeError(Request, -32603,
+			FString::Printf(TEXT("CreateNewGraph returned null for function '%s'"), *FnNameStr));
+	}
+
+	// AddFunctionGraph<UFunction*>(..., SignatureFromObject=nullptr) creates user-editable
+	// Entry/Result nodes and adds the graph to Blueprint->FunctionGraphs. nullptr SignatureType
+	// is the canonical Epic pattern for "user-defined function, no override".
+	UFunction* NullSignature = nullptr;
+	FBlueprintEditorUtils::AddFunctionGraph<UFunction>(Blueprint, NewGraph,
+		/*bIsUserCreated*/ true, NullSignature);
+
+	// Locate the entry node so we can append input UserDefinedPins.
+	UK2Node_FunctionEntry* EntryNode = nullptr;
+	UK2Node_FunctionResult* ResultNode = nullptr;
+	BP_GetFunctionTerminators(NewGraph, EntryNode, ResultNode);
+	if (!EntryNode)
+	{
+		// AddFunctionGraph guarantees an entry node — if missing the BP is corrupt; surface.
+		FBlueprintEditorUtils::RemoveGraph(Blueprint, NewGraph, EGraphRemoveFlags::Recompile);
+		return BP_MakeError(Request, -32603,
+			TEXT("AddFunctionGraph did not produce a UK2Node_FunctionEntry; aborted (graph rolled back)"));
+	}
+
+	for (const FParsedSignaturePin& InputPin : Inputs)
+	{
+		EntryNode->CreateUserDefinedPin(InputPin.Name, InputPin.Type, EGPD_Output, /*bUseUniqueName*/ true);
+	}
+
+	if (Outputs.Num() > 0)
+	{
+		// Result node is created lazily — only when the function needs to return values. Use
+		// SpawnNode on the schema to honor proper initialisation order. The simpler API: locate or
+		// add via the schema-aware helper from UEdGraphSchema_K2.
+		if (!ResultNode)
+		{
+			// SpawnIntermediate is the Epic-blessed way to add a result node to an existing
+			// function graph after the fact. We create it parented to NewGraph and let UE wire it.
+			FGraphNodeCreator<UK2Node_FunctionResult> Creator(*NewGraph);
+			ResultNode = Creator.CreateNode();
+			ResultNode->FunctionReference.SetSelfMember(FnName);
+			Creator.Finalize();
+
+			// Connect the entry's Then pin to the result's Execute pin so the function has flow.
+			UEdGraphPin* EntryThen = EntryNode->FindPin(UEdGraphSchema_K2::PN_Then);
+			UEdGraphPin* ResultExec = ResultNode->FindPin(UEdGraphSchema_K2::PN_Execute);
+			if (EntryThen && ResultExec)
+			{
+				EntryThen->MakeLinkTo(ResultExec);
+			}
+		}
+		for (const FParsedSignaturePin& OutputPin : Outputs)
+		{
+			ResultNode->CreateUserDefinedPin(OutputPin.Name, OutputPin.Type, EGPD_Input, /*bUseUniqueName*/ true);
+		}
+	}
+
+	// Optional category metadata — stored on the function graph via FKismetUserDeclaredFunctionMetadata.
+	FString CategoryStr;
+	if (Request.Args->TryGetStringField(TEXT("category"), CategoryStr) && !CategoryStr.IsEmpty())
+	{
+		if (FKismetUserDeclaredFunctionMetadata* Meta = FBlueprintEditorUtils::GetGraphFunctionMetaData(NewGraph))
+		{
+			Meta->Category = FText::FromString(CategoryStr);
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("added"), true);
+	Out->SetStringField(TEXT("function_name"), FnNameStr);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.remove_function (Lane A, PIE-guarded, idempotent) ────────────────────────────────────
+//
+// Removes a function graph by name. Idempotent — if missing, returns {removed: false,
+// was_present: false}. UE's RemoveGraph + EGraphRemoveFlags::Recompile retriggers compile so
+// dependent nodes invalidate cleanly.
+//
+// Args:    { blueprint_path, function_name }
+// Result:  { removed: bool, was_present: bool }
+//
+// Errors: -32027 / -32010 / -32004 / -32031 / -32602 (standard set)
+FMCPResponse Tool_RemoveFunction(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FString FnNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("function_name"), FnNameStr) || FnNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'function_name'"));
+	}
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	const FName FnName(*FnNameStr);
+	UEdGraph* Graph = FMCPBlueprintUtils::FindFunctionGraph(Blueprint, FnName);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	if (!Graph)
+	{
+		Out->SetBoolField(TEXT("removed"), false);
+		Out->SetBoolField(TEXT("was_present"), false);
+		return BP_MakeSuccessObj(Request, Out);
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("BPRemoveFunction", "MCP: remove blueprint function"));
+	FBlueprintEditorUtils::RemoveGraph(Blueprint, Graph, EGraphRemoveFlags::Recompile);
+
+	Out->SetBoolField(TEXT("removed"), true);
+	Out->SetBoolField(TEXT("was_present"), true);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.reparent (Lane A, PIE-guarded, EXPERIMENTAL, confirm_dangerous-gated) ────────────────
+//
+// Changes the parent class of a Blueprint. EXPERIMENTAL — UE provides no clean rollback for
+// reparent; variables/functions inherited from the prior parent that don't exist on the new
+// parent become invalid (red error nodes / removed). Tool gate:
+//   1. ``args.confirm_dangerous=true`` REQUIRED (literal bool). Missing/false → -32033 ReparentUnsafe.
+//   2. New parent must resolve to a UClass.
+//   3. New parent must be in the same AActor / UObject family as the current parent (-32011 if not).
+//
+// Args:    { blueprint_path, new_parent_class_path, confirm_dangerous: true }
+// Result:  { reparented: bool, prior_parent: string, lost_variables: [string], lost_functions: [string] }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams (missing new_parent_class_path)
+//   -32023 / -32020 (class resolution)
+//   -32033 ReparentUnsafe (confirm_dangerous missing/false)
+//   -32011 WrongClass (AActor BP reparented to non-AActor class)
+//
+// Logs at Display: "MCP bp.reparent: <bp_path> from <old_parent> to <new_parent> (lost N vars,
+// M funcs)" — same pattern as UBlueprintEditorLibrary::ReparentBlueprint warnings, scoped to MCP.
+FMCPResponse Tool_Reparent(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	FString NewParentPath;
+	if (!Request.Args->TryGetStringField(TEXT("new_parent_class_path"), NewParentPath) || NewParentPath.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'new_parent_class_path'"));
+	}
+
+	// Confirm gate FIRST — even before resolving the BP, so the surface error is consistent
+	// regardless of what else is wrong. Pass requires LITERAL bool true (truthy != true).
+	bool bConfirmDangerous = false;
+	const bool bHasConfirm = Request.Args->TryGetBoolField(TEXT("confirm_dangerous"), bConfirmDangerous);
+	if (!bHasConfirm || !bConfirmDangerous)
+	{
+		return BP_MakeError(Request, kMCPErrorReparentUnsafe,
+			TEXT("bp.reparent requires args.confirm_dangerous=true; this operation may invalidate "
+				 "variables/functions inherited from prior parent class; see failure_modes"));
+	}
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	FMCPResponse ClassErr;
+	UClass* NewParentClass = BP_ResolveClassOrError(Request, NewParentPath, ClassErr);
+	if (!NewParentClass) { return ClassErr; }
+
+	// Validate class family — if current parent is AActor-family, new parent MUST also be. UE
+	// allows arbitrary reparent technically but the result is unusable; surface as -32011 so AI
+	// gets a typed error rather than a compiler explosion later.
+	UClass* OldParentClass = Blueprint->ParentClass;
+	if (OldParentClass && OldParentClass->IsChildOf(AActor::StaticClass())
+		&& !NewParentClass->IsChildOf(AActor::StaticClass()))
+	{
+		return BP_MakeError(Request, kMCPErrorWrongClass,
+			FString::Printf(
+				TEXT("blueprint's current parent '%s' is an AActor subclass; cannot reparent to non-AActor class '%s'"),
+				*OldParentClass->GetPathName(), *NewParentClass->GetPathName()));
+	}
+
+	// No-op short-circuit — same parent is not an error but produces zero work and a noisy log if
+	// we just forwarded to UE.
+	if (NewParentClass == OldParentClass)
+	{
+		TSharedRef<FJsonObject> NoOpOut = MakeShared<FJsonObject>();
+		NoOpOut->SetBoolField(TEXT("reparented"), false);
+		NoOpOut->SetStringField(TEXT("prior_parent"), OldParentClass->GetPathName());
+		NoOpOut->SetArrayField(TEXT("lost_variables"), TArray<TSharedPtr<FJsonValue>>());
+		NoOpOut->SetArrayField(TEXT("lost_functions"), TArray<TSharedPtr<FJsonValue>>());
+		return BP_MakeSuccessObj(Request, NoOpOut);
+	}
+
+	// Diff variables / functions that the OLD parent declared but the NEW parent does NOT.
+	// These are the members the child BP would lose access to after reparent.
+	TSet<FString> OldVars, NewVars, OldFuncs, NewFuncs;
+	BP_CollectClassDeclaredVariableNames(OldParentClass, OldVars);
+	BP_CollectClassDeclaredVariableNames(NewParentClass, NewVars);
+	BP_CollectClassDeclaredFunctionNames(OldParentClass, OldFuncs);
+	BP_CollectClassDeclaredFunctionNames(NewParentClass, NewFuncs);
+
+	const TSet<FString> LostVars = OldVars.Difference(NewVars);
+	const TSet<FString> LostFuncs = OldFuncs.Difference(NewFuncs);
+
+	// Perform reparent — mirror UBlueprintEditorLibrary::ReparentBlueprint's body to avoid a hard
+	// dep on the BlueprintEditorLibrary module. Same compile options it uses for the post-reparent
+	// compile pass.
+	const FScopedTransaction Transaction(LOCTEXT("BPReparent", "MCP: reparent blueprint"));
+	Blueprint->Modify();
+
+	Blueprint->ParentClass = NewParentClass;
+
+	if (Blueprint->SimpleConstructionScript != nullptr)
+	{
+		Blueprint->SimpleConstructionScript->ValidateSceneRootNodes();
+	}
+
+	FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+	EBlueprintCompileOptions CompileOptions =
+		EBlueprintCompileOptions::SkipSave
+		| EBlueprintCompileOptions::UseDeltaSerializationDuringReinstancing
+		| EBlueprintCompileOptions::SkipNewVariableDefaultsDetection;
+	if (GEditor && GEditor->PlayWorld != nullptr)
+	{
+		// Wouldn't happen here because PIE guard above refuses, but UE's library guards this so we
+		// mirror for safety in case the PIE check window race-allows entry.
+		CompileOptions |= EBlueprintCompileOptions::IncludeCDOInReferenceReplacement;
+	}
+	FKismetEditorUtilities::CompileBlueprint(Blueprint, CompileOptions);
+
+	const FString OldParentName = OldParentClass ? OldParentClass->GetPathName() : FString(TEXT("None"));
+	UE_LOG(LogMCP, Display,
+		TEXT("MCP bp.reparent: %s from %s to %s (lost %d vars, %d funcs)"),
+		*Path, *OldParentName, *NewParentClass->GetPathName(),
+		LostVars.Num(), LostFuncs.Num());
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("reparented"), true);
+	Out->SetStringField(TEXT("prior_parent"), OldParentName);
+	Out->SetArrayField(TEXT("lost_variables"), BP_StringSetToJsonArray(LostVars));
+	Out->SetArrayField(TEXT("lost_functions"), BP_StringSetToJsonArray(LostFuncs));
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.compile (Lane A sync, PIE-guarded) ────────────────────────────────────────────────────
+//
+// Synchronous single-Blueprint compile. Captures messages into a private FCompilerResultsLog and
+// splits into errors[] / warnings[] arrays. Returns compiled=true iff post-compile
+// Blueprint->Status ∈ {BS_UpToDate, BS_UpToDateWithWarnings}.
+//
+// Args:    { blueprint_path, fail_on_error?: bool=false }
+// Result:  { compiled: bool, errors: [string], warnings: [string], duration_ms: float, status: string }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32030 KismetCompilationError — only when args.fail_on_error=true AND compile produced errors.
+//                                    Same result payload is embedded in the error envelope for
+//                                    AI strict-mode diagnostic surface.
+//
+// Threading: bp.compile internally schedules compile work but blocks until done. ~50ms-2s per BP
+// in our experience. Async batch use bp.compile_all_dirty instead.
+FMCPResponse Tool_Compile(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	bool bFailOnError = false;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetBoolField(TEXT("fail_on_error"), bFailOnError);
+	}
+
+	FMCPResponse ResolveErr;
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	if (!Blueprint) { return ResolveErr; }
+
+	const double StartTime = FPlatformTime::Seconds();
+
+	FCompilerResultsLog ResultsLog;
+	ResultsLog.bSilentMode = true;
+	ResultsLog.SetSourcePath(Path);
+
+	FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None, &ResultsLog);
+
+	const double DurationMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+
+	TArray<TSharedPtr<FJsonValue>> Errors;
+	TArray<TSharedPtr<FJsonValue>> Warnings;
+	BP_SplitCompileMessages(ResultsLog, Errors, Warnings);
+
+	const EBlueprintStatus Status = Blueprint->Status;
+	const bool bCompiled = (Status == BS_UpToDate || Status == BS_UpToDateWithWarnings);
+
+	const TCHAR* StatusStr = TEXT("Unknown");
+	switch (Status)
+	{
+	case BS_Unknown:               StatusStr = TEXT("Unknown");               break;
+	case BS_Dirty:                 StatusStr = TEXT("Dirty");                 break;
+	case BS_Error:                 StatusStr = TEXT("Error");                 break;
+	case BS_UpToDate:              StatusStr = TEXT("UpToDate");              break;
+	case BS_BeingCreated:          StatusStr = TEXT("BeingCreated");          break;
+	case BS_UpToDateWithWarnings:  StatusStr = TEXT("UpToDateWithWarnings");  break;
+	default:                       StatusStr = TEXT("Unknown");               break;
+	}
+
+	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetBoolField(TEXT("compiled"), bCompiled);
+	ResultObj->SetArrayField(TEXT("errors"), Errors);
+	ResultObj->SetArrayField(TEXT("warnings"), Warnings);
+	ResultObj->SetNumberField(TEXT("duration_ms"), DurationMs);
+	ResultObj->SetStringField(TEXT("status"), StatusStr);
+
+	if (bFailOnError && !bCompiled)
+	{
+		FMCPResponse Err = BP_MakeError(Request, kMCPErrorKismetCompilationError,
+			FString::Printf(
+				TEXT("blueprint '%s' failed strict compile: %d errors, %d warnings (status=%s)"),
+				*Path, Errors.Num(), Warnings.Num(), StatusStr));
+		// Embed the same diagnostic payload as the success path so strict callers don't have to
+		// re-run with fail_on_error=false to get details.
+		Err.Result = MakeShared<FJsonValueObject>(ResultObj);
+		return Err;
+	}
+
+	return BP_MakeSuccessObj(Request, ResultObj);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -990,8 +1972,29 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("bp.get_function"),           &Tool_GetFunction,         /*Lane A*/ false);
 	RegisterTool(TEXT("bp.list_nodes_in_function"), &Tool_ListNodesInFunction, /*Lane A*/ false);
 
+	// Day 6: variable add/remove (writes, PIE-guarded)
+	RegisterTool(TEXT("bp.add_variable"),     &Tool_AddVariable,    /*Lane A*/ false);
+	RegisterTool(TEXT("bp.remove_variable"),  &Tool_RemoveVariable, /*Lane A*/ false);
+
+	// Day 7: variable retype (writes, PIE-guarded)
+	RegisterTool(TEXT("bp.change_variable_type"), &Tool_ChangeVariableType, /*Lane A*/ false);
+
+	// Day 8: function add/remove (writes, PIE-guarded)
+	RegisterTool(TEXT("bp.add_function"),    &Tool_AddFunction,    /*Lane A*/ false);
+	RegisterTool(TEXT("bp.remove_function"), &Tool_RemoveFunction, /*Lane A*/ false);
+
+	// Day 9: reparent (experimental, PIE-guarded, confirm_dangerous-gated)
+	RegisterTool(TEXT("bp.reparent"), &Tool_Reparent, /*Lane A*/ false);
+
+	// Day 10: synchronous single-BP compile (PIE-guarded). bp.compile_all_dirty is the async
+	// composite registered separately by FBlueprintCompositeTools::Register.
+	RegisterTool(TEXT("bp.compile"), &Tool_Compile, /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 4 Days 1-5: registered 6 bp.* read handlers (all Lane A)"));
+		TEXT("Phase 4 Days 1-10: registered 13 bp.* handlers (6 reads + 6 writes + 1 compile, all Lane A); ")
+		TEXT("bp.compile_all_dirty registered separately via FBlueprintCompositeTools"));
 }
 
 } // namespace FBlueprintTools
+
+#undef LOCTEXT_NAMESPACE
