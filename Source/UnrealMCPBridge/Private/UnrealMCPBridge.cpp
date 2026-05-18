@@ -26,6 +26,8 @@
 #include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
 #include "Tools/SequencerTools.h"
+#include "Tools/SourceControlCompositeTools.h"
+#include "Tools/SourceControlTools.h"
 #include "Tools/UMGTools.h"
 
 #include "Dom/JsonObject.h"
@@ -280,14 +282,25 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// get_current_time reads the active LevelSequence editor playhead via
 	// ULevelSequenceEditorBlueprintLibrary::GetGlobalPosition. New error codes landed in MCPTypes.h:
 	// -32042 NoActiveSequencer, -32043 TrackNotFound, -32044 SectionIndexOOB.
-	// PHASE 5 COMPLETE with this registration — 30 user-visible tools across Chunks A/B/C/D
-	// (cumulative across all phases = 145 user-visible + 11 internal hidden).
 	FSequencerTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Phase 6 Chunk A: Source Control surface (6 tools = 5 sync sc.* + 1 async composite
+	// sc.submit). All sync tools are Lane A (sc.status/checkout/diff/diff_binary/revert);
+	// the composite's internal submitter sc._submit_internal is Lane B (queues a job
+	// with bGameThreadRequired=true; the Python wrapper sc.submit returns {job_id} and AI
+	// polls externally). sc.revert requires confirm_destructive=true → -32033 ReparentUnsafe
+	// (reused destructive-confirm gate) when missing. New error code: -32045
+	// SourceControlProviderUnavailable, raised when ISourceControlModule::Get().IsEnabled()
+	// returns false or GetProvider().IsAvailable() returns false. Provider is resolved
+	// per-call (Git LFS, Perforce, Subversion — anything UE Editor's Source Control panel
+	// has configured). Binary diff payloads capped at 32 MiB/side → -32017 InputTooLarge.
+	FSourceControlTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+	FSourceControlCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + sc.* (5) + sc._internal (1) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

@@ -105,6 +105,14 @@ public class UnrealMCPBridge : ModuleRules
 				"MovieScene",
 				"MovieSceneTracks",
 				"LevelSequenceEditor",
+				// Phase 6 Chunk A — Source Control surface.
+				// `SourceControl` module exposes ISourceControlModule, ISourceControlProvider,
+				// ISourceControlState, ISourceControlRevision, and the operation classes
+				// (FUpdateStatus, FCheckOut, FRevert, FCheckIn) used by sc.* tools.
+				// Provider implementations (Git LFS, Perforce, Subversion) live in separate
+				// plugins and are loaded by their own modules — we never reference them directly
+				// (we go through the abstract ISourceControlProvider interface).
+				"SourceControl",
 			}
 		);
 	}

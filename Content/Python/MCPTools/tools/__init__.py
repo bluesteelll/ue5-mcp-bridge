@@ -24,3 +24,9 @@ from MCPTools.tools import level_composites  # noqa: F401
 # scope_paths + compiles each UBlueprint, aggregates per-BP failures into {compiled, succeeded,
 # failed, duration_ms}.
 from MCPTools.tools import blueprint_composites  # noqa: F401
+
+# Phase 6 — Async composite tools for SC + Test + LiveCoding surfaces. Chunk A (Source Control)
+# ships sc.submit; later chunks will add test.run_automation + livecoding.recompile here. All
+# composites are async-only — they call dispatch_internal('..._internal', args) and return
+# {job_id}; AI client polls job.status / job.result externally.
+from MCPTools.tools import phase6_composites  # noqa: F401

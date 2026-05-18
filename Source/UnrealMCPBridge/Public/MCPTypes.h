@@ -223,6 +223,25 @@ inline constexpr int32 kMCPErrorTrackNotFound               = -32043;
 inline constexpr int32 kMCPErrorSectionIndexOOB             = -32044;
 
 /**
+ * Phase 6 — Source Control + Test + Config + Logs + LiveCoding surface (Chunk A: Source Control).
+ *
+ *   -32045 SourceControlProviderUnavailable  ``sc.*`` — Either ``ISourceControlModule::Get().IsEnabled()``
+ *                                            returned false (no provider configured for this project)
+ *                                            OR ``GetProvider().IsAvailable()`` returned false (provider
+ *                                            present but not connected — e.g. Perforce server unreachable).
+ *                                            Caller's recovery: configure SC in Editor Preferences →
+ *                                            Source Control, or use a workspace that already has a
+ *                                            connected provider (Git LFS, Perforce, Subversion, etc.).
+ *
+ * Future Phase 6 chunks (placeholder; codes will land alongside their chunks):
+ *   -32046 TestNotFound          (Chunk B: test.*)
+ *   -32047 CVarReadOnly          (Chunk C: cfg.*)
+ *   -32048 LiveCodingDisabled    (Chunk E: livecoding.*)
+ *   -32049 LogCategoryUnknown    (Chunk D: log.*)
+ */
+inline constexpr int32 kMCPErrorSourceControlProviderUnavailable = -32045;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */
