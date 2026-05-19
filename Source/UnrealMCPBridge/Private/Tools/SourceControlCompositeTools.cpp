@@ -310,12 +310,14 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	};
 
 	// Day 3: sc.submit backing internal (async composite).
-	// Lane A (was Lane B until 2026-05 livecoding crash class). Submitter pre-checks call
-	// ISourceControlModule::IsEnabled / GetProvider().IsAvailable() / .GetName() which formally
-	// require IsInGameThread() per UE 5.7 contract. The actual FCheckIn RPC still runs on GT via
-	// SubmitJob's bGameThreadRequired=true. Latency cost (~16ms tick quantization) is negligible
-	// for an async op.
-	RegisterTool(TEXT("sc._submit_internal"), &Tool_SubmitInternal, /*Lane A*/ false);
+	// Lane B (revert from short-lived Lane A test). ISourceControlModule::Get + Provider state
+	// queries (IsEnabled/IsAvailable/GetName) are observed empirically thread-safe in UE 5.7 from
+	// the listener thread; the actual FCheckIn RPC runs on GT via SubmitJob's bGameThreadRequired.
+	// CRITICAL: must NOT be Lane A. Python composites call dispatch_internal which synchronously
+	// blocks the GT (FMCPPythonEval runs on GT) waiting for the response. If the submitter ran on
+	// Lane A it would queue to OnEndFrame drain — but GT is busy in the Python wrapper → 30 s
+	// dispatch_internal timeout. Same pattern Phase 2 Hotfix 3 documented for composites.
+	RegisterTool(TEXT("sc._submit_internal"), &Tool_SubmitInternal, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk A (Source Control composites): registered 1 internal composite handler ")

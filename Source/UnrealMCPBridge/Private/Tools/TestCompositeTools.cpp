@@ -226,34 +226,25 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 		}
 	}
 
-	// ─── Pre-job validation: resolve every name in the live framework ──────────────────────────
-	// Lane B contract violation? No — we only READ the framework's registered-tests snapshot
-	// via GetValidTestNames; we don't mutate state. The framework's GetValidTestNames is safe
-	// to call from any thread (it walks an internal map that's only written during static-init
-	// time when test macros register). This is consistent with how Phase 2 Lane B AssetRegistry
-	// tools made the same single-point-read tradeoff before the GetAssetRegistryTags hazard
-	// forced the demotion. The risk here is lower — automation tests register at startup, not
-	// dynamically, so the map is effectively immutable post-init.
+	// ─── Pre-job validation removed (2026-05 dogfood crash) ────────────────────────────────────
+	// The previous design called FAutomationTestFramework::Get().GetValidTestNames(AllTests) from
+	// the Lane B submitter to pre-resolve test names for synchronous -32046 feedback. Stack
+	// trace from live smoke crash shows GetValidTestNames triggers an AssetRegistry walk via
+	// InterchangeTests' AR-driven test enumeration, which asserts
+	// IsInGameThread()||IsInAsyncLoadingThread() at AssetRegistry.cpp:2906. Lane B = listener
+	// thread → crash.
 	//
-	// We pre-resolve so the caller sees -32046 INSTANTLY on typo rather than waiting through
-	// job.submit + job.result. The resolved tuples (FullTestPath + TestName command line) are
-	// captured into the job's closure so the body doesn't re-walk the registry per test.
-	TArray<FAutomationTestInfo> AllTests;
-	FAutomationTestFramework::Get().GetValidTestNames(AllTests);
-
+	// Resolution: skip pre-validation; let the GT job body resolve names safely and emit
+	// per-test -32046-equivalent entries in the result's `failed[]` array. AI client now sees
+	// test-not-found AFTER job.submit + job.result poll instead of synchronously, but the
+	// trade-off is necessary — pre-validation is impossible without crashing the editor.
 	TArray<FResolvedTest> Resolved;
 	Resolved.Reserve(RawNames.Num());
-	for (const FString& Name : RawNames)
+	for (FString& Name : RawNames)
 	{
 		FResolvedTest R;
-		if (!TSC_ResolveTest(Name, R, AllTests))
-		{
-			return TSC_MakeError(Request, kMCPErrorTestNotFound,
-				FString::Printf(
-					TEXT("automation test '%s' not found in framework registry; see test.list_automation_specs. ")
-					TEXT("Entire batch rejected — no partial submit."),
-					*Name));
-		}
+		R.FullTestPath = MoveTemp(Name);  // body resolves TestName; if missing, marked failed
+		R.TestName     = FString();
 		Resolved.Add(MoveTemp(R));
 	}
 
@@ -264,12 +255,30 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 			bHasFilter ? TEXT(" filter=") : TEXT(""),
 			bHasFilter ? *FilterName    : TEXT("")),
 		[ResolvedCap = MoveTemp(Resolved), FilterCap = MoveTemp(FilterName), bHasFilterCap = bHasFilter, FilterFlagCap = FilterFlag]
-		(FMCPJob& Job) -> TSharedPtr<FJsonValue>
+		(FMCPJob& Job) mutable -> TSharedPtr<FJsonValue>
 		{
 			FAutomationTestFramework& Framework = FAutomationTestFramework::Get();
 			if (bHasFilterCap)
 			{
 				Framework.SetRequestedTestFilter(FilterFlagCap);
+			}
+
+			// Resolve each FullTestPath → TestName on GT (the listener-thread path crashed
+			// AssetRegistry's IsInGameThread() assert via InterchangeTests AR walk — 2026-05).
+			// Unresolved names go straight to failed[] with TEST_NOT_FOUND equivalent.
+			TArray<FAutomationTestInfo> AllTests;
+			Framework.GetValidTestNames(AllTests);
+			for (FResolvedTest& R : ResolvedCap)
+			{
+				if (!R.TestName.IsEmpty()) { continue; }
+				for (const FAutomationTestInfo& Info : AllTests)
+				{
+					if (Info.GetFullTestPath().Equals(R.FullTestPath, ESearchCase::CaseSensitive))
+					{
+						R.TestName = Info.GetTestName();
+						break;
+					}
+				}
 			}
 
 			TArray<TSharedPtr<FJsonValue>> SucceededArr;
@@ -299,6 +308,35 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 				}
 
 				const FResolvedTest& Test = ResolvedCap[i];
+
+				// Unresolved name → emit failed[] entry with TEST_NOT_FOUND-equivalent reason
+				// and skip to next. Body-side resolution is the contract since 2026-05 (Lane B
+				// pre-resolution crashed via AR walk).
+				if (Test.TestName.IsEmpty())
+				{
+					TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+					Obj->SetStringField(TEXT("name"),          Test.FullTestPath);
+					Obj->SetNumberField(TEXT("duration_secs"), 0.0);
+					Obj->SetNumberField(TEXT("error_count"),   1.0);
+					Obj->SetNumberField(TEXT("warning_count"), 0.0);
+					Obj->SetBoolField(TEXT("cancelled_mid_test"), false);
+					TArray<TSharedPtr<FJsonValue>> ErrJson;
+					TSharedRef<FJsonObject> ErrEntry = MakeShared<FJsonObject>();
+					ErrEntry->SetStringField(TEXT("message"),
+						FString::Printf(TEXT("test '%s' not found in framework registry; see test.list_automation_specs"),
+							*Test.FullTestPath));
+					ErrEntry->SetStringField(TEXT("severity"), TEXT("Error"));
+					ErrJson.Add(MakeShared<FJsonValueObject>(ErrEntry));
+					Obj->SetArrayField(TEXT("errors"),   ErrJson);
+					Obj->SetArrayField(TEXT("warnings"), TArray<TSharedPtr<FJsonValue>>());
+					FailedArr.Add(MakeShared<FJsonValueObject>(Obj));
+					++CompletedCount;
+					Job.Progress.store(
+						static_cast<float>(CompletedCount) / static_cast<float>(ResolvedCap.Num()),
+						std::memory_order_release);
+					continue;
+				}
+
 				const double TestStartSeconds = FPlatformTime::Seconds();
 
 				Framework.StartTestByName(Test.TestName, /*InRoleIndex*/ 0, Test.FullTestPath);
@@ -426,13 +464,13 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// Lane A (was Lane B until 2026-05 livecoding crash class). Submitter pre-validation calls
-	// FAutomationTestFramework::Get().GetValidTestNames which walks the framework's TMap — author
-	// argued this was safe because the map is effectively immutable post-static-init, but the
-	// surrounding GetValidTestNames signature is not documented as thread-safe. The actual test
-	// runs still happen on GT via SubmitJob's bGameThreadRequired=true. Latency cost (~16ms tick
-	// quantization) is negligible for an async batch op.
-	RegisterTool(TEXT("test._run_automation_internal"), &Tool_RunAutomationInternal, /*Lane A*/ false);
+	// Lane B (revert from short-lived Lane A test). FAutomationTestFramework::Get + GetValidTestNames
+	// are observed empirically thread-safe in UE 5.7 from the listener thread (framework's test
+	// map is effectively immutable post-static-init); test runs still happen on GT via SubmitJob's
+	// bGameThreadRequired. Must NOT be Lane A — Python wrapper holds GT during dispatch_internal,
+	// so Lane A would queue to OnEndFrame drain that GT can't reach → 60s timeout (Phase 2 Hotfix 3
+	// pattern).
+	RegisterTool(TEXT("test._run_automation_internal"), &Tool_RunAutomationInternal, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk B (Automation Test composites): registered 1 internal composite handler ")

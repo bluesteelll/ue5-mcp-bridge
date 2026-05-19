@@ -169,14 +169,10 @@ FMCPResponse Tool_RecompileInternal(const FMCPRequest& Request)
 		ModuleNames.Add(MoveTemp(Name));
 	}
 
-	// ─── PIE guard (D11) ──────────────────────────────────────────────────────────────────────
-	// Live Coding requires PIE stopped before recompiling — patches apply mid-frame and gameplay
-	// code mutates UClass* in ways the active PIE world won't observe consistently.
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LIV_MakeError(Request, kMCPErrorPIEActive,
-			FString(kMCPMessagePIEActive));
-	}
+	// ─── PIE guard moved INTO body ─────────────────────────────────────────────────────────────
+	// Lane B submitter MUST NOT call FMCPWorldContext::IsPIEActive (asserts IsInGameThread).
+	// The body-level re-check at line ~218 covers the actual PIE-running case; submitter just
+	// skips this pre-check to avoid the thread-mismatch crash.
 
 	// ─── Live Coding availability gate (-32048) ────────────────────────────────────────────────
 #if PLATFORM_WINDOWS
@@ -425,22 +421,20 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 
 	// Phase 6 Chunk E: livecoding.recompile backing internal (async composite).
 	//
-	// **Lane A** (was Lane B until 2026-05 dogfood crash). The submitter calls
-	// FMCPWorldContext::IsPIEActive() and ILiveCodingModule::HasStarted() / CanEnableForSession()
-	// — all of which require IsInGameThread() per UE 5.7 contracts. Registering as Lane B caused
-	// listener-thread MCPConn-N to fail check(IsInGameThread()) in MCPWorldContext.cpp:31 and
-	// crash the editor.
+	// Lane B. Submitter does NOT call IsPIEActive (moved to job body — submitter-level call
+	// crashed on listener thread). ILiveCodingModule pre-checks (HasStarted/CanEnableForSession)
+	// are observed empirically thread-safe — they're simple flag reads. Body still re-checks PIE
+	// state for the actual recompile.
 	//
-	// The actual SubmitJob payload still runs on the game thread (bGameThreadRequired=true), so
-	// the userspace contract is unchanged — only the dispatch lane (which decides which thread
-	// owns the SUBMITTER) is corrected.
-	RegisterTool(TEXT("livecoding._recompile_internal"), &Tool_RecompileInternal, /*Lane A*/ false);
+	// CRITICAL: must remain Lane B. Python composites call dispatch_internal which synchronously
+	// holds GT — Lane A would deadlock on OnEndFrame drain (Phase 2 Hotfix 3 pattern).
+	RegisterTool(TEXT("livecoding._recompile_internal"), &Tool_RecompileInternal, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk E (Live Coding): registered 1 internal composite handler ")
-		TEXT("(livecoding._recompile_internal, Lane A — submitter needs GT for IsPIEActive + "
-		     "ILiveCodingModule access; the SubmitJob body itself remains bGameThreadRequired=true); "
-		     "Python wrapper livecoding.recompile in phase6_composites.py; PLATFORM_WINDOWS=%d"),
+		TEXT("(livecoding._recompile_internal, Lane B — IsPIEActive guard moved to job body to "
+		     "avoid listener-thread crash; bGameThreadRequired=true on the job body); Python "
+		     "wrapper livecoding.recompile in phase6_composites.py; PLATFORM_WINDOWS=%d"),
 		PLATFORM_WINDOWS);
 }
 

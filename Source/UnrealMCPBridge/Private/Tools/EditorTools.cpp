@@ -9,6 +9,7 @@
 #include "Utils/MCPScreenshotUtils.h"
 #include "Utils/MCPWorldContext.h"
 
+#include "Containers/Ticker.h"
 #include "Editor.h"
 #include "EditorViewportClient.h"
 #include "Engine/Engine.h"
@@ -427,9 +428,12 @@ FMCPResponse Tool_ViewportScreenshotToDisk(const FMCPRequest& Request)
 	}
 	if (PathRaw.IsEmpty())
 	{
+		// FPaths::ProjectSavedDir() is UE-relative (../../../FatumGame/Saved/) — sandbox correctly
+		// rejects `..` segments, so canonicalise to absolute BEFORE the Combine.
 		const TCHAR* Ext = (Format == FMCPScreenshotUtils::EImageFormat::JPG) ? TEXT("jpg") : TEXT("png");
 		const FGuid Guid = FGuid::NewGuid();
-		PathRaw = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UnrealMCP"),
+		const FString SavedAbs = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir());
+		PathRaw = FPaths::Combine(SavedAbs, TEXT("UnrealMCP"),
 			TEXT("screenshots"), FString::Printf(TEXT("%s.%s"), *Guid.ToString(EGuidFormats::Digits), Ext));
 	}
 
@@ -524,8 +528,10 @@ FMCPResponse Tool_PIEScreenshotToDisk(const FMCPRequest& Request)
 	}
 	if (PathRaw.IsEmpty())
 	{
+		// Canonicalise UE-relative ProjectSavedDir to absolute (sandbox blocks `..` segments).
 		const FGuid Guid = FGuid::NewGuid();
-		PathRaw = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UnrealMCP"),
+		const FString SavedAbs = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir());
+		PathRaw = FPaths::Combine(SavedAbs, TEXT("UnrealMCP"),
 			TEXT("screenshots"), FString::Printf(TEXT("pie_%s.png"), *Guid.ToString(EGuidFormats::Digits)));
 	}
 
@@ -1032,27 +1038,31 @@ FMCPResponse Tool_CurrentWorld(const FMCPRequest& Request)
 // Errors:
 //   -32603 Internal  GEditor unavailable
 //
-// Forces ONE editor tick via GEditor->Tick(DeltaTime, false). Default DeltaTime = 1/60s. Note
-// that this DOES NOT tick Slate UI — toast notifications enqueued via editor.show_message will
-// only appear after the next natural editor tick (the OnEndFrame drain from our own bridge will
-// also fire normally). This tool's primary use case is headless / commandlet scenarios where the
-// editor is otherwise idle and queued work (e.g. material compile, async asset load) needs a
-// nudge to progress.
+// Advances the global FTSTicker (timers, async-task progress) by ONE 60 Hz frame. Does NOT call
+// GEditor->Tick() — that's reserved for the engine's own per-frame loop and asserts on
+// EDynamicResolutionStateEvent::BeginFrame being unique-per-frame. Calling GEditor->Tick from a
+// Lane A dispatch handler runs MID-frame (inside the engine's natural tick), violating that
+// invariant and immediately crashing with appError ("UnrealEngine.cpp:13962").
+//
+// This implementation uses the safer FTSTicker path: gameplay timers, async load completions,
+// per-frame callbacks, and the bridge's own OnEndFrame drain all advance. The engine's own
+// per-frame work (rendering, animation, physics) does NOT — that still requires a natural tick.
+// Primary use case: headless / commandlet scenarios where the editor is otherwise idle and
+// queued FTSTicker work needs a nudge to progress.
 FMCPResponse Tool_TickOnce(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (!GEditor)
-	{
-		return EDT_MakeError(Request, kEDTErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
-	}
-
 	// One 60Hz frame. Caller has no way to specify dt — keeping the input schema strict (per plan).
 	constexpr float TickDt = 1.0f / 60.0f;
-	GEditor->Tick(TickDt, /*bIdleMode*/ false);
+	FTSTicker::GetCoreTicker().Tick(TickDt);
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("ticked"), true);
+	Out->SetNumberField(TEXT("delta_seconds"), TickDt);
+	Out->SetStringField(TEXT("note"),
+		TEXT("FTSTicker advanced; GEditor->Tick is unsafe mid-frame and is NOT called here. "
+			 "Engine render/anim/physics ticks still require a natural editor frame."));
 	return EDT_MakeSuccessObj(Request, Out);
 }
 
