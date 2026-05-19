@@ -17,6 +17,7 @@
 #include "Editor.h"
 #include "Engine/DataAsset.h"
 #include "Factories/DataAssetFactory.h"
+#include "Factories/Factory.h"
 #include "IAssetTools.h"
 #include "ImageUtils.h"
 #include "Subsystems/EditorAssetSubsystem.h"
@@ -1520,6 +1521,180 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 	return AR_MakeSuccessObj(Request, Out);
 }
 
+// ─── asset.create — generic creator for ANY UObject subclass (no source file) ───────────────
+//
+// Wider than asset.create_data_asset: covers UNiagaraSystem, UAnimSequence, UAnimMontage,
+// UMaterial (empty graph), UStaticMesh (empty), UDataTable, UCurveTable, USoundCue, etc.
+//
+// Discovery strategy:
+//   1. Try to find a UFactoryNew subclass with SupportedClass == TargetClass. If found, use
+//      IAssetTools::CreateAsset(name, path, class, factory) — same path as material.create_instance.
+//   2. Fallback: direct NewObject<TargetClass>(Package) + AssetRegistry::AssetCreated +
+//      MarkPackageDirty. Works for most simple classes (data tables need a row struct → fails
+//      this path; caller should use specialized tooling for those).
+//
+// Args:
+//   - class_path:   string (required)  /Script/Module.Class  OR  /Game/.../BP.BP_C
+//   - dest_path:    string (required)  /Game/.../NewAsset
+//   - save:         bool   (optional)  default false
+//   - allow_fallback_newobject: bool (optional) default true — allow NewObject fallback if no factory found
+//
+// Result:
+//   - created:     bool
+//   - asset_path:  string
+//   - class_path:  string  echo
+//   - used_factory:string  factory class path used (empty if NewObject fallback)
+//   - saved:       bool
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (GEditor && GEditor->PlayWorld != nullptr)
+	{
+		return AR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	if (!Request.Args.IsValid())
+	{
+		return AR_MakeError(Request, -32602,
+			TEXT("asset.create requires args.class_path + args.dest_path"));
+	}
+
+	FString ClassPath;
+	FString DestPathRaw;
+	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
+	{
+		return AR_MakeError(Request, -32602, TEXT("missing required string field 'class_path'"));
+	}
+	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
+	{
+		return AR_MakeError(Request, -32602, TEXT("missing required string field 'dest_path'"));
+	}
+	if (!ClassPath.StartsWith(TEXT("/")) || ClassPath.Contains(TEXT("\\")))
+	{
+		return AR_MakeError(Request, kMCPErrorInvalidClassPath,
+			FString::Printf(TEXT("class_path '%s' must start with '/' (form: /Script/<Module>.<Class>  OR  /Game/.../BP.BP_C)"),
+				*ClassPath));
+	}
+
+	// Resolve class (with _C autoload fallback).
+	UClass* TargetClass = LoadClass<UObject>(nullptr, *ClassPath);
+	if (!TargetClass)
+	{
+		const FString WithC = ClassPath.EndsWith(TEXT("_C")) ? ClassPath : (ClassPath + TEXT("_C"));
+		TargetClass = LoadClass<UObject>(nullptr, *WithC);
+	}
+	if (!TargetClass)
+	{
+		return AR_MakeError(Request, kMCPErrorClassNotFound,
+			FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath));
+	}
+	if (TargetClass->HasAnyClassFlags(CLASS_Abstract))
+	{
+		return AR_MakeError(Request, kMCPErrorClassAbstract,
+			FString::Printf(TEXT("class '%s' is abstract — cannot instantiate"), *TargetClass->GetPathName()));
+	}
+
+	// Validate dest path.
+	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
+	if (DestPathNorm.IsEmpty())
+	{
+		return AR_MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path"), *DestPathRaw));
+	}
+	if (FPackageName::DoesPackageExist(DestPathNorm))
+	{
+		return AR_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
+	}
+
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	// ─── Strategy 1: find UFactoryNew with SupportedClass == TargetClass ───────────────────────
+	UFactory* SelectedFactory = nullptr;
+	UClass*   SelectedFactoryClass = nullptr;
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		UClass* FC = *It;
+		if (!FC || !FC->IsChildOf(UFactory::StaticClass())) { continue; }
+		if (FC->HasAnyClassFlags(CLASS_Abstract | CLASS_NewerVersionExists)) { continue; }
+		UFactory* CDO = FC->GetDefaultObject<UFactory>();
+		if (!CDO) { continue; }
+		// Prefer factories that explicitly support "new asset" creation (not import factories).
+		if (!CDO->ShouldShowInNewMenu()) { continue; }
+		if (CDO->GetSupportedClass() != TargetClass) { continue; }
+		SelectedFactory      = NewObject<UFactory>(GetTransientPackage(), FC);
+		SelectedFactoryClass = FC;
+		break;
+	}
+
+	UObject* NewAsset = nullptr;
+	FString  UsedFactory;
+	if (SelectedFactory)
+	{
+		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+		NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, TargetClass, SelectedFactory);
+		if (NewAsset && SelectedFactoryClass)
+		{
+			UsedFactory = SelectedFactoryClass->GetPathName();
+		}
+	}
+
+	// ─── Strategy 2: NewObject fallback (only if requested + no factory worked) ────────────────
+	bool bAllowFallback = true;
+	Request.Args->TryGetBoolField(TEXT("allow_fallback_newobject"), bAllowFallback);
+
+	if (!NewAsset && bAllowFallback)
+	{
+		const FString PackageNameFull = PackagePath / AssetName;
+		UPackage* Pkg = CreatePackage(*PackageNameFull);
+		if (Pkg)
+		{
+			Pkg->FullyLoad();
+			NewAsset = NewObject<UObject>(Pkg, TargetClass, FName(*AssetName), RF_Public | RF_Standalone);
+			if (NewAsset)
+			{
+				FAssetRegistryModule::AssetCreated(NewAsset);
+				Pkg->MarkPackageDirty();
+				UsedFactory = TEXT("(NewObject fallback)");
+			}
+		}
+	}
+
+	if (!NewAsset)
+	{
+		return AR_MakeError(Request, -32603,
+			FString::Printf(TEXT("could not create asset of class '%s' at '%s' "
+				"(no UFactoryNew matched%s)"),
+				*TargetClass->GetPathName(), *DestPathNorm,
+				bAllowFallback ? TEXT(" and NewObject fallback failed") : TEXT(" and allow_fallback_newobject=false")));
+	}
+
+	if (UPackage* Pkg = NewAsset->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	bool bSaveRequested = false;
+	bool bSavedOk = false;
+	Request.Args->TryGetBoolField(TEXT("save"), bSaveRequested);
+	if (bSaveRequested)
+	{
+		if (UEditorAssetSubsystem* EAS = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr)
+		{
+			bSavedOk = EAS->SaveLoadedAsset(NewAsset, /*bOnlyIfIsDirty*/ true);
+		}
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("created"), true);
+	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
+	Out->SetStringField(TEXT("class_path"), TargetClass->GetPathName());
+	Out->SetStringField(TEXT("used_factory"), UsedFactory);
+	Out->SetBoolField(TEXT("saved"), bSavedOk);
+	return AR_MakeSuccessObj(Request, Out);
+}
+
 // ─── asset.list_data_asset_classes — discover UDataAsset subclasses available for create ────
 //
 // Args:
@@ -1718,6 +1893,8 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// Data Asset creation surface (2026-05): create + discover DA classes.
 	RegisterTool(TEXT("asset.create_data_asset"),       &Tool_AssetCreateDataAsset,       /*Lane A*/          false);
 	RegisterTool(TEXT("asset.list_data_asset_classes"), &Tool_AssetListDataAssetClasses,  /*Lane A*/          false);
+	// Generic asset creation for any UClass (UFactoryNew + NewObject fallback).
+	RegisterTool(TEXT("asset.create"),                  &Tool_AssetCreate,                /*Lane A*/          false);
 
 	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 13 asset.* handlers (all Lane A — UE 5.7 AR not thread-safe)"));
 }

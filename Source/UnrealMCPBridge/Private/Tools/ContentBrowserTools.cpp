@@ -11,7 +11,11 @@
 #include "AssetExportTask.h"
 #include "AssetImportTask.h"
 #include "AssetRegistry/ARFilter.h"
+#include "EditorReimportHandler.h"
+#include "EditorFramework/AssetImportData.h"
 #include "Exporters/Exporter.h"
+#include "Factories/Factory.h"
+#include "UObject/UObjectIterator.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -959,6 +963,189 @@ FMCPResponse Tool_SaveAllDirty(const FMCPRequest& Request)
 	return CB_MakeSuccessObj(Request, Out);
 }
 
+// ─── cb.reimport (refresh asset from source) ─────────────────────────────────────────────────
+//
+// Args:
+//   - asset_path:    string (required)  /Game/.../Asset
+//   - source_file:   string (optional)  Override the source file. Default = use the source the
+//                                          asset was originally imported from (stored in
+//                                          AssetImportData).
+//
+// Result:
+//   - reimported:    bool
+//   - source_file:   string  the file actually used
+//   - asset_path:    string  echo
+//
+// PIE-guarded. Lane A (FReimportManager + UObject access).
+FMCPResponse Tool_Reimport(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (GEditor && GEditor->PlayWorld != nullptr)
+	{
+		return CB_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString NormalizedPath;
+	FMCPResponse Err;
+	if (!CB_RequirePath(Request, TEXT("asset_path"), NormalizedPath, Err)) { return Err; }
+
+	UObject* AssetObj = StaticLoadObject(UObject::StaticClass(), nullptr, *NormalizedPath);
+	if (!AssetObj)
+	{
+		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("could not load asset '%s' for reimport"), *NormalizedPath));
+	}
+
+	// Optional source-file override — push into AssetImportData->SetSourceFiles before reimport.
+	FString SourceFileOverride;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetStringField(TEXT("source_file"), SourceFileOverride);
+	}
+	if (!SourceFileOverride.IsEmpty())
+	{
+		FString AbsSrc;
+		FString SandboxErr;
+		if (!FMCPPathSandbox::Resolve(SourceFileOverride, AbsSrc, SandboxErr))
+		{
+			return CB_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		}
+		if (!IFileManager::Get().FileExists(*AbsSrc))
+		{
+			return CB_MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("source_file '%s' does not exist on disk"), *AbsSrc));
+		}
+
+		// Try to find the asset's UAssetImportData via reflection. Common location:
+		// UTexture::AssetImportData, UStaticMesh::AssetImportData, etc.
+		FProperty* AssetImportProp = AssetObj->GetClass()->FindPropertyByName(FName(TEXT("AssetImportData")));
+		if (AssetImportProp)
+		{
+			FObjectProperty* ObjProp = CastField<FObjectProperty>(AssetImportProp);
+			if (ObjProp)
+			{
+				UObject* ImportData = ObjProp->GetObjectPropertyValue_InContainer(AssetObj);
+				if (UAssetImportData* AID = Cast<UAssetImportData>(ImportData))
+				{
+					AID->Update(AbsSrc);
+				}
+			}
+		}
+		SourceFileOverride = AbsSrc;  // for response echo
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("CBReimport", "MCP: reimport asset"));
+	const bool bReimported = FReimportManager::Instance()->Reimport(
+		AssetObj,
+		/*bAskForNewFileIfMissing*/ false,
+		/*bShowNotification*/ false,
+		/*PreferredReimportFile*/ SourceFileOverride);
+
+	if (!bReimported)
+	{
+		return CB_MakeError(Request, -32000,
+			FString::Printf(TEXT("FReimportManager::Reimport returned false for '%s' "
+				"(no factory accepted the reimport; check editor log)"), *NormalizedPath));
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("reimported"), true);
+	Out->SetStringField(TEXT("asset_path"), NormalizedPath);
+	Out->SetStringField(TEXT("source_file"), SourceFileOverride);
+	return CB_MakeSuccessObj(Request, Out);
+}
+
+// ─── cb.list_supported_formats (discover factories + supported file extensions) ─────────────
+//
+// Args:
+//   - extension_filter: string (optional)  case-insensitive — only emit factories that support
+//                                            this extension (e.g. "fbx" → just FBX factories)
+//   - include_class_path: bool (optional)   default true — include supported_class path
+//
+// Result:
+//   - factories[{factory_class_path, supported_class_path, extensions[string], description,
+//                supports_new_menu, supports_drag_drop}]
+//   - total_known
+//
+// Lane A (TObjectIterator + UFactory::GetSupportedFileExtensions).
+FMCPResponse Tool_ListSupportedFormats(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FString ExtensionFilter;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetStringField(TEXT("extension_filter"), ExtensionFilter);
+		ExtensionFilter = ExtensionFilter.ToLower();
+		if (ExtensionFilter.StartsWith(TEXT(".")))
+		{
+			ExtensionFilter = ExtensionFilter.RightChop(1);
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Out;
+	int32 TotalKnown = 0;
+
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		UClass* C = *It;
+		if (!C || !C->IsChildOf(UFactory::StaticClass()) || C == UFactory::StaticClass())
+		{
+			continue;
+		}
+		if (C->HasAnyClassFlags(CLASS_Abstract | CLASS_NewerVersionExists | CLASS_Deprecated))
+		{
+			continue;
+		}
+
+		UFactory* CDO = C->GetDefaultObject<UFactory>();
+		if (!CDO) { continue; }
+
+		TArray<FString> Extensions;
+		CDO->GetSupportedFileExtensions(Extensions);
+
+		// Filter by extension if requested.
+		if (!ExtensionFilter.IsEmpty())
+		{
+			bool bMatchesExt = false;
+			for (const FString& E : Extensions)
+			{
+				if (E.Equals(ExtensionFilter, ESearchCase::IgnoreCase))
+				{
+					bMatchesExt = true;
+					break;
+				}
+			}
+			if (!bMatchesExt) { continue; }
+		}
+
+		++TotalKnown;
+
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("factory_class_path"), C->GetPathName());
+		Obj->SetStringField(TEXT("supported_class_path"),
+			CDO->GetSupportedClass() ? CDO->GetSupportedClass()->GetPathName() : FString());
+
+		TArray<TSharedPtr<FJsonValue>> ExtArr;
+		for (const FString& E : Extensions)
+		{
+			ExtArr.Add(MakeShared<FJsonValueString>(E));
+		}
+		Obj->SetArrayField(TEXT("extensions"), ExtArr);
+		Obj->SetBoolField(TEXT("supports_new_menu"), CDO->ShouldShowInNewMenu());
+		Obj->SetBoolField(TEXT("supports_drag_drop"), CDO->FactoryCanImport(TEXT("")));
+		Obj->SetStringField(TEXT("description"), CDO->GetDisplayName().ToString());
+
+		Out.Add(MakeShared<FJsonValueObject>(Obj));
+	}
+
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetArrayField(TEXT("factories"), Out);
+	ResultObj->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
+	return CB_MakeSuccessObj(Request, ResultObj);
+}
+
 // ─── cb.bulk_import (async, inline lambda body per D5/D10) ──────────────────────────────────
 FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 {
@@ -1146,6 +1333,10 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// Day 10: async jobs.
 	RegisterTool(TEXT("cb.save_all_dirty"),  &Tool_SaveAllDirty,    /*Lane A*/ false);
 	RegisterTool(TEXT("cb.bulk_import"),     &Tool_BulkImport,      /*Lane A*/ false);
+
+	// Asset-import surface additions (2026-05): reimport from source + factory discovery.
+	RegisterTool(TEXT("cb.reimport"),               &Tool_Reimport,              /*Lane A*/ false);
+	RegisterTool(TEXT("cb.list_supported_formats"), &Tool_ListSupportedFormats,  /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 12 cb.* handlers (all Lane A — UE 5.7 AR not thread-safe)"));
 }
