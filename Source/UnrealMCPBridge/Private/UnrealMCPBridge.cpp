@@ -22,6 +22,8 @@
 #include "Tools/EditorTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
+#include "Tools/LiveCodingTools.h"
+#include "Tools/LogTools.h"
 #include "Tools/MaterialTools.h"
 #include "Tools/NiagaraTools.h"
 #include "Tools/PhysicsTools.h"
@@ -330,10 +332,37 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// all in Core, already a transitive dep).
 	FConfigTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 6 Chunk D: Log surface additions (3 sync log.* tools, all Lane A).
+	//   - log.set_category_verbosity : routes through FSelfRegisteringExec::StaticExec with the
+	//     canonical ``Log <Category> <Verbosity>`` command. Forward-references accepted (UE's own
+	//     Log Exec stores the value in BootAssociations for unknown categories). Process-lifetime
+	//     scope only (D6) — to persist verbosity changes across editor restarts use cfg.write
+	//     against DefaultEngine.ini [Core.Log].
+	//   - log.list_categories : paginated enumeration of categories observed in FMCPLogStream
+	//     since attach. Observed-set caveat — quiet categories (never logged anything) are
+	//     invisible (the public FLogSuppressionInterface doesn't expose name→FLogCategoryBase*
+	//     lookup). FMCPPageCursor pagination, default 100, clamped [1, 1000].
+	//   - log.clear : empties the in-memory ring buffer that backs log.tail / log.search. Does
+	//     NOT clear on-disk file logs.
+	// Combined with the 3 Phase 1 log.* tools (log.tail / log.search / log.subscribe) this brings
+	// the log.* surface to 6 user-visible tools total. New error code: -32049 LogCategoryUnknown.
+	FLogTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Phase 6 Chunk E: Live Coding surface (1 async composite — livecoding.recompile, Python
+	// wrapper in phase6_composites.py). Backing internal handler livecoding._recompile_internal
+	// is Lane B (queues a GT-required job; AI polls externally via job.status / job.result).
+	// PIE-guarded (D11 — LC requires PIE off; -32027 PIEActive on submit). Platform-gated to
+	// Windows desktop editor builds via PLATFORM_WINDOWS macros; non-Windows → -32048
+	// LiveCodingDisabled. Module availability gated via ILiveCodingModule::HasStarted() +
+	// CanEnableForSession(). Compile result enum values exposed verbatim in the response. Best-
+	// effort patched_modules / failed_modules extraction from LogLiveCoding entries. New error
+	// code: -32048 LiveCodingDisabled. Build.cs adds LiveCoding private dep (Win64-only).
+	FLiveCodingTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + sc.* (5) + sc._internal (1) + test.* (7) + test._internal (1) + cfg.* (6) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + sc.* (5) + sc._internal (1) + test.* (7) + test._internal (1) + cfg.* (6) + log.* (3 NEW Phase 6) + livecoding._internal (1) + _phase3_lane_b_sanity (1) — ALL 6 PHASES COMPLETE: 169 user-visible tools cumulative"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

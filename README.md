@@ -7,7 +7,7 @@ the editor for asset/level/blueprint authoring tasks.
 
 ## Status
 
-**Phase 5 complete — 145 user-visible tools + 11 internal hidden handlers.**
+**Phase 6 complete — 169 user-visible tools + 14 internal hidden handlers. ALL 6 PHASES OF THE v2 BLUEPRINT SHIPPED.**
 
 | Phase | Tools | Surface |
 |---|---|---|
@@ -16,7 +16,8 @@ the editor for asset/level/blueprint authoring tasks.
 | Phase 3 | 45 | level.* (12), actor.* (20), component.* (8), composites (5 user-visible Python) — plus 5 internal hidden C++ handlers |
 | Phase 4 | 23 | bp.* (13 C++ + 1 Python composite = 14), material.* (9) — plus 1 internal hidden C++ handler |
 | Phase 5 | 30 | pie.* (10), editor.* (9 + pie.screenshot_to_disk), umg.* (2), niagara.* (1), physics.* (2), sequencer.* (5) |
-| **Total** | **145** | (user-visible; 156 total handler registrations counting hidden internals) |
+| Phase 6 | 24 | sc.* (5 C++ + 1 Python composite = 6), test.* (7 C++ + 1 Python composite = 8), cfg.* (6), log.* (3 Phase 6 additions — Phase 1 had 3), livecoding.recompile (1 Python composite) — plus 3 internal hidden C++ handlers (sc._submit_internal, test._run_automation_internal, livecoding._recompile_internal) |
+| **Total** | **169** | (user-visible; 183 total handler registrations counting hidden internals) |
 
 ### Phase 3 polish round (2026-05) — 5 known issues addressed
 
@@ -127,6 +128,13 @@ UnrealMCPBridge/
         NiagaraTools.h/.cpp           # Phase 5 Chunk C — 1 niagara.list_parameters (user/system/emitter enum)
         PhysicsTools.h/.cpp           # Phase 5 Chunk C — 2 physics.* tools (Chaos line trace + capsule sweep)
         SequencerTools.h/.cpp         # Phase 5 Chunk D — 5 sequencer.* tools (list_cinematics + tracks + cuts + keyframes + current_time)
+        SourceControlTools.h/.cpp     # Phase 6 Chunk A — 5 sc.* sync tools (status / checkout / diff / diff_binary / revert)
+        SourceControlCompositeTools.h/.cpp # Phase 6 Chunk A — 1 internal Lane-B submitter (sc._submit_internal — backs sc.submit Python)
+        TestTools.h/.cpp              # Phase 6 Chunk B — 7 test.* sync tools (list_specs / run_single / get_last / cancel / ...)
+        TestCompositeTools.h/.cpp     # Phase 6 Chunk B — 1 internal Lane-B submitter (test._run_automation_internal)
+        ConfigTools.h/.cpp            # Phase 6 Chunk C — 6 cfg.* sync tools (get_cvar / set_cvar / list_cvars / read / write / list_sections)
+        LogTools.h/.cpp               # Phase 6 Chunk D — 3 log.* additions (set_category_verbosity / list_categories / clear)
+        LiveCodingTools.h/.cpp        # Phase 6 Chunk E — 1 internal Lane-B submitter (livecoding._recompile_internal — Win64-gated)
       Utils/                                # Unified utility namespace post-polish #11
         MCPAssetPathUtils.h/.cpp     # Phase 2 — asset path canonicalisation
         MCPARFilterParser.h/.cpp     # Phase 2 — FARFilter JSON ↔ struct + hash
@@ -151,6 +159,7 @@ UnrealMCPBridge/
       asset_composites.py    # Phase 2 — 6 Category D Python composites
       level_composites.py    # Phase 3 — 5 Category D Python composites (level/actor batch ops)
       blueprint_composites.py # Phase 4 — 1 Category C Python composite (bp.compile_all_dirty)
+      phase6_composites.py   # Phase 6 — 3 async composites (sc.submit, test.run_automation, livecoding.recompile)
   Tests/
     smoke_ping.py                # Phase 1 14-subtest smoke
     smoke_phase2.py              # Phase 2 34-subtest smoke
@@ -830,6 +839,291 @@ frozen ``kMCPMessagePIEActive`` text.
 //                          "supported_types":["float", "double", "bool", "integer"]}}
 ```
 
+## Phase 6 tool catalogue (24 user-visible tools)
+
+Breakdown: **5 sc.* sync C++** + **1 sc.submit Python composite (async)** + **7 test.* sync C++** +
+**1 test.run_automation Python composite (async)** + **6 cfg.* sync C++** + **3 log.* sync C++
+(Phase 6 additions to the Phase 1 log surface)** + **1 livecoding.recompile Python composite
+(async)** = **24 user-visible tools**, plus **3 internal hidden** C++ submitters
+(``sc._submit_internal`` / ``test._run_automation_internal`` / ``livecoding._recompile_internal``)
+backing the 3 async composites — all use the same async-only pattern as Phase 2-5 composites.
+
+Phase 6 closes the v2 blueprint scope: 16 (P1) + 31 (P2) + 45 (P3) + 23 (P4) + 30 (P5) + 24 (P6)
+= **169 user-visible tools cumulative across all 6 phases**. The combined hidden-internals count
+is now 14 (5 P2 + 5 P3 + 1 P4 + 3 P6).
+
+Most Phase 6 tools are **Lane A** (game thread, queued via OnEndFrame Drain). The 3 async-composite
+internal submitters are **Lane B** (TCP listener thread — fall-through to socket.recv from the
+Python composite caller without GT deadlock). Mutator/PIE-guard policy is per-tool: ``sc.*`` and
+``cfg.*`` have no PIE guard (workspace-level operations); ``test.*`` documents PIE interaction but
+doesn't refuse; ``log.*`` are workspace-level; ``livecoding.recompile`` is PIE-guarded with
+**-32027 PIEActive** per Epic's "Live Coding requires PIE stopped" constraint.
+
+### Inverse PIE-guard / standard PIE-guard / no-PIE-guard policies across Phase 6
+
+```
+sc.*                       no PIE guard (SC operations are workspace-level)
+test.run_single_test       no PIE guard (test framework may itself drive PIE)
+test.run_automation        no PIE guard (same — recommend pie.stop first for clean run)
+cfg.*                      no PIE guard (cvars designed for runtime tweaking)
+log.*                      no PIE guard (Log Exec works during PIE)
+livecoding.recompile       PIE-guarded — refuses with -32027 PIEActive (D11)
+```
+
+### Chunk A — Source Control (6 tools, 5 sync C++ + 1 async composite)
+
+```
+sc.status         → {files[{path, state, revision, action, last_modified_by, ...}]}     Lane A
+sc.checkout       → {checked_out[{path}], failed[{path, reason}]}                       Lane A
+sc.diff           → {is_binary: bool, diff_text? | base64_a?, base64_b?, bytes_a?, ...} Lane A
+sc.diff_binary    → {base64_a, base64_b, bytes_a, bytes_b, mime_a?, mime_b?}            Lane A
+sc.revert         → {reverted[{path}], failed[{path, reason}]}  confirm_destructive=true required
+sc.submit         → {job_id}  → sc._submit_internal  (Lane B submitter; ASYNC composite)
+```
+
+``sc.submit`` is async-only — Python wrapper validates ``file_paths`` (non-empty) +
+``description`` (non-empty) and raises ValueError → -32602 on bad input. Provider RPC (Perforce
+/ Git) typically runs 5-60s. Inner result on poll:
+
+```
+{
+  "submitted":    bool,             # FCheckIn returned Succeeded
+  "changelist":   str,              # provider success message (CL / Git SHA / etc.) — always string per D9
+  "conflicts":    [str],            # post-submit paths in conflict state
+  "duration_ms":  float,
+  "provider":     str,              # provider name (Git, Perforce, etc.)
+  "error":        str (optional)    # populated on submitted=false
+}
+```
+
+``sc.revert`` requires ``confirm_destructive=true`` (D2-style gate, reuses -32033 ReparentUnsafe).
+Without the flag the tool returns -32033 with recovery hint. Path resolution accepts both disk
+paths AND ``/Game/...`` package paths — packages are translated via FPackageName +
+``.uasset``/``.umap`` extension probe, sandboxed via FMCPPathSandbox identical to Phase 2 ``cb.*``
+tools. Binary diff caps payload at 32 MiB per side (per Phase 6 risk #6) → -32017 InputTooLarge
+on overflow.
+
+### Chunk B — Automation Test (8 tools, 7 sync C++ + 1 async composite)
+
+```
+test.list_automation_specs → {specs[{name, full_path, command_line, category, ...}], next_page_token, total_known}
+test.run_single_test       → {name, succeeded, errors[], warnings[], duration_secs}     SYNC (cap 30s)
+test.get_last_results      → {last_run_at, total, succeeded, failed, skipped, tests[]}
+test.cancel_current        → {cancelled, was_running}
+test.list_categories       → {categories[str]}
+test.get_test_info         → {name, full_path, command_line, beautifies_to, parameters[]}
+test.set_filter_flags      → {applied[str], rejected[{flag, reason}]}
+test.run_automation        → {job_id}  → test._run_automation_internal  (Lane B; ASYNC composite)
+```
+
+``test.run_single_test`` is sync but bounded — caps wall-clock at 30s (most smoke tests complete
+in <1s; product/perf tests should use the async ``test.run_automation`` path). On cap exceed →
+``-32603 InternalError`` with partial results in the message body.
+
+``test.run_automation`` runs each test in ``test_names`` sequentially on the game thread (the
+framework only tracks one "current" test at a time). Per-test execution captures errors / warnings
+into the result; the batch can be cancelled mid-flight via ``job.cancel`` (remaining tests go to
+``skipped[]``). Optional ``run_smoke_filter`` (e.g. ``"SmokeFilter"`` / ``"EngineFilter"`` /
+``"ProductFilter"``) is applied via ``SetRequestedTestFilter`` BEFORE the batch — persists past
+the batch run, caller can reset via ``test.set_filter_flags`` afterward.
+
+### Chunk C — Config / CVars (6 tools, all sync C++, all Lane A)
+
+```
+cfg.get_cvar       → {name, type, value, value_string, help, default_value, set_by, flags_raw, is_read_only, is_cheat, is_unregistered}
+cfg.set_cvar       → {set, name, type, prior_value, prior_value_string, new_value, new_value_string, set_by}
+cfg.list_cvars     → {cvars[{name, type, value_summary, help_first_line, set_by, is_read_only, is_cheat, is_command, flags_raw}], next_page_token, total_known, prefix_filter_echo}
+cfg.read           → {found, value, raw_string, type_hint, ini_path, ini_file_echo, section_echo, key_echo}
+cfg.write          → {written, prior_existed, prior_value, new_value_string, ini_path, flushed}
+cfg.list_sections  → {sections[str], next_page_token, total_known, ini_path, ini_file_echo}
+```
+
+**D4 — typed CVar marshalling.** ``cfg.set_cvar`` accepts JSON int/float/bool/string and coerces
+per the cvar's reported type (``IsVariableBool/Int/Float/String``). Wrong-type → -32006
+PropertyTypeMismatch. JSON bool ↔ bool cvar / JSON number ↔ int|float cvar / JSON string passes
+through for string cvars. Mismatches that ARE coercible (e.g. JSON string "1" → bool 1) succeed.
+
+**D5 — commands ≠ variables.** ``cfg.get_cvar`` / ``cfg.set_cvar`` reject ``IConsoleCommand``
+entries with -32011 WrongClass + hint pointing at ``pie.console_exec`` for execution. Without
+this gate callers might use ``cfg.set_cvar`` to "set" a command (no-op + confusing).
+
+**D9 — read-only cvars (-32047).** ``cfg.set_cvar`` checks ``TestFlags(ECVF_ReadOnly)`` AFTER
+the command/variable gate and returns -32047 CVarReadOnly with a recovery hint pointing at the
+matching ``DefaultEngine.ini`` ``[ConsoleVariables]`` section + restart.
+
+**D8 — ini sandbox.** ``cfg.read`` / ``cfg.write`` / ``cfg.list_sections`` accept only 4
+whitelisted ini BASE names: ``DefaultEngine`` / ``DefaultGame`` / ``DefaultInput`` /
+``DefaultEditor``. Anything else → -32013 PathEscape. Resolution:
+``<ProjectDir>/Config/<BaseName>.ini`` via ``FPaths::SourceConfigDir()``.
+
+### Chunk D — Log additions (3 tools, all sync C++, all Lane A)
+
+Phase 1 shipped 3 log.* tools (``log.tail`` / ``log.search`` / ``log.subscribe``). Phase 6 adds
+3 more to complete the log surface at **6 user-visible log.* tools**:
+
+```
+log.set_category_verbosity → {applied, category, requested_verbosity, prior_verbosity, console_output, compile_time_clamped, warning?}
+log.list_categories        → {categories[{name, current_verbosity, observation_count}], next_page_token, total_known, prefix_filter_echo}
+log.clear                  → {cleared, line_count_before, ring_capacity, total_observed}
+```
+
+**D6 — process-lifetime scope.** ``log.set_category_verbosity`` changes persist for the current
+editor session only. To persist across editor restarts use ``cfg.write`` against
+``DefaultEngine.ini`` ``[Core.Log]`` section. Routes through ``FSelfRegisteringExec::StaticExec``
+with the canonical ``Log <Category> <Verbosity>`` command — UE's
+``FLogSuppressionImplementation`` applies the change identically to operator-typed Log commands.
+
+Accepted verbosity tokens (case-insensitive): NoLogging / None / Off / Fatal / Error / Warning /
+Display / Log / Verbose / VeryVerbose / All / On / Default / Reset / Break. Unknown → -32602
+InvalidParams with accepted-list hint.
+
+**Observed-set caveat (D6).** ``log.list_categories`` only knows about categories that have
+produced at least one log entry since ``FMCPLogStream::Attach`` fires at module startup. Quiet
+categories (e.g. a custom category that hasn't fired yet) are INVISIBLE. The public
+``FLogSuppressionInterface`` does not expose its ReverseAssociations map; reflection-based access
+is out of scope. Workaround: emit a UE_LOG line at any verbosity to register the category in the
+observed-set. For ``log.set_category_verbosity`` on never-observed categories the bridge surfaces
+a ``warning`` field but still applies the write (UE accepts forward-references via
+BootAssociations).
+
+**log.clear** empties only the in-memory ring buffer used by ``log.tail`` / ``log.search``. The
+on-disk file logs (``Saved/Logs/<Project>.log``) are append-only via ``FOutputDeviceFile`` and
+not touched.
+
+### Chunk E — Live Coding (1 tool, async composite — Win64 editor only)
+
+```
+livecoding.recompile → {job_id}  → livecoding._recompile_internal  (Lane B; ASYNC composite)
+```
+
+``livecoding.recompile`` is platform-locked to Windows desktop editor builds (LiveCoding module
+is Win64-only by Epic's design). Non-Windows / non-editor → -32048 LiveCodingDisabled at submit
+time. PIE-guarded — refuses with -32027 PIEActive (D11 — Live Coding requires PIE off per Epic
+docs). Module availability checks: ``ILiveCodingModule::HasStarted()`` + ``CanEnableForSession()``.
+Either failing → -32048 with the ``GetEnableErrorText`` echoed.
+
+Inner result on poll:
+
+```
+{
+  "recompiled":          bool,    # true if ELiveCodingCompileResult::Success returned
+  "result":              str,     # enum verbatim: Success / NoChanges / InProgress / CompileStillActive / NotStarted / Failure / Cancelled
+  "patched_modules":     [str],   # best-effort, log-scraped from LogLiveCoding
+  "failed_modules":      [{name, errors[]}],
+  "duration_secs":       float,
+  "wait_timeout_hit":    bool,    # true if internal 180s cap reached
+  "live_coding_version": str,     # "LiveCoding" module name echo
+  "modules_requested":   [str]    # echo of input
+}
+```
+
+Worker body subscribes to ``GetOnPatchCompleteDelegate()`` BEFORE calling ``Compile`` to avoid
+racing fast (NoChanges) compiles. Polls ``IsCompiling()`` + ``Tick()`` cooperatively every 100ms.
+Honours ``Job.bCancelRequested`` — stops polling (Live Coding has no Cancel API in 5.7; the
+compile continues in the background, next attempt may see ``CompileStillActive`` until it drains).
+
+Per-tool caveat: Live Coding's compile path writes patched .dll directly into the running editor's
+address space. If patch fails, in-memory UClass* state may be inconsistent — restart recommended
+for any ``Failure`` result with non-empty ``patched_modules``.
+
+### Phase 6 error codes (-32045..-32049)
+
+5 new error codes were added in Phase 6:
+
+```
+-32045 SourceControlProviderUnavailable  sc.* — provider not configured OR not available
+-32046 TestNotFound                      test.run_single_test / test.get_test_info / batch — name not in registry
+-32047 CVarReadOnly                      cfg.set_cvar — cvar has ECVF_ReadOnly; hint points at DefaultEngine.ini + restart
+-32048 LiveCodingDisabled                livecoding.recompile — module unavailable in this build config / platform
+-32049 LogCategoryUnknown                log.set_category_verbosity — category not in observed-set (currently surfaced
+                                          via response.warning field; reserved if surface tightens to a hard reject)
+```
+
+The bridge's complete error-code inventory now spans -32004 through -32049 with gaps for future
+expansion (-32050+ reserved for post-launch v2.1+).
+
+### Phase 6 example: cvar round-trip + ini persistence
+
+```jsonc
+// 1. Read current value
+{"id":"q1","kind":"call_function","method":"cfg.get_cvar", "args":{"name":"r.ScreenPercentage"}}
+// → {"ok":true, "result":{"name":"r.ScreenPercentage", "type":"float", "value":100.0, ...}}
+
+// 2. Tweak at runtime (session-only)
+{"id":"q2","kind":"call_function","method":"cfg.set_cvar",
+ "args":{"name":"r.ScreenPercentage", "value":75.0}}
+// → {"ok":true, "result":{"set":true, "type":"float", "prior_value":100.0, "new_value":75.0, ...}}
+
+// 3. Persist the new value across editor restarts
+{"id":"q3","kind":"call_function","method":"cfg.write",
+ "args":{"ini_file":"DefaultEngine", "section":"/Script/Engine.RendererSettings",
+         "key":"r.ScreenPercentage", "value":"75.0"}}
+// → {"ok":true, "result":{"written":true, "ini_path":".../Config/DefaultEngine.ini", "flushed":true}}
+```
+
+### Phase 6 example: async test batch + live coding recompile
+
+```jsonc
+// 1. Submit batch (returns job_id immediately)
+{"id":"t1","kind":"call_function","method":"test.run_automation",
+ "args":{"test_names":["System.Engine.Maps.PIE_DefaultMap"], "run_smoke_filter":"SmokeFilter"}}
+// → {"ok":true, "result":{"job_id":"abc-def-..."}}
+
+// 2. Poll externally (DON'T poll from another composite — that deadlocks; see Hotfix 3 notes)
+{"id":"t2","kind":"call_function","method":"job.result",
+ "args":{"job_id":"abc-def-...", "wait_timeout_s":120}}
+// → {"ok":true, "result":{"state":"Succeeded",
+//      "result":{"succeeded":[{"name":"...", "duration_secs":2.5, "warning_count":0}],
+//                "failed":[], "skipped":[], "total":1, "completed":1, "failed_count":0,
+//                "total_duration_secs":2.5}}}
+
+// 3. Live Coding recompile of FatumGame after editing C++
+{"id":"lc1","kind":"call_function","method":"livecoding.recompile",
+ "args":{"modules":["FatumGame"]}}
+// → {"ok":true, "result":{"job_id":"def-..."}}
+
+// 4. Poll (compiles take 5-30s typically)
+{"id":"lc2","kind":"call_function","method":"job.result",
+ "args":{"job_id":"def-...", "wait_timeout_s":60}}
+// → {"ok":true, "result":{"state":"Succeeded",
+//      "result":{"recompiled":true, "result":"Success",
+//                "patched_modules":["FatumGame"], "failed_modules":[],
+//                "duration_secs":8.2, "wait_timeout_hit":false}}}
+```
+
+### Async-composite inventory (post-Phase-6)
+
+The full async-composite catalogue (post-launch reference). All return ``{job_id}`` from their
+Python wrapper; AI polls via ``job.status`` / ``job.result`` from outside the GT:
+
+```
+asset.find_unused              → asset._find_unused_internal             (Phase 2)
+asset.size_report              → asset._size_report_internal             (Phase 2)
+asset.batch_metadata           → asset._batch_metadata_internal          (Phase 2)
+asset.find_broken_references   → asset._find_broken_references_internal  (Phase 2)
+asset.find_duplicates_by_name  → asset._find_duplicates_by_name_internal (Phase 2)
+cb.save_all_dirty              → cb._save_all_dirty_internal             (Phase 2)
+cb.bulk_import                 → cb._bulk_import_internal                (Phase 2)
+level.full_actor_dump          → level._full_actor_dump_internal         (Phase 3)
+level.find_actors_with_class   → level._find_actors_with_class_internal  (Phase 3)
+actor.batch_spawn              → actor._batch_spawn_internal             (Phase 3)
+actor.batch_destroy            → actor._batch_destroy_internal           (Phase 3)
+actor.batch_set_property       → actor._batch_set_property_internal      (Phase 3)
+bp.compile_all_dirty           → bp._compile_all_dirty_internal          (Phase 4)
+sc.submit                      → sc._submit_internal                     (Phase 6)
+test.run_automation            → test._run_automation_internal           (Phase 6)
+livecoding.recompile           → livecoding._recompile_internal          (Phase 6)
+```
+
+**ALL 6 PHASES OF THE v2 BLUEPRINT SHIPPED.** The remaining wishlist for v2.1+:
+
+- Animation surface (cut entirely from v2 — UMG/Niagara/Physics/Sequencer kept read-only)
+- Build / Package surface (cut — handled outside the bridge)
+- Niagara writes (``niagara.set_user_param``) — error code -32040 already reserved
+- UMG writes (``umg.set_widget_property``)
+- Expanded Source Control (shelve / integrate / branch)
+- Live Coding Cancel API support (depends on UE adding Cancel — not in 5.7)
+
 ## Common patterns
 
 ### `cb.move_with_redirector_cleanup` (2-line recipe — no separate tool)
@@ -962,6 +1256,11 @@ listener up (loopback port 30020 by default).
 | `smoke_phase5_editor.py` | 13 | Phase 5 Chunk B — 10 `editor.*` + `pie.screenshot_to_disk` |
 | `smoke_phase5_chunk_c.py` | 11 | Phase 5 Chunk C — 5 tools (`umg.*` + `niagara.list_parameters` + `physics.*`) |
 | `smoke_phase5_sequencer.py` | 10 | Phase 5 Chunk D — 5 `sequencer.*` tools (list + tracks + cuts + keyframes + current_time) |
+| `smoke_phase6.py` | **wrapper** | Runs all 4 Phase 6 sub-suites below and aggregates pass/fail |
+| `smoke_phase6_sc.py` | 15 | Phase 6 Chunk A — 6 `sc.*` tools (status + checkout + diff + diff_binary + revert + sc.submit composite) |
+| `smoke_phase6_test.py` | 12 | Phase 6 Chunk B — 8 `test.*` tools (specs + run_single + run_automation composite + ...) |
+| `smoke_phase6_cfg.py` | 23 | Phase 6 Chunk C — 6 `cfg.*` tools (get/set cvar + list_cvars + read/write/list_sections ini) |
+| `smoke_phase6_log_livecoding.py` | 18 | Phase 6 Chunks D+E — 3 `log.*` additions + `livecoding.recompile` composite |
 
 Run a specific phase:
 ```

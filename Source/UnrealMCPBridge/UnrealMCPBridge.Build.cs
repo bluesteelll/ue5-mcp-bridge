@@ -115,5 +115,17 @@ public class UnrealMCPBridge : ModuleRules
 				"SourceControl",
 			}
 		);
+
+		// Phase 6 Chunk E — Live Coding surface (Windows desktop editor only).
+		// ``LiveCoding`` module exposes ``ILiveCodingModule`` which the Phase 6 livecoding.recompile
+		// async composite uses to drive ``Compile()`` + ``IsCompiling()`` + ``GetOnPatchCompleteDelegate()``.
+		// LiveCoding.Build.cs restricts the module to Win64 (it links Windows-specific patch
+		// machinery in Developer/Windows/LiveCoding/Private). All non-Windows references must be
+		// gated by ``#if PLATFORM_WINDOWS`` in our code, and the dep must be conditional here so
+		// non-Windows builds of the bridge module link without LiveCoding's Win64 libs.
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			PrivateDependencyModuleNames.Add("LiveCoding");
+		}
 	}
 }

@@ -256,13 +256,53 @@ inline constexpr int32 kMCPErrorSectionIndexOOB             = -32044;
  *                                            (command-vs-variable) overlap — that case raises
  *                                            -32011 WrongClass instead.
  *
- * Future Phase 6 chunks (placeholder; codes will land alongside their chunks):
- *   -32048 LiveCodingDisabled    (Chunk E: livecoding.*)
- *   -32049 LogCategoryUnknown    (Chunk D: log.*)
+ * Phase 6 Chunk D (Logs) — 1 additional code, paired with the 3 new log.* tools (set_category_
+ * verbosity, list_categories, clear). Chunk D extends the Phase 1 log surface; no new log code
+ * needed for log.clear (it only needs -32603 for internal failure cases).
+ *
+ *   -32049 LogCategoryUnknown                ``log.set_category_verbosity`` — the supplied
+ *                                            ``category`` name has not been observed in any log
+ *                                            entry since this editor session started. UE's
+ *                                            ``FLogSuppressionInterface`` does not expose a public
+ *                                            FName→FLogCategoryBase* lookup, so the bridge tracks
+ *                                            categories observed via ``FMCPLogStream::Serialize``
+ *                                            instead. Effectively this means "no log line has been
+ *                                            emitted from this category yet, so we can't be sure
+ *                                            it's registered". Caller's recovery: trigger ANY log
+ *                                            emission from the category first (or accept that the
+ *                                            command went through the `Log <Cat> <Verb>` console
+ *                                            path which UE will silently accept for unknown names
+ *                                            — and queue the verbosity for whenever the category
+ *                                            does register). The set is still attempted via
+ *                                            ``FSelfRegisteringExec::StaticExec`` because UE's own
+ *                                            ``Log`` console command accepts forward-references —
+ *                                            we surface the warning but DON'T block the write.
+ *                                            (Subject to change in a future revision if the
+ *                                            forward-reference behaviour proves confusing.)
+ *
+ * Phase 6 Chunk E (Live Coding) — 1 additional code, paired with the lone livecoding.recompile
+ * async composite. Returned when Live Coding is unavailable in the running build configuration
+ * (Shipping builds + commandlets disable it; LiveCoding module may not be loaded in -nullrhi /
+ * cooker / dedicated-server contexts).
+ *
+ *   -32048 LiveCodingDisabled                ``livecoding.recompile`` — ``ILiveCodingModule`` is
+ *                                            not loadable OR ``HasStarted() == false`` AND
+ *                                            ``CanEnableForSession() == false`` (the module
+ *                                            exists but Live Coding cannot be activated in this
+ *                                            session — e.g. ``-nolivecoding`` command-line, or
+ *                                            console-build configurations that strip the feature).
+ *                                            Caller's recovery: launch the editor without
+ *                                            ``-nolivecoding``, enable Live Coding via
+ *                                            Editor Preferences → General → Live Coding, then
+ *                                            retry. For headless contexts there's no recovery —
+ *                                            recompile via a separate `dotnet build` / `make`
+ *                                            invocation outside the MCP surface.
  */
 inline constexpr int32 kMCPErrorSourceControlProviderUnavailable = -32045;
 inline constexpr int32 kMCPErrorTestNotFound                     = -32046;
 inline constexpr int32 kMCPErrorCVarReadOnly                     = -32047;
+inline constexpr int32 kMCPErrorLiveCodingDisabled               = -32048;
+inline constexpr int32 kMCPErrorLogCategoryUnknown               = -32049;
 
 /**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.

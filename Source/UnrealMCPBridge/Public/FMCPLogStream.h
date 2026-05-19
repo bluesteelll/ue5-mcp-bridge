@@ -93,6 +93,40 @@ public:
 	/** Total log entries observed since attach (includes those that have rolled out of the ring). */
 	int64 GetTotalObserved() const { return TotalObserved.load(std::memory_order_relaxed); }
 
+	/**
+	 * Phase 6 Chunk D — clear the ring buffer of all entries.
+	 *
+	 * Returns the number of entries dropped (the prior Count). Does NOT clear file logs
+	 * (UE writes those append-only to Saved/Logs/<Project>.log via FOutputDeviceFile). Does NOT
+	 * reset TotalObserved — that counter is cumulative-since-attach and useful for observing
+	 * total log volume independent of the bounded ring.
+	 *
+	 * Thread safety: acquires EntriesLock, walks no further than kMaxEntries assignments.
+	 * Game-thread-only by convention (log.clear is a Lane A tool). Allowed any-thread because
+	 * the only mutation is under the lock — but cleared content can race against the next
+	 * Serialize() call from any thread.
+	 */
+	int32 Clear();
+
+	/**
+	 * Phase 6 Chunk D — snapshot of all categories that have produced at least one log entry
+	 * since attach. Returns (Category, MostRecentVerbosity) tuples sorted by name.
+	 *
+	 * The MostRecentVerbosity is the LAST observed verbosity for that category (NOT the current
+	 * FLogCategoryBase::GetVerbosity() — UE's suppression registry doesn't expose name→category
+	 * lookup publicly, so we report what we've seen instead). For filtered logging the public
+	 * surface (``log.list_categories``) makes this distinction explicit in its docstring.
+	 *
+	 * Acquires EntriesLock briefly (TMap copy). Caller owns the returned array.
+	 */
+	struct FObservedCategoryInfo
+	{
+		FName Category;
+		ELogVerbosity::Type LastObservedVerbosity = ELogVerbosity::Log;
+		int64 ObservationCount = 0;
+	};
+	TArray<FObservedCategoryInfo> GetObservedCategories() const;
+
 	/** Ring buffer capacity. Public so log.tail / log.search can validate N parameters. */
 	static constexpr int32 kMaxEntries = 5000;
 
@@ -118,4 +152,22 @@ private:
 
 	std::atomic<int64> TotalObserved{0};
 	std::atomic<bool> bAttached{false};
+
+	/**
+	 * Phase 6 Chunk D — observed-categories registry. Populated lazily inside Serialize() so
+	 * log.list_categories can enumerate everything that's actually emitted log entries since
+	 * attach. UE's FLogSuppressionImplementation owns the canonical FName→FLogCategoryBase* map
+	 * but doesn't expose it through the public FLogSuppressionInterface (only AssociateSuppress /
+	 * DisassociateSuppress / ProcessConfigAndCommandLine are public). Our observed-set is a
+	 * pragmatic subset: every category that has logged at least once since this stream attached.
+	 *
+	 * Value is the LAST verbosity seen for that category (used as "current verbosity" hint in
+	 * log.list_categories) + a cumulative count of observations. Updated under EntriesLock.
+	 */
+	struct FCategoryStats
+	{
+		ELogVerbosity::Type LastVerbosity = ELogVerbosity::Log;
+		int64 ObservationCount = 0;
+	};
+	TMap<FName, FCategoryStats> ObservedCategories;
 };

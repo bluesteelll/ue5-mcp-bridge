@@ -99,6 +99,13 @@ void FMCPLogStream::Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, con
 	{
 		++Count;
 	}
+
+	// Phase 6 Chunk D — update observed-categories registry for log.list_categories. Under the
+	// same lock as the ring write so log.list_categories sees a consistent snapshot. TMap::FindOrAdd
+	// is O(1) amortised; per-category stats are minimal (12 bytes + FName key).
+	FCategoryStats& Stats = ObservedCategories.FindOrAdd(Category);
+	Stats.LastVerbosity = MaskedVerbosity;
+	++Stats.ObservationCount;
 }
 
 int32 FMCPLogStream::GetEntryCount() const
@@ -152,6 +159,37 @@ TArray<FMCPLogEntry> FMCPLogStream::GetLastN(int32 N, const FName* CategoryFilte
 
 	// Silence unused-variable warnings if OldestIdx isn't read above (it documents intent).
 	(void)OldestIdx;
+	return Out;
+}
+
+int32 FMCPLogStream::Clear()
+{
+	FScopeLock Lock(&EntriesLock);
+	const int32 PriorCount = Count;
+	// Reset the ring metadata. We leave the Entries TArray sized but stale; future Serialize()
+	// calls overwrite slots in-order from Head=0. Avoids the realloc cost of SetNum(0).
+	Head = 0;
+	Count = 0;
+	// Leave ObservedCategories intact — it's a cumulative-since-attach catalogue, not a ring
+	// snapshot. Operator intuition: log.clear wipes log.tail content; log.list_categories continues
+	// reporting every category seen since the editor started (matching UE's own Log List behaviour
+	// which surveys the suppression registry, not the in-memory ring).
+	return PriorCount;
+}
+
+TArray<FMCPLogStream::FObservedCategoryInfo> FMCPLogStream::GetObservedCategories() const
+{
+	TArray<FObservedCategoryInfo> Out;
+	FScopeLock Lock(&EntriesLock);
+	Out.Reserve(ObservedCategories.Num());
+	for (const TPair<FName, FCategoryStats>& Pair : ObservedCategories)
+	{
+		FObservedCategoryInfo Info;
+		Info.Category = Pair.Key;
+		Info.LastObservedVerbosity = Pair.Value.LastVerbosity;
+		Info.ObservationCount = Pair.Value.ObservationCount;
+		Out.Add(MoveTemp(Info));
+	}
 	return Out;
 }
 
