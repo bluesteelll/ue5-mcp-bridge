@@ -1240,13 +1240,17 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 		Format.Equals(TEXT("jpeg"), ESearchCase::IgnoreCase);
 
 	// Resolve output_path: default = <Saved>/UnrealMCP/thumbnails/<uuid>.<ext>.
+	// FPaths::ProjectSavedDir() returns a UE-style RELATIVE path (e.g. ../../../FatumGame/Saved/)
+	// — must canonicalise to absolute BEFORE handing to FMCPPathSandbox::Resolve, which (correctly)
+	// refuses any `..` segments as a defense-in-depth measure to prevent silent sandbox escape.
 	FString OutputPathRaw;
 	Request.Args->TryGetStringField(TEXT("output_path"), OutputPathRaw);
 	if (OutputPathRaw.IsEmpty())
 	{
 		const FString Ext = bJpg ? TEXT("jpg") : TEXT("png");
 		const FGuid Guid = FGuid::NewGuid();
-		OutputPathRaw = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UnrealMCP"),
+		const FString SavedAbs = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir());
+		OutputPathRaw = FPaths::Combine(SavedAbs, TEXT("UnrealMCP"),
 			TEXT("thumbnails"), FString::Printf(TEXT("%s.%s"), *Guid.ToString(EGuidFormats::Digits), *Ext));
 	}
 

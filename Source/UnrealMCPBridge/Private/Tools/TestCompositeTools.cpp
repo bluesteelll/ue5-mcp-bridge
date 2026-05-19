@@ -426,7 +426,13 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("test._run_automation_internal"), &Tool_RunAutomationInternal, /*Lane B*/ true);
+	// Lane A (was Lane B until 2026-05 livecoding crash class). Submitter pre-validation calls
+	// FAutomationTestFramework::Get().GetValidTestNames which walks the framework's TMap — author
+	// argued this was safe because the map is effectively immutable post-static-init, but the
+	// surrounding GetValidTestNames signature is not documented as thread-safe. The actual test
+	// runs still happen on GT via SubmitJob's bGameThreadRequired=true. Latency cost (~16ms tick
+	// quantization) is negligible for an async batch op.
+	RegisterTool(TEXT("test._run_automation_internal"), &Tool_RunAutomationInternal, /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk B (Automation Test composites): registered 1 internal composite handler ")

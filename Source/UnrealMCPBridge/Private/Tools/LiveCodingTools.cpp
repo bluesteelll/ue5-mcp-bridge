@@ -424,12 +424,24 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	};
 
 	// Phase 6 Chunk E: livecoding.recompile backing internal (async composite).
-	RegisterTool(TEXT("livecoding._recompile_internal"), &Tool_RecompileInternal, /*Lane B*/ true);
+	//
+	// **Lane A** (was Lane B until 2026-05 dogfood crash). The submitter calls
+	// FMCPWorldContext::IsPIEActive() and ILiveCodingModule::HasStarted() / CanEnableForSession()
+	// — all of which require IsInGameThread() per UE 5.7 contracts. Registering as Lane B caused
+	// listener-thread MCPConn-N to fail check(IsInGameThread()) in MCPWorldContext.cpp:31 and
+	// crash the editor.
+	//
+	// The actual SubmitJob payload still runs on the game thread (bGameThreadRequired=true), so
+	// the userspace contract is unchanged — only the dispatch lane (which decides which thread
+	// owns the SUBMITTER) is corrected.
+	RegisterTool(TEXT("livecoding._recompile_internal"), &Tool_RecompileInternal, /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk E (Live Coding): registered 1 internal composite handler ")
-		TEXT("(livecoding._recompile_internal, Lane B); Python wrapper livecoding.recompile in "
-		     "phase6_composites.py; PLATFORM_WINDOWS=%d"), PLATFORM_WINDOWS);
+		TEXT("(livecoding._recompile_internal, Lane A — submitter needs GT for IsPIEActive + "
+		     "ILiveCodingModule access; the SubmitJob body itself remains bGameThreadRequired=true); "
+		     "Python wrapper livecoding.recompile in phase6_composites.py; PLATFORM_WINDOWS=%d"),
+		PLATFORM_WINDOWS);
 }
 
 } // namespace FLiveCodingTools

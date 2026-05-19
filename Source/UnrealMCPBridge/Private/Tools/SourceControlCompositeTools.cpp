@@ -310,7 +310,12 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	};
 
 	// Day 3: sc.submit backing internal (async composite).
-	RegisterTool(TEXT("sc._submit_internal"), &Tool_SubmitInternal, /*Lane B*/ true);
+	// Lane A (was Lane B until 2026-05 livecoding crash class). Submitter pre-checks call
+	// ISourceControlModule::IsEnabled / GetProvider().IsAvailable() / .GetName() which formally
+	// require IsInGameThread() per UE 5.7 contract. The actual FCheckIn RPC still runs on GT via
+	// SubmitJob's bGameThreadRequired=true. Latency cost (~16ms tick quantization) is negligible
+	// for an async op.
+	RegisterTool(TEXT("sc._submit_internal"), &Tool_SubmitInternal, /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk A (Source Control composites): registered 1 internal composite handler ")

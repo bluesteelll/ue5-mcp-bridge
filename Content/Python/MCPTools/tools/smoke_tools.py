@@ -15,6 +15,8 @@ the eventual Lane-B router.
 
 from __future__ import annotations
 
+import os
+
 import unreal
 
 from MCPTools.registry import tool
@@ -76,6 +78,13 @@ def engine_version(_args):
     thread_safe=True,
 )
 def project_name(_args):
-    """Return the loaded project's name (matches the .uproject filename without extension)."""
+    """Return the loaded project's name (matches the .uproject filename without extension).
 
-    return {"name": unreal.SystemLibrary.get_project_name()}
+    UE 5.7 removed ``SystemLibrary.get_project_name`` from the Python API surface; derive
+    from ``get_project_directory`` instead — last folder name == project name by UE
+    convention (project root folder always shares the .uproject base name).
+    """
+
+    proj_dir = unreal.SystemLibrary.get_project_directory()
+    name = os.path.basename(os.path.normpath(proj_dir))
+    return {"name": name}
