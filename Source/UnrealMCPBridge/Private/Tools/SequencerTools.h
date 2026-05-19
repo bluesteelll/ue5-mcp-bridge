@@ -8,14 +8,21 @@
 class FMCPDispatchQueue;
 
 /**
- * Phase 5 — Chunk D, Category F (Sequencer read-only). 5 user-visible tools, all Lane A.
+ * Phase 5 — Chunk D, Category F (Sequencer read-only) + Wave C Tier 5a (Sequencer writes).
+ * 10 user-visible tools, all Lane A.
  *
- * Tool roster (per Phase 5 plan §F-Sequencer lines 899-1118):
- *   sequencer.list_cinematics    → enumerate ULevelSequence assets in scope
+ * Tool roster:
+ *   sequencer.list_cinematics    → enumerate ULevelSequence assets in scope (Phase 5)
  *   sequencer.get_tracks         → master tracks + per-binding tracks (possessables/spawnables)
  *   sequencer.get_camera_cuts    → camera cut sections of a sequence
  *   sequencer.get_keyframes      → keyframes of a specific track section (float/double/bool/int)
  *   sequencer.get_current_time   → current playhead time of the focused Sequencer editor tab
+ *
+ *   sequencer.create_sequence    → create empty ULevelSequence asset (Wave C)
+ *   sequencer.add_master_track   → add a top-level (un-bound) UMovieSceneTrack to a sequence
+ *   sequencer.add_camera_cut     → add a camera-cut section + optional camera-actor binding
+ *   sequencer.add_keyframe       → add a typed key on a section's channel (float/double/bool/int)
+ *   sequencer.set_section_range  → set TRange<FFrameNumber> on an existing section
  *
  * **All 5 tools are Lane A** (``bThreadSafe=false``). Reasons:
  *   - ``LoadObject<ULevelSequence>`` touches the package loader + GC visited set; GT-only.
@@ -83,4 +90,11 @@ namespace FSequencerTools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetCameraCuts(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetKeyframes(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetCurrentTime(const FMCPRequest& Request);
+
+	// ─── Wave C Tier 5a: Sequencer writes ───────────────────────────────────────────────────────
+	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateSequence(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddMasterTrack(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddCameraCut(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddKeyframe(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetSectionRange(const FMCPRequest& Request);
 }

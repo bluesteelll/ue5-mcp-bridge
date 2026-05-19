@@ -11,6 +11,14 @@
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Editor.h"
+#include "GameFramework/Actor.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "ScopedTransaction.h"
+#include "Subsystems/EditorAssetSubsystem.h"
+#include "UObject/Package.h"
+#include "Utils/MCPActorPathUtils.h"
 #include "Channels/MovieSceneBoolChannel.h"
 #include "Channels/MovieSceneChannelData.h"
 #include "Channels/MovieSceneChannelEditorData.h"
@@ -1085,6 +1093,537 @@ FMCPResponse Tool_GetCurrentTime(const FMCPRequest& Request)
 	return SEQ_MakeSuccessObj(Request, Out);
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// Wave C Tier 5a — Sequencer write surface (5 tools, all Lane A, PIE-guarded)
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+	/**
+	 * Compute a designer-facing display name for a freshly-spawned track. Used by add_master_track's
+	 * response (returns the same name a subsequent get_tracks would emit so the caller can write
+	 * follow-up tools without an extra round-trip).
+	 */
+	FString SEQ_GetTrackDisplayName(const UMovieSceneTrack* Track)
+	{
+		check(Track != nullptr);
+		FString Name;
+#if WITH_EDITORONLY_DATA
+		Name = Track->GetDisplayName().ToString();
+#endif
+		if (Name.IsEmpty()) { Name = Track->GetName(); }
+		if (Name.IsEmpty()) { Name = Track->GetClass()->GetName(); }
+		return Name;
+	}
+} // namespace
+
+// ─── sequencer.create_sequence ────────────────────────────────────────────────────────────────
+//
+// Args:    { dest_path: string, save?: bool }
+// Result:  { created, asset_path, saved, factory_used }
+//
+// Errors: -32602 / -32010 / -32014 PathInUse / -32027 PIEActive / -32603 InternalError.
+FMCPResponse Tool_CreateSequence(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return SEQ_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString DestPathRaw;
+	FMCPResponse Err;
+	if (!SEQ_RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
+
+	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
+	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
+	{
+		return SEQ_MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(TEXT("dest_path '%s' malformed or unknown mount"), *DestPathRaw));
+	}
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	// PathInUse check — cover BOTH on-disk persistence AND in-memory transient packages. Without
+	// the in-memory probe a freshly-created (but unsaved) sequence reads as "not present" and a
+	// double-create silently overwrites the prior UObject.
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+	    FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
+	{
+		return SEQ_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists (on disk or in-memory)"), *DestPathNorm));
+	}
+
+	// CRITICAL: do NOT use IAssetTools::CreateAsset for LevelSequence — it auto-opens the Sequencer
+	// editor tab on success which yields the game thread to interactive Slate state and starves the
+	// MCP OnEndFrame drain. We replicate ULevelSequenceFactoryNew::FactoryCreateNew inline (which is
+	// just NewObject + Initialize() + AssetRegistry::AssetCreated) — no editor pop-up, no factory
+	// post-create-callback, no interactive yield.
+	const FString PackageName = PackagePath + TEXT("/") + AssetName;
+	UPackage* SeqPackage = CreatePackage(*PackageName);
+	if (!SeqPackage)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInternal,
+			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *PackageName));
+	}
+	SeqPackage->FullyLoad();
+
+	ULevelSequence* NewAsset = NewObject<ULevelSequence>(
+		SeqPackage, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+	if (!NewAsset)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInternal,
+			FString::Printf(TEXT("ULevelSequence NewObject returned null for %s"), *DestPathNorm));
+	}
+	NewAsset->Initialize();
+	FAssetRegistryModule::AssetCreated(NewAsset);
+
+	if (UPackage* Pkg = NewAsset->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	bool bSaveRequested = false;
+	bool bSavedOk       = false;
+	Request.Args->TryGetBoolField(TEXT("save"), bSaveRequested);
+	if (bSaveRequested)
+	{
+		if (UEditorAssetSubsystem* EAS = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr)
+		{
+			bSavedOk = EAS->SaveLoadedAsset(NewAsset, /*bOnlyIfIsDirty*/ true);
+		}
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("created"), true);
+	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
+	Out->SetBoolField(TEXT("saved"), bSavedOk);
+	Out->SetStringField(TEXT("method"), TEXT("manual_init"));
+	return SEQ_MakeSuccessObj(Request, Out);
+}
+
+// ─── sequencer.add_master_track ───────────────────────────────────────────────────────────────
+//
+// Args:    { sequence_path: string, track_class: string }
+// Result:  { track_name, track_class, master_index }
+//
+// Adds an un-bound master track (e.g. UMovieSceneCameraCutTrack, UMovieSceneAudioTrack,
+// UMovieSceneFadeTrack). For binding-scoped tracks (transform / property animation on a
+// possessable) use a future sequencer.add_track_to_binding tool — out of Tier 5a scope.
+//
+// Errors: standard + -32011 WrongClass (track_class not a UMovieSceneTrack), -32603 InternalError.
+FMCPResponse Tool_AddMasterTrack(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return SEQ_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString SeqPath, TrackClassPath;
+	FMCPResponse Err;
+	if (!SEQ_RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err)) { return Err; }
+	if (!SEQ_RequireStringField(Request, TEXT("track_class"),   TrackClassPath, Err)) { return Err; }
+
+	int32 ErrCode = 0;
+	FString ErrMsg;
+	ULevelSequence* Seq = SEQ_LoadLevelSequenceByPath(SeqPath, ErrCode, ErrMsg);
+	if (!Seq) { return SEQ_MakeError(Request, ErrCode, ErrMsg); }
+
+	UMovieScene* MovieScene = Seq->GetMovieScene();
+	if (!MovieScene)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInternal,
+			FString::Printf(TEXT("sequence '%s' has no MovieScene"), *SeqPath));
+	}
+
+	UClass* TrackClass = LoadObject<UClass>(nullptr, *TrackClassPath);
+	if (!TrackClass)
+	{
+		return SEQ_MakeError(Request, kMCPErrorClassNotFound,
+			FString::Printf(TEXT("track_class '%s' could not be loaded "
+				"(e.g. /Script/MovieSceneTracks.MovieSceneCameraCutTrack)"), *TrackClassPath));
+	}
+	if (!TrackClass->IsChildOf(UMovieSceneTrack::StaticClass()))
+	{
+		return SEQ_MakeError(Request, kMCPErrorWrongClass,
+			FString::Printf(TEXT("track_class '%s' is not a UMovieSceneTrack subclass"), *TrackClassPath));
+	}
+	if (TrackClass->HasAnyClassFlags(CLASS_Abstract))
+	{
+		return SEQ_MakeError(Request, kMCPErrorClassAbstract,
+			FString::Printf(TEXT("track_class '%s' is abstract"), *TrackClassPath));
+	}
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_AddMasterTrack", "Add Sequencer Master Track"));
+	MovieScene->Modify();
+	Seq->Modify();
+
+	// CameraCutTrack lives in a dedicated slot — UMovieScene::AddTrack DOES insert into
+	// GetTracks(), but the canonical pattern is AddCameraCutTrack which sets up the unique slot.
+	UMovieSceneTrack* NewTrack = nullptr;
+	if (TrackClass->IsChildOf(UMovieSceneCameraCutTrack::StaticClass()))
+	{
+		NewTrack = MovieScene->AddCameraCutTrack(TrackClass);
+	}
+	else
+	{
+		NewTrack = MovieScene->AddTrack(TrackClass);
+	}
+
+	if (!NewTrack)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInternal,
+			FString::Printf(TEXT("AddTrack returned null for class %s on sequence %s"),
+				*TrackClassPath, *SeqPath));
+	}
+
+	if (UPackage* Pkg = Seq->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("track_name"),  SEQ_GetTrackDisplayName(NewTrack));
+	Out->SetStringField(TEXT("track_class"), NewTrack->GetClass()->GetPathName());
+	Out->SetNumberField(TEXT("master_index"), MovieScene->GetTracks().Find(NewTrack));
+	return SEQ_MakeSuccessObj(Request, Out);
+}
+
+// ─── sequencer.add_camera_cut ─────────────────────────────────────────────────────────────────
+//
+// Args:    { sequence_path: string,
+//            start_frame: number, end_frame: number,
+//            camera_actor_path?: string (optional — binds the camera into the sequence) }
+// Result:  { section_index, section_class, start_frame, end_frame, camera_actor_path?, binding_guid? }
+//
+// Ensures CameraCutTrack exists (auto-creates if missing), then adds a new
+// UMovieSceneCameraCutSection. If camera_actor_path is provided, possesses the actor into the
+// sequence and binds the section to that actor's GUID.
+//
+// Errors: standard + -32603 if AddCameraCutTrack returns null.
+FMCPResponse Tool_AddCameraCut(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return SEQ_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString SeqPath;
+	FMCPResponse Err;
+	if (!SEQ_RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err)) { return Err; }
+
+	int32 StartFrameRaw = 0, EndFrameRaw = 0;
+	if (!Request.Args->TryGetNumberField(TEXT("start_frame"), StartFrameRaw) ||
+	    !Request.Args->TryGetNumberField(TEXT("end_frame"),   EndFrameRaw))
+	{
+		return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+			TEXT("sequencer.add_camera_cut requires args.start_frame + args.end_frame (integer ticks)"));
+	}
+	if (EndFrameRaw <= StartFrameRaw)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+			FString::Printf(TEXT("end_frame (%d) must be greater than start_frame (%d)"),
+				EndFrameRaw, StartFrameRaw));
+	}
+
+	FString CameraActorPath;
+	Request.Args->TryGetStringField(TEXT("camera_actor_path"), CameraActorPath);
+
+	int32 ErrCode = 0;
+	FString ErrMsg;
+	ULevelSequence* Seq = SEQ_LoadLevelSequenceByPath(SeqPath, ErrCode, ErrMsg);
+	if (!Seq) { return SEQ_MakeError(Request, ErrCode, ErrMsg); }
+	UMovieScene* MovieScene = Seq->GetMovieScene();
+	if (!MovieScene)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInternal,
+			FString::Printf(TEXT("sequence '%s' has no MovieScene"), *SeqPath));
+	}
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_AddCameraCut", "Add Sequencer Camera Cut"));
+	MovieScene->Modify();
+	Seq->Modify();
+
+	UMovieSceneCameraCutTrack* CCT = Cast<UMovieSceneCameraCutTrack>(MovieScene->GetCameraCutTrack());
+	if (!CCT)
+	{
+		CCT = Cast<UMovieSceneCameraCutTrack>(
+			MovieScene->AddCameraCutTrack(UMovieSceneCameraCutTrack::StaticClass()));
+	}
+	if (!CCT)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInternal,
+			TEXT("could not obtain or create the CameraCutTrack on this sequence"));
+	}
+
+	// Optional binding — resolve camera actor and possess it into the sequence if needed.
+	FGuid CameraGuid;
+	if (!CameraActorPath.IsEmpty())
+	{
+		bool bAmbiguous = false;
+		FString AmbiguityHint, ActorErr;
+		AActor* CameraActor = FMCPActorPathUtils::ResolveActor(CameraActorPath, /*bRejectPIE*/ true,
+			bAmbiguous, AmbiguityHint, ActorErr);
+		if (!CameraActor)
+		{
+			return SEQ_MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("camera_actor '%s' not found: %s"), *CameraActorPath, *ActorErr));
+		}
+		// Cast<UCameraComponent> isn't required for sequencer binding — any AActor with a transform
+		// can be a "camera". The Sequencer editor enforces camera-component presence interactively;
+		// we honour the user's intent literally.
+
+		// Possess by adding a new possessable bound to the actor in the persistent level.
+		CameraGuid = MovieScene->AddPossessable(CameraActor->GetActorLabel(), CameraActor->GetClass());
+		Seq->BindPossessableObject(CameraGuid, *CameraActor, CameraActor->GetWorld());
+	}
+
+	UMovieSceneCameraCutSection* Section = NewObject<UMovieSceneCameraCutSection>(
+		CCT, NAME_None, RF_Transactional);
+	Section->SetRange(TRange<FFrameNumber>(FFrameNumber(StartFrameRaw), FFrameNumber(EndFrameRaw)));
+	if (CameraGuid.IsValid())
+	{
+		Section->SetCameraGuid(CameraGuid);
+	}
+	CCT->AddSection(*Section);
+
+	if (UPackage* Pkg = Seq->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	const int32 SectionIdx = CCT->GetAllSections().Find(Section);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetNumberField(TEXT("section_index"), SectionIdx);
+	Out->SetStringField(TEXT("section_class"), Section->GetClass()->GetPathName());
+	Out->SetNumberField(TEXT("start_frame"), StartFrameRaw);
+	Out->SetNumberField(TEXT("end_frame"),   EndFrameRaw);
+	if (CameraGuid.IsValid())
+	{
+		Out->SetStringField(TEXT("camera_actor_path"), CameraActorPath);
+		Out->SetStringField(TEXT("binding_guid"), CameraGuid.ToString(EGuidFormats::Digits));
+	}
+	return SEQ_MakeSuccessObj(Request, Out);
+}
+
+// ─── sequencer.add_keyframe ───────────────────────────────────────────────────────────────────
+//
+// Args:    { sequence_path: string,
+//            track_path:   string  (dotted form per get_keyframes — see SEQ_ResolveTrackSection),
+//            channel_index: number (which channel inside the section, ChannelProxy order),
+//            time_frame:   number  (FFrameNumber tick — at MovieScene tick resolution),
+//            value:        <typed JSON> (number for float/double/int, bool for bool channels) }
+// Result:  { added, channel_type, total_keys_after }
+//
+// Errors: standard + -32032 PinTypeUnsupported (channel type not in float/double/bool/int).
+FMCPResponse Tool_AddKeyframe(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return SEQ_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString SeqPath, TrackPath;
+	FMCPResponse Err;
+	if (!SEQ_RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err)) { return Err; }
+	if (!SEQ_RequireStringField(Request, TEXT("track_path"),    TrackPath, Err)) { return Err; }
+
+	int32 ChannelIndex = -1;
+	if (!Request.Args->TryGetNumberField(TEXT("channel_index"), ChannelIndex) || ChannelIndex < 0)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+			TEXT("sequencer.add_keyframe requires args.channel_index (non-negative integer)"));
+	}
+
+	int32 TimeFrame = 0;
+	if (!Request.Args->TryGetNumberField(TEXT("time_frame"), TimeFrame))
+	{
+		return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+			TEXT("sequencer.add_keyframe requires args.time_frame (integer tick number)"));
+	}
+
+	if (!Request.Args.IsValid() || !Request.Args->HasField(TEXT("value")))
+	{
+		return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+			TEXT("sequencer.add_keyframe requires args.value (number for float/double/int channels, bool for bool channels)"));
+	}
+	const TSharedPtr<FJsonValue> ValueJson = Request.Args->TryGetField(TEXT("value"));
+
+	int32 ErrCode = 0;
+	FString ErrMsg;
+	ULevelSequence* Seq = SEQ_LoadLevelSequenceByPath(SeqPath, ErrCode, ErrMsg);
+	if (!Seq) { return SEQ_MakeError(Request, ErrCode, ErrMsg); }
+	UMovieScene* MovieScene = Seq->GetMovieScene();
+	if (!MovieScene) { return SEQ_MakeError(Request, kSEQErrorInternal, TEXT("no MovieScene")); }
+
+	UMovieSceneSection* Section = SEQ_ResolveTrackSection(MovieScene, TrackPath, ErrCode, ErrMsg);
+	if (!Section) { return SEQ_MakeError(Request, ErrCode, ErrMsg); }
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_AddKeyframe", "Add Sequencer Keyframe"));
+	MovieScene->Modify();
+	Section->Modify();
+
+	FMovieSceneChannelProxy& Proxy = Section->GetChannelProxy();
+	const FFrameNumber FrameTime(TimeFrame);
+
+	// Try each channel-type bucket — adding a key has the same shape across channel types but the
+	// AddCubicKey / AddConstantKey variants differ per channel struct, so we dispatch by index.
+	FString ChannelType;
+	int32 TotalKeysAfter = -1;
+
+	// Float channels.
+	{
+		TMovieSceneChannelHandle<FMovieSceneFloatChannel> Handle = Proxy.MakeHandle<FMovieSceneFloatChannel>(ChannelIndex);
+		if (FMovieSceneFloatChannel* Channel = Handle.Get())
+		{
+			if (ValueJson->Type != EJson::Number)
+			{
+				return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+					TEXT("channel is float — value must be a JSON number"));
+			}
+			Channel->AddCubicKey(FrameTime, static_cast<float>(ValueJson->AsNumber()));
+			ChannelType = TEXT("float");
+			TotalKeysAfter = Channel->GetData().GetTimes().Num();
+		}
+	}
+	// Double channels.
+	if (TotalKeysAfter < 0)
+	{
+		TMovieSceneChannelHandle<FMovieSceneDoubleChannel> Handle = Proxy.MakeHandle<FMovieSceneDoubleChannel>(ChannelIndex);
+		if (FMovieSceneDoubleChannel* Channel = Handle.Get())
+		{
+			if (ValueJson->Type != EJson::Number)
+			{
+				return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+					TEXT("channel is double — value must be a JSON number"));
+			}
+			Channel->AddCubicKey(FrameTime, ValueJson->AsNumber());
+			ChannelType = TEXT("double");
+			TotalKeysAfter = Channel->GetData().GetTimes().Num();
+		}
+	}
+	// Bool channels.
+	if (TotalKeysAfter < 0)
+	{
+		TMovieSceneChannelHandle<FMovieSceneBoolChannel> Handle = Proxy.MakeHandle<FMovieSceneBoolChannel>(ChannelIndex);
+		if (FMovieSceneBoolChannel* Channel = Handle.Get())
+		{
+			bool bValue = false;
+			if (ValueJson->Type == EJson::Boolean)     { bValue = ValueJson->AsBool(); }
+			else if (ValueJson->Type == EJson::Number) { bValue = (ValueJson->AsNumber() != 0.0); }
+			else
+			{
+				return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+					TEXT("channel is bool — value must be JSON bool or number"));
+			}
+			Channel->GetData().UpdateOrAddKey(FrameTime, bValue);
+			ChannelType = TEXT("bool");
+			TotalKeysAfter = Channel->GetData().GetTimes().Num();
+		}
+	}
+	// Integer channels.
+	if (TotalKeysAfter < 0)
+	{
+		TMovieSceneChannelHandle<FMovieSceneIntegerChannel> Handle = Proxy.MakeHandle<FMovieSceneIntegerChannel>(ChannelIndex);
+		if (FMovieSceneIntegerChannel* Channel = Handle.Get())
+		{
+			if (ValueJson->Type != EJson::Number)
+			{
+				return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+					TEXT("channel is integer — value must be a JSON number"));
+			}
+			Channel->GetData().UpdateOrAddKey(FrameTime, static_cast<int32>(ValueJson->AsNumber()));
+			ChannelType = TEXT("integer");
+			TotalKeysAfter = Channel->GetData().GetTimes().Num();
+		}
+	}
+
+	if (TotalKeysAfter < 0)
+	{
+		return SEQ_MakeError(Request, kMCPErrorPinTypeUnsupported,
+			FString::Printf(
+				TEXT("channel %d on track section '%s' is not float/double/bool/integer "
+					 "(other channel types not yet supported by sequencer.add_keyframe)"),
+				ChannelIndex, *TrackPath));
+	}
+
+	if (UPackage* Pkg = Seq->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("added"), true);
+	Out->SetStringField(TEXT("channel_type"), ChannelType);
+	Out->SetNumberField(TEXT("total_keys_after"), TotalKeysAfter);
+	return SEQ_MakeSuccessObj(Request, Out);
+}
+
+// ─── sequencer.set_section_range ──────────────────────────────────────────────────────────────
+//
+// Args:    { sequence_path: string, track_path: string,
+//            start_frame: number, end_frame: number }
+// Result:  { prior_range: [s, e], new_range: [s, e] }
+//
+// Errors: standard.
+FMCPResponse Tool_SetSectionRange(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return SEQ_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString SeqPath, TrackPath;
+	FMCPResponse Err;
+	if (!SEQ_RequireStringField(Request, TEXT("sequence_path"), SeqPath, Err)) { return Err; }
+	if (!SEQ_RequireStringField(Request, TEXT("track_path"),    TrackPath, Err)) { return Err; }
+
+	int32 StartFrame = 0, EndFrame = 0;
+	if (!Request.Args->TryGetNumberField(TEXT("start_frame"), StartFrame) ||
+	    !Request.Args->TryGetNumberField(TEXT("end_frame"),   EndFrame))
+	{
+		return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+			TEXT("sequencer.set_section_range requires args.start_frame + args.end_frame (integer ticks)"));
+	}
+	if (EndFrame <= StartFrame)
+	{
+		return SEQ_MakeError(Request, kSEQErrorInvalidParams,
+			FString::Printf(TEXT("end_frame (%d) must be greater than start_frame (%d)"), EndFrame, StartFrame));
+	}
+
+	int32 ErrCode = 0;
+	FString ErrMsg;
+	ULevelSequence* Seq = SEQ_LoadLevelSequenceByPath(SeqPath, ErrCode, ErrMsg);
+	if (!Seq) { return SEQ_MakeError(Request, ErrCode, ErrMsg); }
+	UMovieScene* MovieScene = Seq->GetMovieScene();
+	if (!MovieScene) { return SEQ_MakeError(Request, kSEQErrorInternal, TEXT("no MovieScene")); }
+
+	UMovieSceneSection* Section = SEQ_ResolveTrackSection(MovieScene, TrackPath, ErrCode, ErrMsg);
+	if (!Section) { return SEQ_MakeError(Request, ErrCode, ErrMsg); }
+
+	FScopedTransaction Transaction(LOCTEXT("MCP_SetSectionRange", "Set Sequencer Section Range"));
+	Section->Modify();
+
+	const TRange<FFrameNumber> Prior = Section->GetRange();
+	Section->SetRange(TRange<FFrameNumber>(FFrameNumber(StartFrame), FFrameNumber(EndFrame)));
+
+	if (UPackage* Pkg = Seq->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	auto RangeToJson = [](const TRange<FFrameNumber>& R) -> TSharedRef<FJsonValueArray>
+	{
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		Arr.Add(MakeShared<FJsonValueNumber>(
+			R.HasLowerBound() ? R.GetLowerBoundValue().Value : 0));
+		Arr.Add(MakeShared<FJsonValueNumber>(
+			R.HasUpperBound() ? R.GetUpperBoundValue().Value : 0));
+		return MakeShared<FJsonValueArray>(Arr);
+	};
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetField(TEXT("prior_range"), RangeToJson(Prior));
+	Out->SetField(TEXT("new_range"),
+		RangeToJson(TRange<FFrameNumber>(FFrameNumber(StartFrame), FFrameNumber(EndFrame))));
+	return SEQ_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -1100,9 +1639,17 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("sequencer.get_keyframes"),    &Tool_GetKeyframes,    /*Lane A*/ false);
 	RegisterTool(TEXT("sequencer.get_current_time"), &Tool_GetCurrentTime,  /*Lane A*/ false);
 
+	// Wave C Tier 5a (2026-05): Sequencer write surface.
+	RegisterTool(TEXT("sequencer.create_sequence"),   &Tool_CreateSequence,   /*Lane A*/ false);
+	RegisterTool(TEXT("sequencer.add_master_track"),  &Tool_AddMasterTrack,   /*Lane A*/ false);
+	RegisterTool(TEXT("sequencer.add_camera_cut"),    &Tool_AddCameraCut,     /*Lane A*/ false);
+	RegisterTool(TEXT("sequencer.add_keyframe"),      &Tool_AddKeyframe,      /*Lane A*/ false);
+	RegisterTool(TEXT("sequencer.set_section_range"), &Tool_SetSectionRange,  /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 5 Chunk D (Sequencer): registered 5 sequencer.* handlers "
-			 "(list_cinematics + get_tracks + get_camera_cuts + get_keyframes + get_current_time, all Lane A)"));
+		TEXT("Sequencer surface registered: 5 reads + 5 writes "
+			 "(list_cinematics/get_tracks/get_camera_cuts/get_keyframes/get_current_time + "
+			 "create_sequence/add_master_track/add_camera_cut/add_keyframe/set_section_range), all Lane A"));
 }
 
 } // namespace FSequencerTools
