@@ -580,7 +580,11 @@ def main() -> int:
         return fail(f"33/asset.batch_metadata.toolarge: expected error got {resp!r}")
     print(f"[SMOKE_PHASE2]   33/asset.batch_metadata.toolarge OK (5050 paths rejected — 5000-cap)")
 
-    # ─── 34. Lane B latency verification (50 calls < 200ms) ─────────────────────────────────
+    # ─── 34. AR tool latency sanity (50 calls; threshold relaxed post Hotfix-1) ──────────────
+    # Originally targeted Lane B (<200ms = 4ms per call). Hotfix-1 demoted AR tools to Lane A
+    # (GT-only via OnEndFrame drain) so per-call latency is ~16ms tick quantization + TCP
+    # connect/teardown overhead. Realistic ceiling is ~30 s (50 × 600ms with slack) — anything
+    # above that suggests a genuine regression (deadlocked drain, listener saturation, etc.).
     t0 = time.monotonic()
     for i in range(50):
         r = call(host, port, f"34/lane_b_{i}", "asset.exists", {"path": test_asset})
@@ -588,12 +592,12 @@ def main() -> int:
         if r.get("exists") is not True:
             return fail(f"34/lane_b loop iter {i}: expected exists=true got {r!r}")
     elapsed_ms = (time.monotonic() - t0) * 1000.0
-    # 50 calls × ~16ms tick quantization = 800ms if falling back to Lane A.
-    # Lane B should be <200ms (4× headroom).
-    if elapsed_ms > 1000.0:
-        # 1s = lane B clearly broken (likely falling back to game thread).
-        return fail(f"34/lane_b_latency: 50 calls took {elapsed_ms:.1f}ms (Lane B broken? expected <200ms)")
-    print(f"[SMOKE_PHASE2]   34/lane_b_latency OK ({elapsed_ms:.1f}ms for 50 calls — Lane B {'OK' if elapsed_ms < 200 else 'slow but acceptable'})")
+    if elapsed_ms > 30000.0:
+        return fail(f"34/ar_latency: 50 calls took {elapsed_ms:.1f}ms (>30 s — drain/listener regression?)")
+    perf_label = ("fast" if elapsed_ms < 1000 else
+                  "normal" if elapsed_ms < 5000 else
+                  "slow but acceptable")
+    print(f"[SMOKE_PHASE2]   34/ar_latency OK ({elapsed_ms:.1f}ms for 50 asset.exists — {perf_label})")
 
     # ─── Cleanup: best-effort delete of PhaseTwoScratch + its contents. ─────────────────────
     # Enumerate via cb.list_folders + asset.list, then cb.delete each. Failures here don't

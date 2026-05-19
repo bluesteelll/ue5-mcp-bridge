@@ -6,6 +6,7 @@
 
 #include "Async/Async.h"
 #include "Async/Future.h"
+#include "Containers/Ticker.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/RunnableThread.h"
 #include "Misc/IQueuedWork.h"
@@ -235,23 +236,33 @@ void FMCPJobRegistry::ExecuteJobOnWorker(TSharedRef<FMCPJob> Job, FBody Body)
 
 	if (Job->bGameThreadRequired)
 	{
-		// Game-thread coordinator: dispatch the body to GT and block this worker on the future.
-		// Worker slot is monopolised for the body's runtime — acceptable trade-off vs. shipping a
-		// second "GT-job queue" today; revisit in Phase 2 if it starves under load.
+		// Game-thread coordinator: dispatch the body to GT via FTSTicker and block this worker on
+		// the future. Worker slot is monopolised for the body's runtime.
+		//
+		// **2026-05 fix:** switched from AsyncTask(ENamedThreads::GameThread, ...) to FTSTicker.
+		// AsyncTask runs the body INSIDE a TaskGraph task processing context — any nested
+		// TaskGraph dispatch from the body (e.g. AssetTools.ImportAssetTasks → Interchange spawns
+		// internal TaskGraph work) tripped TaskGraph's RecursionGuard at Async/TaskGraph.cpp:689
+		// and crashed the editor. FTSTicker callbacks fire from FEngineLoop::Tick OUTSIDE the
+		// TaskGraph task processing loop, so nested TaskGraph dispatches are fresh entries.
 		//
 		// TPromise/TFuture state is shared via internal TSharedRef so moving the promise into the
 		// lambda doesn't invalidate the future we already retrieved.
 		TPromise<TSharedPtr<FJsonValue>> Promise;
 		TFuture<TSharedPtr<FJsonValue>> Future = Promise.GetFuture();
 
-		AsyncTask(ENamedThreads::GameThread,
-			[PromiseCap = MoveTemp(Promise), JobCap = Job, BodyCap = MoveTemp(Body)]() mutable
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[PromiseShared = MakeShared<TPromise<TSharedPtr<FJsonValue>>>(MoveTemp(Promise)),
+			 JobCap = Job, BodyCap = MoveTemp(Body)]
+			(float /*DeltaTime*/) mutable -> bool
 			{
 				TSharedPtr<FJsonValue> GTResult = BodyCap(JobCap.Get());
-				PromiseCap.SetValue(MoveTemp(GTResult));
-			});
+				PromiseShared->SetValue(MoveTemp(GTResult));
+				return false;  // one-shot
+			}),
+			/*InDelay*/ 0.0f);
 
-		// Blocks the worker. Body runs on the game thread, then we resume here.
+		// Blocks the worker. Body runs on the game thread via next-tick FTSTicker fire.
 		Result = Future.Get();
 	}
 	else
