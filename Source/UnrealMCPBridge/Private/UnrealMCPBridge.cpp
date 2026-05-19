@@ -28,6 +28,8 @@
 #include "Tools/SequencerTools.h"
 #include "Tools/SourceControlCompositeTools.h"
 #include "Tools/SourceControlTools.h"
+#include "Tools/TestCompositeTools.h"
+#include "Tools/TestTools.h"
 #include "Tools/UMGTools.h"
 
 #include "Dom/JsonObject.h"
@@ -297,10 +299,24 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	FSourceControlTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FSourceControlCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 6 Chunk B: Automation Test surface (8 tools = 7 sync test.* + 1 async composite
+	// test.run_automation). All sync tools are Lane A (list_automation_specs / run_single_test /
+	// get_last_results / cancel_current / list_categories / get_test_info / set_filter_flags);
+	// the composite's internal submitter test._run_automation_internal is Lane B (queues a job
+	// with bGameThreadRequired=true; Python wrapper test.run_automation returns {job_id} and AI
+	// polls externally). New error code: -32046 TestNotFound, raised when caller's test_name
+	// (FullTestPath) doesn't exist in the FAutomationTestFramework registry. test.run_single_test
+	// has a sync wall-clock cap (kTSTSingleTestMaxSeconds = 30s) — longer-running tests must go
+	// through the async test.run_automation path. test.list_automation_specs paginates via
+	// FMCPPageCursor keyed on FullTestPath + filter hash. No additional Build.cs dep needed —
+	// FAutomationTestFramework lives in Core which the bridge already depends on transitively.
+	FTestTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+	FTestCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + sc.* (5) + sc._internal (1) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + sc.* (5) + sc._internal (1) + test.* (7) + test._internal (1) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()

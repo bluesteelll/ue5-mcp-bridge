@@ -4,8 +4,8 @@
 ``job.status`` / ``job.result``.**
 
 This module is a THIN wrapper around the C++ internal handlers registered in
-``SourceControlCompositeTools.cpp`` (Chunk A) — later chunks will add ``TestCompositeTools.cpp``
-(Chunk B test.run_automation), and ``LiveCodingTools.cpp`` (Chunk E livecoding.recompile).
+``SourceControlCompositeTools.cpp`` (Chunk A) and ``TestCompositeTools.cpp`` (Chunk B). Later
+chunks will add ``LiveCodingTools.cpp`` (Chunk E livecoding.recompile).
 
 Why async-only?
 ================
@@ -14,8 +14,8 @@ Same rationale as Phase 3-5 composites (level_composites.py, blueprint_composite
 composite Python function runs inside ``FMCPPythonEval::CallPythonTool`` which executes on the
 game thread (Python's GIL is pinned to the GT). Per-tool body inside the job REQUIRES the game
 thread (SC ``Provider.Execute(FCheckIn)`` calls into provider plugins that touch UObject /
-package state). If a composite tried to block on its own job's result, the GT would never drain
-the job body → 60s timeout deadlock.
+package state; FAutomationTestFramework drives latent commands on the GT). If a composite tried
+to block on its own job's result, the GT would never drain the job body → 60s timeout deadlock.
 
 Resolution: composites NEVER poll. They submit + return ``{job_id}``. The AI client polls
 ``job.status`` / ``job.result`` from outside the GT (external TCP socket on its own thread).
@@ -25,6 +25,13 @@ Chunk A — Source Control composites (1 tool)
 
 ``sc.submit`` — commit + push a batch of changed files. Provider RPC (Perforce / Git) can take
 5-60s on large changelists, so sync would block GT + listener thread.
+
+Chunk B — Automation Test composites (1 tool)
+==============================================
+
+``test.run_automation`` — sequentially run a batch of automation tests. Each test can take
+10s-15min; entire batches can run for hours. Sequential because FAutomationTestFramework only
+tracks one "current" test at a time.
 """
 
 from __future__ import annotations
@@ -125,3 +132,113 @@ def submit(args: Dict[str, Any]) -> Dict[str, Any]:
         "description": description,
     }
     return dispatch_internal("sc._submit_internal", fwd)
+
+
+# ─── test.run_automation (async-only — submits job, returns {job_id}) ──────────────────────────
+@tool(
+    name="test.run_automation",
+    schema_in={
+        "type": "object",
+        "properties": {
+            "test_names": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+                "description": "Full test paths (exact case-sensitive match against "
+                               "FAutomationTestFramework's FullTestPath, e.g. "
+                               "'System.Engine.Maps.PIE_DefaultMap'). Enumerate via "
+                               "test.list_automation_specs.",
+            },
+            "run_smoke_filter": {
+                "type": "string",
+                "description": "Optional EAutomationTestFlags filter name (e.g. 'SmokeFilter', "
+                               "'EngineFilter', 'ProductFilter') applied via "
+                               "SetRequestedTestFilter BEFORE the batch runs. Persists past the "
+                               "batch — caller can reset via test.set_filter_flags afterward. "
+                               "Unknown name → INVALID_PARAMS.",
+            },
+        },
+        "required": ["test_names"],
+    },
+    schema_out={
+        "type": "object",
+        "properties": {"job_id": {"type": "string"}},
+        "required": ["job_id"],
+    },
+    thread_safe=False,
+    failure_modes=[
+        {"code": "INVALID_PARAMS",
+         "when": "test_names missing/empty/not array of strings OR run_smoke_filter present "
+                 "but not a known flag name",
+         "recovery": "Pass test_names as a non-empty list of FullTestPath strings; if using "
+                     "run_smoke_filter, choose from EAutomationTestFlags_GetTestFlagsMap names "
+                     "(e.g. 'SmokeFilter', 'EngineFilter', 'ProductFilter')."},
+        {"code": "TEST_NOT_FOUND",
+         "when": "Any test_name entry doesn't exist in the framework's registry — ENTIRE batch "
+                 "rejected pre-job (no partial submit)",
+         "recovery": "Verify exact spelling via test.list_automation_specs; lookup is "
+                     "case-sensitive against FullTestPath."},
+        {"code": "JOB_SUBMIT_FAILED",
+         "when": "Job registry refused (shutdown?)",
+         "recovery": "Retry after 1s"},
+    ],
+)
+def run_automation(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Async-only: submits job, returns {job_id}. Poll via job.status / job.result.
+
+    Sequentially runs each test in ``test_names`` via FAutomationTestFramework on the game
+    thread. Per-test execution captures errors / warnings into the result; the batch can be
+    cancelled mid-flight via ``job.cancel`` (remaining tests go to ``skipped[]`` with reason
+    'batch cancelled before this test ran').
+
+    Inner result (returned by ``job.result`` once Succeeded)::
+
+        {
+          "succeeded": [{name, duration_secs, warning_count}],
+          "failed":    [{name, duration_secs, error_count, errors[], warnings[],
+                         cancelled_mid_test: bool}],
+          "skipped":   [{name, reason}],
+          "total":               int,
+          "completed":           int,
+          "failed_count":        int,
+          "cancelled":           bool,
+          "applied_filter":      str,     # run_smoke_filter echo (empty if not provided)
+          "total_duration_secs": float
+        }
+
+    Each error / warning entry has the shape::
+
+        {
+          "type":      "error" | "warning" | "info",
+          "message":   str,
+          "context":   str,
+          "filename":  str,    # source file where AddError/AddWarning was called
+          "line":      int,    # source line; -1 if unknown
+          "timestamp": str     # ISO 8601
+        }
+
+    No PIE guard — tests may themselves drive PIE start/stop via latent commands. Operators
+    should ``pie.stop`` first if they want a clean editor-world start state.
+    """
+    if not isinstance(args, dict):
+        raise ValueError("args: expected object")
+
+    test_names = args.get("test_names")
+    if not isinstance(test_names, list) or not test_names:
+        raise ValueError("test_names: required non-empty array of FullTestPath strings")
+    for i, name in enumerate(test_names):
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"test_names[{i}]: must be a non-empty string")
+
+    fwd: Dict[str, Any] = {"test_names": test_names}
+
+    # Optional run_smoke_filter — pass through verbatim; C++ side validates against the
+    # EAutomationTestFlags name table and surfaces -32602 on unknown.
+    run_smoke_filter = args.get("run_smoke_filter")
+    if run_smoke_filter is not None:
+        if not isinstance(run_smoke_filter, str):
+            raise ValueError("run_smoke_filter: must be a string if provided")
+        if run_smoke_filter:
+            fwd["run_smoke_filter"] = run_smoke_filter
+
+    return dispatch_internal("test._run_automation_internal", fwd)

@@ -223,7 +223,8 @@ inline constexpr int32 kMCPErrorTrackNotFound               = -32043;
 inline constexpr int32 kMCPErrorSectionIndexOOB             = -32044;
 
 /**
- * Phase 6 — Source Control + Test + Config + Logs + LiveCoding surface (Chunk A: Source Control).
+ * Phase 6 — Source Control + Test + Config + Logs + LiveCoding surface (Chunk A: Source Control,
+ * Chunk B: Automation Test).
  *
  *   -32045 SourceControlProviderUnavailable  ``sc.*`` — Either ``ISourceControlModule::Get().IsEnabled()``
  *                                            returned false (no provider configured for this project)
@@ -232,14 +233,25 @@ inline constexpr int32 kMCPErrorSectionIndexOOB             = -32044;
  *                                            Caller's recovery: configure SC in Editor Preferences →
  *                                            Source Control, or use a workspace that already has a
  *                                            connected provider (Git LFS, Perforce, Subversion, etc.).
+ *   -32046 TestNotFound                      ``test.run_single_test`` / ``test.get_test_info`` /
+ *                                            ``test.run_automation`` internal — the supplied test
+ *                                            name does not exist in the FAutomationTestFramework
+ *                                            registry. Lookup is exact-match against the framework's
+ *                                            full test path (e.g. ``"System.Engine.Maps.TestSomething"``).
+ *                                            Caller's recovery: enumerate available tests via
+ *                                            ``test.list_automation_specs`` and pick the canonical
+ *                                            full path; names ARE case-sensitive at the framework
+ *                                            level. For ``test.run_automation`` the entire batch is
+ *                                            rejected pre-job if ANY name is missing — we don't
+ *                                            partially run.
  *
  * Future Phase 6 chunks (placeholder; codes will land alongside their chunks):
- *   -32046 TestNotFound          (Chunk B: test.*)
  *   -32047 CVarReadOnly          (Chunk C: cfg.*)
  *   -32048 LiveCodingDisabled    (Chunk E: livecoding.*)
  *   -32049 LogCategoryUnknown    (Chunk D: log.*)
  */
 inline constexpr int32 kMCPErrorSourceControlProviderUnavailable = -32045;
+inline constexpr int32 kMCPErrorTestNotFound                     = -32046;
 
 /**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
