@@ -106,4 +106,7 @@ namespace FBlueprintTools
 
 	// ─── Day 10: synchronous single-BP compile (PIE-guarded) ─────────────────────────────────────
 	UNREALMCPBRIDGE_API FMCPResponse Tool_Compile(const FMCPRequest& Request);
+
+	// ─── 2026-05: generic BP asset creator with explicit parent class ────────────────────────────
+	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request);
 }

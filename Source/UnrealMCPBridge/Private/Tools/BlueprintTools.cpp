@@ -4,12 +4,18 @@
 
 #include "FMCPDispatchQueue.h"
 #include "UnrealMCPBridge.h"
+#include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPBlueprintUtils.h"
 #include "Utils/MCPPageCursor.h"
 #include "Utils/MCPPinTypeUtils.h"
 #include "Utils/MCPWorldContext.h"
 
+#include "AssetToolsModule.h"
 #include "EdGraph/EdGraph.h"
+#include "Factories/BlueprintFactory.h"
+#include "IAssetTools.h"
+#include "Misc/PackageName.h"
+#include "Subsystems/EditorAssetSubsystem.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
@@ -40,6 +46,7 @@ namespace
 	// BP_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
 	// UE's global ValueOrError templates).
 	constexpr int32 kBPErrorInvalidParams = -32602;
+	constexpr int32 kBPErrorInternal      = -32603;
 
 	void BP_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
 	{
@@ -1949,6 +1956,131 @@ FMCPResponse Tool_Compile(const FMCPRequest& Request)
 	return BP_MakeSuccessObj(Request, ResultObj);
 }
 
+// ─── bp.create_blueprint — create new UBlueprint asset with specified parent class ──────────
+//
+// Args:
+//   - parent_class_path: string (required)  /Script/Module.Class  OR  /Game/.../BP.BP_C
+//                                            The new BP will subclass this class. Examples:
+//                                              /Script/Engine.Actor          → actor BP
+//                                              /Script/Engine.HUD            → HUD BP
+//                                              /Script/Engine.GameModeBase   → game mode BP
+//                                              /Script/Engine.Pawn           → pawn BP
+//                                              /Script/UMG.UserWidget        → user widget (also see umg.create_widget_blueprint)
+//   - dest_path:         string (required)  /Game/.../BP_NewName
+//   - save:              bool   (optional)  default false
+//
+// Result:
+//   - created:          bool
+//   - asset_path:       string  (e.g. "/Game/UI/BP_MainHUD.BP_MainHUD")
+//   - generated_class:  string  ("/Game/UI/BP_MainHUD.BP_MainHUD_C")
+//   - parent_class:     string  echo
+//   - saved:            bool
+//
+// PIE-guarded. Lane A.
+//
+// Note: BP factories are class-specific. We use UBlueprintFactory (covers AActor and most
+// engine subclasses). For UserWidget specifically use umg.create_widget_blueprint which
+// uses UWidgetBlueprintFactory.
+FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (GEditor && GEditor->PlayWorld != nullptr)
+	{
+		return BP_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	if (!Request.Args.IsValid())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("bp.create_blueprint requires args.parent_class_path + args.dest_path"));
+	}
+
+	FString ParentClassPath, DestPathRaw;
+	if (!Request.Args->TryGetStringField(TEXT("parent_class_path"), ParentClassPath) || ParentClassPath.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'parent_class_path'"));
+	}
+	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'dest_path'"));
+	}
+
+	// Resolve parent class (with _C autoload).
+	UClass* ParentClass = LoadClass<UObject>(nullptr, *ParentClassPath);
+	if (!ParentClass)
+	{
+		const FString WithC = ParentClassPath.EndsWith(TEXT("_C")) ? ParentClassPath : (ParentClassPath + TEXT("_C"));
+		ParentClass = LoadClass<UObject>(nullptr, *WithC);
+	}
+	if (!ParentClass)
+	{
+		return BP_MakeError(Request, kMCPErrorClassNotFound,
+			FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ParentClassPath));
+	}
+	if (ParentClass->HasAnyClassFlags(CLASS_Abstract))
+	{
+		// Abstract parents are actually FINE for BP subclasses (most engine parents are abstract).
+		// Skip the abstract check here.
+	}
+
+	// Validate dest path.
+	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
+	if (DestPathNorm.IsEmpty())
+	{
+		return BP_MakeError(Request, kMCPErrorInvalidPath,
+			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed path"), *DestPathRaw));
+	}
+	if (FPackageName::DoesPackageExist(DestPathNorm))
+	{
+		return BP_MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
+	}
+
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName = FPaths::GetBaseFilename(DestPathNorm);
+
+	// Create via UBlueprintFactory.
+	UBlueprintFactory* Factory = NewObject<UBlueprintFactory>();
+	Factory->ParentClass = ParentClass;
+
+	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, UBlueprint::StaticClass(), Factory);
+	if (!NewAsset)
+	{
+		return BP_MakeError(Request, kBPErrorInternal,
+			FString::Printf(TEXT("UBlueprintFactory failed to create BP from parent '%s' at '%s'"),
+				*ParentClass->GetPathName(), *DestPathNorm));
+	}
+
+	UBlueprint* NewBP = Cast<UBlueprint>(NewAsset);
+	if (NewBP && NewBP->GetOutermost())
+	{
+		NewBP->GetOutermost()->MarkPackageDirty();
+	}
+
+	bool bSaveRequested = false, bSavedOk = false;
+	Request.Args->TryGetBoolField(TEXT("save"), bSaveRequested);
+	if (bSaveRequested)
+	{
+		if (UEditorAssetSubsystem* EAS = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr)
+		{
+			bSavedOk = EAS->SaveLoadedAsset(NewAsset, /*bOnlyIfIsDirty*/ true);
+		}
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("created"), true);
+	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
+	Out->SetStringField(TEXT("generated_class"),
+		NewBP && NewBP->GeneratedClass ? NewBP->GeneratedClass->GetPathName() : FString());
+	Out->SetStringField(TEXT("parent_class"), ParentClass->GetPathName());
+	Out->SetBoolField(TEXT("saved"), bSavedOk);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -1990,8 +2122,13 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// composite registered separately by FBlueprintCompositeTools::Register.
 	RegisterTool(TEXT("bp.compile"), &Tool_Compile, /*Lane A*/ false);
 
+	// 2026-05 addition: generic BP asset creator with explicit parent class. Covers HUD,
+	// GameModeBase, Pawn, Actor, etc. UserWidget specifically also has umg.create_widget_blueprint
+	// for proper UWidgetBlueprintFactory invocation.
+	RegisterTool(TEXT("bp.create_blueprint"), &Tool_CreateBlueprint, /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 4 Days 1-10: registered 13 bp.* handlers (6 reads + 6 writes + 1 compile, all Lane A); ")
+		TEXT("Phase 4 Days 1-10 + bp.create_blueprint: registered 14 bp.* handlers (6 reads + 6 writes + 1 compile + 1 creator, all Lane A); ")
 		TEXT("bp.compile_all_dirty registered separately via FBlueprintCompositeTools"));
 }
 
