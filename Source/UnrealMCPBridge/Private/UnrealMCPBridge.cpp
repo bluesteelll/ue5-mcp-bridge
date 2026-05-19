@@ -33,6 +33,7 @@
 #include "Tools/SourceControlTools.h"
 #include "Tools/TestCompositeTools.h"
 #include "Tools/TestTools.h"
+#include "Tools/UFunctionTools.h"
 #include "Tools/UMGTools.h"
 
 #include "Dom/JsonObject.h"
@@ -251,6 +252,12 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// 1 create + 2 diagnostic. Reads PIE-safe; writes refuse PIE with -32027. MIC-only writes
 	// enforced — base UMaterial mutations would need graph edits (out of Phase 4 scope).
 	FMaterialTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// UFunction reflection surface (2 tools, Lane A): bp.call_function + bp.list_class_functions.
+	// Generic invoker for any BlueprintCallable/BlueprintPure/Exec UFUNCTION (static or instance),
+	// plus discovery tool. Covers UFlecsContainerLibrary + any future crafting/inventory
+	// BP function libraries without per-system bespoke tools.
+	FUFunctionTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
