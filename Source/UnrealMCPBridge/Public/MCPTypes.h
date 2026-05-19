@@ -224,7 +224,7 @@ inline constexpr int32 kMCPErrorSectionIndexOOB             = -32044;
 
 /**
  * Phase 6 — Source Control + Test + Config + Logs + LiveCoding surface (Chunk A: Source Control,
- * Chunk B: Automation Test).
+ * Chunk B: Automation Test, Chunk C: Config / CVars).
  *
  *   -32045 SourceControlProviderUnavailable  ``sc.*`` — Either ``ISourceControlModule::Get().IsEnabled()``
  *                                            returned false (no provider configured for this project)
@@ -244,14 +244,25 @@ inline constexpr int32 kMCPErrorSectionIndexOOB             = -32044;
  *                                            level. For ``test.run_automation`` the entire batch is
  *                                            rejected pre-job if ANY name is missing — we don't
  *                                            partially run.
+ *   -32047 CVarReadOnly                      ``cfg.set_cvar`` — the named CVar exists as an
+ *                                            ``IConsoleVariable`` but has the ``ECVF_ReadOnly`` flag
+ *                                            set, meaning Epic flagged it as immutable at runtime
+ *                                            (typically rendering/shading CVars whose values bake
+ *                                            into shader keys, or platform-locked engine tunables).
+ *                                            Caller's recovery: write the value into the matching
+ *                                            ``DefaultEngine.ini`` ``[ConsoleVariables]`` section via
+ *                                            ``cfg.write`` and restart the editor, OR consult engine
+ *                                            docs for a runtime-mutable alternative cvar. No D5
+ *                                            (command-vs-variable) overlap — that case raises
+ *                                            -32011 WrongClass instead.
  *
  * Future Phase 6 chunks (placeholder; codes will land alongside their chunks):
- *   -32047 CVarReadOnly          (Chunk C: cfg.*)
  *   -32048 LiveCodingDisabled    (Chunk E: livecoding.*)
  *   -32049 LogCategoryUnknown    (Chunk D: log.*)
  */
 inline constexpr int32 kMCPErrorSourceControlProviderUnavailable = -32045;
 inline constexpr int32 kMCPErrorTestNotFound                     = -32046;
+inline constexpr int32 kMCPErrorCVarReadOnly                     = -32047;
 
 /**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.

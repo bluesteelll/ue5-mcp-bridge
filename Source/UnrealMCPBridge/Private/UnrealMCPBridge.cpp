@@ -17,6 +17,7 @@
 #include "Tools/BlueprintCompositeTools.h"
 #include "Tools/BlueprintTools.h"
 #include "Tools/ComponentTools.h"
+#include "Tools/ConfigTools.h"
 #include "Tools/ContentBrowserTools.h"
 #include "Tools/EditorTools.h"
 #include "Tools/LevelCompositeTools.h"
@@ -313,10 +314,26 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	FTestTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FTestCompositeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
+	// Phase 6 Chunk C: Config / CVars surface (6 sync cfg.* tools, all Lane A).
+	//   - cfg.get_cvar / cfg.set_cvar / cfg.list_cvars : IConsoleManager wrappers with typed
+	//     marshalling (D4 — accepts JSON bool/int/float/string; coerces per cvar's reported type),
+	//     command-vs-variable gate (D5 → -32011 WrongClass for IConsoleCommand entries), read-only
+	//     gate (D9 → -32047 CVarReadOnly when ECVF_ReadOnly is set). Writes use ECVF_SetByCode so
+	//     subsequent Console-priority writes from the operator's editor console still win.
+	//   - cfg.read / cfg.write / cfg.list_sections : GConfig wrappers sandboxed (D8) to four ini
+	//     BASE names {DefaultEngine, DefaultGame, DefaultInput, DefaultEditor}. Anything else →
+	//     -32013 PathEscape. cfg.write flushes immediately to <ProjectDir>/Config/Default*.ini and
+	//     verifies via post-write GetString that the cache holds the new value.
+	//   - Pagination via FMCPPageCursor on cfg.list_cvars + cfg.list_sections; default page_size
+	//     100, clamped [1, 1000]. Filter mutation across pages → -32015 StaleCursor.
+	// New error code: -32047 CVarReadOnly. No new Build.cs deps (IConsoleManager + GConfig + FPaths
+	// all in Core, already a transitive dep).
+	FConfigTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
 		TEXT("unknown-method-fallback → FMCPPythonEval::CallPythonTool, ")
-		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + sc.* (5) + sc._internal (1) + test.* (7) + test._internal (1) + _phase3_lane_b_sanity (1)"));
+		TEXT("C++ handlers → marshall.* (4) + job.* (5) + log.* (3) + tools.list + asset.* (13) + cb.* (12) + asset._internal (5) + level.* (12) + actor.* (20) + component.* (8) + level._internal/actor._internal (5) + bp.* (13) + bp._internal (1) + material.* (9) + pie.* (10) + editor.* (9) + pie.screenshot_to_disk + umg.* (2) + niagara.* (1) + physics.* (2) + sequencer.* (5) + sc.* (5) + sc._internal (1) + test.* (7) + test._internal (1) + cfg.* (6) + _phase3_lane_b_sanity (1)"));
 }
 
 void FUnrealMCPBridgeModule::UnregisterDefaultDispatchHandlers()
