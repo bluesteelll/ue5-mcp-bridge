@@ -8,8 +8,10 @@
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPathSandbox.h"
 
+#include "AssetExportTask.h"
 #include "AssetImportTask.h"
 #include "AssetRegistry/ARFilter.h"
+#include "Exporters/Exporter.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -818,49 +820,62 @@ FMCPResponse Tool_Export(const FMCPRequest& Request)
 	const FString ParentDir = FPaths::GetPath(AbsDest);
 	IFileManager::Get().MakeDirectory(*ParentDir, /*Tree*/ true);
 
-	// IAssetTools::ExportAssets writes into a DIRECTORY, deriving the filename from the asset
-	// short name + exporter extension. We export into a temp subfolder, find the produced file,
-	// and rename to dest_file. This is the simplest way to control the output filename without
-	// re-implementing the exporter dispatch.
-	const FString TempSubDir = ParentDir / FString::Printf(TEXT("__mcp_export_%s"),
-		*FGuid::NewGuid().ToString(EGuidFormats::Digits));
-	IFileManager::Get().MakeDirectory(*TempSubDir, /*Tree*/ true);
-
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(NormalizedPath);
-	AssetToolsModule.Get().ExportAssets({ ObjectPath }, TempSubDir);
-
-	// Scan temp dir for the produced file. ExportAssets is fire-and-forget; success/failure is
-	// observed by file existence.
-	TArray<FString> Produced;
-	IFileManager::Get().FindFiles(Produced, *(TempSubDir / TEXT("*")), /*Files*/ true, /*Dirs*/ false);
-
-	if (Produced.Num() == 0)
+	// UE 5.0+ canonical export: UAssetExportTask + UExporter::RunAssetExportTask. Handles
+	// exporter discovery internally (was broken with IAssetTools::ExportAssets for Texture2D
+	// in UE 5.7 since UTextureExporter* classes weren't being auto-instantiated by the older
+	// path).
+	UObject* AssetToExport = Data.GetAsset();
+	if (!AssetToExport)
 	{
-		IFileManager::Get().DeleteDirectory(*TempSubDir, /*RequireExists*/ false, /*Tree*/ true);
-		return CB_MakeError(Request, -32000,
-			FString::Printf(TEXT("ExportAssets produced no output for '%s' (no compatible exporter for class %s?)"),
-				*NormalizedPath, *Data.AssetClassPath.ToString()));
+		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("asset '%s' could not be loaded"), *NormalizedPath));
 	}
 
-	// Take the first produced file (typical case = single file per asset). Move/rename to AbsDest.
-	const FString ProducedAbs = TempSubDir / Produced[0];
+	// Find a compatible exporter for the requested file extension. UExporter::FindExporter
+	// iterates all loaded UExporter subclasses and matches by SupportedClass + FormatExtension.
+	const FString DestExt = FPaths::GetExtension(AbsDest, /*bIncludeDot*/ false).ToLower();
+	UExporter* Exporter = nullptr;
+	if (!DestExt.IsEmpty())
+	{
+		Exporter = UExporter::FindExporter(AssetToExport, *DestExt);
+	}
+	if (!Exporter)
+	{
+		// Last-ditch: any exporter that supports the asset's class. UE will pick its preferred
+		// extension (e.g. .uasset.copy or .fbx for static meshes) but we still write to AbsDest.
+		Exporter = UExporter::FindExporter(AssetToExport, TEXT(""));
+	}
+	if (!Exporter)
+	{
+		return CB_MakeError(Request, -32000,
+			FString::Printf(TEXT("no compatible UExporter for class %s + ext '%s' "
+								"(try .png/.jpg for textures, .fbx for meshes, .t3d for levels)"),
+				*Data.AssetClassPath.ToString(), *DestExt));
+	}
 
-	// If AbsDest already exists, delete it so MoveFile doesn't fail.
+	// If AbsDest already exists, delete it so the export doesn't accumulate or fail.
 	if (IFileManager::Get().FileExists(*AbsDest))
 	{
 		IFileManager::Get().Delete(*AbsDest);
 	}
 
-	const bool bMoved = IFileManager::Get().Move(*AbsDest, *ProducedAbs, /*bReplace*/ true,
-		/*bEvenIfReadOnly*/ false, /*bAttributes*/ false, /*bDoNotRetryOrError*/ false);
+	UAssetExportTask* Task = NewObject<UAssetExportTask>();
+	Task->Object             = AssetToExport;
+	Task->Exporter           = Exporter;
+	Task->Filename           = AbsDest;
+	Task->bSelected          = false;
+	Task->bReplaceIdentical  = true;
+	Task->bPrompt            = false;
+	Task->bUseFileArchive    = AssetToExport->IsA(UPackage::StaticClass());  // binary archive for packages
+	Task->bWriteEmptyFiles   = false;
+	Task->bAutomated         = true;
+	const bool bExported     = UExporter::RunAssetExportTask(Task);
 
-	IFileManager::Get().DeleteDirectory(*TempSubDir, /*RequireExists*/ false, /*Tree*/ true);
-
-	if (!bMoved)
+	if (!bExported || !IFileManager::Get().FileExists(*AbsDest))
 	{
 		return CB_MakeError(Request, -32000,
-			FString::Printf(TEXT("could not rename exported file '%s' -> '%s'"), *ProducedAbs, *AbsDest));
+			FString::Printf(TEXT("UExporter::RunAssetExportTask failed for '%s' (Exporter=%s, dest='%s')"),
+				*NormalizedPath, *Exporter->GetClass()->GetName(), *AbsDest));
 	}
 
 	const int64 Bytes = IFileManager::Get().FileSize(*AbsDest);
@@ -1010,6 +1025,16 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 
 			FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
 
+			// Batch-build all tasks then submit ONCE to ImportAssetTasks. UE 5.7's AssetTools
+			// internally dispatches via Interchange which uses TaskGraph for parallel work; calling
+			// ImportAssetTasks per-file in a tight loop tripped TaskGraph's RecursionGuard at
+			// Async/TaskGraph.cpp:689 (Interchange's intermediate tasks hadn't drained between
+			// iterations). Single batched call lets Interchange manage its own internal pipelining.
+			TArray<UAssetImportTask*> Tasks;
+			Tasks.Reserve(Total);
+			TArray<int32> TaskFileIndex;  // map Tasks[k] back to Files[TaskFileIndex[k]] for reporting
+			TaskFileIndex.Reserve(Total);
+
 			for (int32 i = 0; i < Total; ++i)
 			{
 				if (Job.bCancelRequested.load(std::memory_order_acquire))
@@ -1019,11 +1044,6 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 				}
 
 				const FString& File = Files[i];
-				Job.Progress.store(static_cast<float>(i) / FMath::Max(1, Total),
-					std::memory_order_release);
-				Job.Description = FString::Printf(TEXT("Imported %d/%d: %s"),
-					i + 1, Total, *FPaths::GetCleanFilename(File));
-
 				if (!IFileManager::Get().FileExists(*File))
 				{
 					Failed.Add(MakeShared<FJsonValueObject>(
@@ -1038,9 +1058,23 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 				Task->bAutomated       = true;
 				Task->bReplaceExisting = bReplaceExisting;
 				Task->bSave            = false;
-				AssetToolsModule.Get().ImportAssetTasks({ Task });
+				Tasks.Add(Task);
+				TaskFileIndex.Add(i);
+			}
 
-				if (Task->ImportedObjectPaths.Num() > 0)
+			Job.Description = FString::Printf(TEXT("ImportAssetTasks: %d task(s) batched"), Tasks.Num());
+			Job.Progress.store(0.5f, std::memory_order_release);
+
+			if (Tasks.Num() > 0)
+			{
+				AssetToolsModule.Get().ImportAssetTasks(Tasks);
+			}
+
+			for (int32 k = 0; k < Tasks.Num(); ++k)
+			{
+				UAssetImportTask* Task = Tasks[k];
+				const FString& File = Files[TaskFileIndex[k]];
+				if (Task && Task->ImportedObjectPaths.Num() > 0)
 				{
 					TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
 					Entry->SetStringField(TEXT("source"), File);

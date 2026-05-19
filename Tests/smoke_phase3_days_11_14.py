@@ -384,11 +384,12 @@ def main() -> int:
         return fail("9/too_large: timeout")
     if resp.get("ok") is True:
         return fail(f"9/too_large: expected error, got success {resp!r}")
-    # Python wrapper raises before reaching C++ (ValueError → -32603) for >1000; if it gets
-    # past the wrapper, C++ surfaces -32017. Accept either.
+    # Python wrapper raises ValueError before reaching C++ (polish #12 dispatcher → -32602
+    # InvalidParams); if it gets past the wrapper, C++ surfaces -32017 InputTooLarge. Accept any
+    # of the canonical input-validation codes.
     code = (resp.get("error") or {}).get("code")
-    if code not in (-32017, -32603):
-        return fail(f"9/too_large: expected -32017 or -32603, got {code}")
+    if code not in (-32017, -32602, -32603):
+        return fail(f"9/too_large: expected -32017/-32602/-32603, got {code}")
     print(f"[SMOKE_PHASE3_11_14]   9/too_large refused OK (code={code})")
 
     print("[SMOKE_PHASE3_11_14] PASS")

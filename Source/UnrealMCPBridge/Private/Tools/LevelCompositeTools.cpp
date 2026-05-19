@@ -1073,16 +1073,19 @@ FMCPResponse Tool_BatchSetPropertyInternal(const FMCPRequest& Request)
 					continue;
 				}
 
-				// Edit-const 3-flag gate per Days 4-8 hotfix. CPF_DisableEditOnInstance is the
-				// critical one for placed-instance mutations — its omission would silently let the
-				// bridge overwrite values the editor's own property browser refuses.
+				// Edit-const 2-flag gate (CPF_BlueprintReadOnly dropped 2026-05 — it's runtime BP
+				// restriction, not editor-write restriction; editor's Details panel writes to those
+				// fine). Per-mutation `bypass_readonly: true` field opts past the remaining
+				// CPF_EditConst | CPF_DisableEditOnInstance check.
+				bool bBypassReadOnlyPer = false;
+				Item->TryGetBoolField(TEXT("bypass_readonly"), bBypassReadOnlyPer);
 				const uint64 Flags = LeafProp->PropertyFlags;
-				if (Flags & (CPF_BlueprintReadOnly | CPF_EditConst | CPF_DisableEditOnInstance))
+				if (!bBypassReadOnlyPer && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 				{
 					Failed.Add(MakeShared<FJsonValueObject>(LCO_MakeFailureEntry(
 						i, kMCPErrorPropertyAccessDenied,
 						FString::Printf(
-							TEXT("property '%s' is read-only (CPF flags=%llu)"),
+							TEXT("property '%s' is read-only (CPF flags=%llu); pass mutation.bypass_readonly=true to override"),
 							*LeafProp->GetName(),
 							static_cast<unsigned long long>(Flags)))));
 					continue;

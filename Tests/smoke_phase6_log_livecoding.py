@@ -425,26 +425,44 @@ def main() -> int:
     # Re-verified above in sub-test 1; just print a confirmation here for clarity.
     info("15/livecoding.recompile registration verified in sub-test 1")
 
-    # ─── Sub-test 16: livecoding.recompile modules=["*"] → job_id OR -32048 OR -32027 ────────
-    # All three are acceptable depending on environment. We don't poll the job — recompile would
-    # alter editor state, defer to operator.
+    # ─── Sub-test 16: livecoding.recompile job_id OR -32048 OR -32027 ─────────────────────────
+    # Use a deliberately bogus module name. Per livecoding.recompile contract: "Live Coding's
+    # own compile path gracefully handles unknown module names (logged as warnings, not errors)".
+    # This means the compile body runs but finds nothing to compile — fast no-op, doesn't block
+    # GT for tens of seconds with a real recompile. Real-module recompile would block subsequent
+    # Python @tool calls (sub-test 17+) for the full duration of the compile.
     response = call(args.host, args.port, "16", "p6-loglc-16", "livecoding.recompile",
-                    {"modules": ["*"]}, timeout=10.0)
+                    {"modules": ["__MCP_Smoke_NonExistent_Module__"]}, timeout=10.0)
     if response is None:
         return fail("16/livecoding.recompile: timeout")
     if response.get("id") != "p6-loglc-16":
         return fail(f"16/livecoding.recompile: id mismatch {response.get('id')!r}")
     if response.get("ok") is True:
-        # Success — we got a job_id. Verify shape, don't poll.
+        # Success — we got a job_id. Cancel + poll until terminal so subsequent sub-tests
+        # don't fight the still-running Live Coding job for GT time. Without this barrier
+        # sub-tests 17/18 (Python @tool calls — FMCPPythonEval is GT-bound) time out at 30s
+        # waiting for the recompile to drain.
         result = response.get("result") or {}
-        if "job_id" not in result:
+        job_id = result.get("job_id")
+        if not job_id:
             return fail(f"16/livecoding.recompile: missing job_id in success result: {result!r}")
-        info(f"16/livecoding.recompile OK job_id={result['job_id']} (NOT polled to avoid editor mutation)")
-        # Cancel the job to avoid recompiling the entire codebase during the smoke test.
-        cancel_resp = call(args.host, args.port, "16cancel", "p6-loglc-16cancel",
-                           "job.cancel", {"job_id": result["job_id"]})
-        if cancel_resp is not None and cancel_resp.get("ok") is True:
-            info("16/livecoding.recompile job cancel issued")
+        info(f"16/livecoding.recompile OK job_id={job_id}; cancelling + draining…")
+        call(args.host, args.port, "16cancel", "p6-loglc-16cancel",
+             "job.cancel", {"job_id": job_id})
+        # Wait up to 20 s for terminal state — Live Coding doesn't honour cancel mid-compile but
+        # the bogus-module form returns quickly anyway.
+        import time as _t
+        deadline = _t.monotonic() + 20.0
+        while _t.monotonic() < deadline:
+            sr = call(args.host, args.port, "16poll", "p6-loglc-16poll",
+                      "job.status", {"job_id": job_id})
+            if sr and sr.get("ok") and (sr.get("result") or {}).get("state") in (
+                    "Succeeded", "Failed", "Cancelled"):
+                info(f"16/livecoding.recompile drained — state={(sr['result']).get('state')}")
+                break
+            _t.sleep(0.5)
+        else:
+            info("16/livecoding.recompile job did not drain in 20 s (continuing anyway)")
     else:
         # Error path — accept -32048 LiveCodingDisabled or -32027 PIEActive.
         err = response.get("error") or {}

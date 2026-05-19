@@ -177,15 +177,19 @@ FMCPResponse FMCPMarshalling::WriteProperty(const FMCPRequest& Request)
 		return MCP_MakeError(Request, ErrCode, ErrMsg);
 	}
 
-	// Guard: don't write to BlueprintReadOnly / EditConst from outside the editor UI without a
-	// flag — surface as -32007 PropertyAccessDenied so the client knows the schema, not the wire,
-	// rejected the write. Caller can override by passing args.bypass_readonly=true if they really
-	// need to (escape hatch for tooling that knows what it's doing — also required for CDO writes,
-	// see smoke_ping.py sub-test 9b which writes FrameRateLimit on the GameUserSettings CDO).
+	// Guard: don't write to EditConst / DisableEditOnInstance from outside the editor UI without
+	// a flag — surface as -32007 PropertyAccessDenied so the client knows the schema, not the
+	// wire, rejected the write. Caller can override by passing args.bypass_readonly=true if they
+	// really need to (escape hatch for tooling that knows what it's doing — also required for
+	// CDO writes, see smoke_ping.py sub-test 9b).
+	// CPF_BlueprintReadOnly was DROPPED 2026-05 — that flag means "BP code can't write at runtime"
+	// but the editor's Details panel happily writes BlueprintReadOnly UPROPERTIES at design time
+	// and the MCP bridge is acting as editor surrogate. Without this fix, e.g. Light.Intensity
+	// (ULightComponentBase::Intensity, BlueprintReadOnly) and AActor::bHidden silently rejected.
 	const bool bBypassReadOnly = Request.Args->HasField(TEXT("bypass_readonly")) &&
 		Request.Args->GetBoolField(TEXT("bypass_readonly"));
 	const uint64 Flags = LeafProp->PropertyFlags;
-	if (!bBypassReadOnly && (Flags & (CPF_BlueprintReadOnly | CPF_EditConst | CPF_DisableEditOnInstance)))
+	if (!bBypassReadOnly && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{
 		return MCP_MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(

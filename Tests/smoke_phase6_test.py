@@ -527,21 +527,34 @@ def main() -> int:
         return 1
     info("16/run_automation empty test_names OK -32602 (Python ValueError)")
 
-    # ─── Sub-test 17: test.run_automation bogus name → -32046 (or -32603 wrapped) ───────────────
-    # The C++ internal handler returns -32046 TestNotFound. The Python ``dispatch_internal``
-    # helper in MCPTools/tools/asset_tools.py raises a RuntimeError carrying the original code
-    # in its message; the outer Python tool wrapper catches it as an Exception → -32603. So the
-    # observable wire code may be either -32046 (rare, only if a future dispatcher-side change
-    # passes the code through) or -32603 (the current behaviour). Accept both and verify the
-    # message references TestNotFound or the test name when -32603.
+    # ─── Sub-test 17: test.run_automation bogus name → job_id, then failed[] entry ─────────────
+    # POST-2026-05 contract: Lane B pre-validation crashed editor via GetValidTestNames AR walk.
+    # Pre-validation MOVED INTO GT job body. Bogus names now flow through:
+    #   Python wrapper validates non-empty → OK → dispatch_internal → C++ submitter → SubmitJob
+    #   → {job_id}. GT body resolves names; unresolved → failed[] entry with TEST_NOT_FOUND text.
+    # This sub-test polls the resulting job and verifies the failure surface.
     resp = call(args.host, args.port, "17", "p6-test-17", "test.run_automation",
                 {"test_names": ["Nonexistent.Bogus.Test.XYZ123"]})
-    err = expect_error(resp, "p6-test-17", (-32046, -32603), "17/run_automation bogus")
-    if err is None:
+    result = expect_ok(resp, "p6-test-17", "17/run_automation bogus submit")
+    if result is None:
         return 1
-    if err["code"] == -32603 and "Nonexistent" not in (err.get("message") or ""):
-        return fail(f"17/run_automation -32603 but message doesn't reference test name: {err!r}")
-    info(f"17/run_automation bogus name OK code={err['code']}")
+    job_id = result.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return fail(f"17/run_automation bogus: expected job_id, got {result!r}")
+    inner = poll_job_result(args.host, args.port, job_id, "17b/run_automation poll",
+                              timeout=15.0)
+    if inner is None:
+        return fail(f"17b/run_automation bogus: poll timeout/error for job {job_id}")
+    if not isinstance(inner, dict):
+        return fail(f"17b/run_automation bogus: poll returned non-dict {inner!r}")
+    failed_arr = inner.get("failed") or []
+    if not failed_arr:
+        return fail(f"17b/run_automation bogus: expected failed[] entry, got inner={inner!r}")
+    bogus_marker = any("Nonexistent" in str(f) or "not found" in str(f).lower()
+                        for f in failed_arr)
+    if not bogus_marker:
+        return fail(f"17b/run_automation bogus: no TEST_NOT_FOUND marker in failed[]={failed_arr!r}")
+    info(f"17/run_automation bogus OK ({len(failed_arr)} failed[] entries, TEST_NOT_FOUND-equiv marker present)")
 
     # ─── Sub-test 18: test.run_automation valid → {job_id}, poll job.result ────────────────────
     if probed_test is None:

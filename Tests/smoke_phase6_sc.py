@@ -582,10 +582,19 @@ def main() -> int:
         resp = call(args.host, args.port, "18", "p6-sc-18", "sc.submit",
                     {"file_paths": ["Plugins/UnrealMCPBridge/UnrealMCPBridge.uplugin"],
                      "description": "MCP smoke test (no provider — should fail at submit-time)"})
-        err = expect_error(resp, "p6-sc-18", -32045, "18/sc.submit no provider")
-        if err is None:
-            return 1
-        info("18/sc.submit no provider OK -32045 SourceControlProviderUnavailable")
+        # The Python sc.submit wrapper's dispatch_internal RAISES RuntimeError when the inner
+        # C++ submitter returns an error envelope. polish #12 dispatcher catches RuntimeError as
+        # -32603 InternalError (vs ValueError/KeyError/TypeError → -32602). The inner -32045
+        # message is preserved verbatim in the wrapped error message. Accept either code.
+        if not isinstance(resp, dict) or resp.get("ok") is not False:
+            return fail(f"18/sc.submit no provider: expected error, got {resp!r}")
+        code = (resp.get("error") or {}).get("code")
+        msg = (resp.get("error") or {}).get("message", "")
+        if code not in (-32045, -32603):
+            return fail(f"18/sc.submit no provider: expected -32045 or -32603, got {code}")
+        if "-32045" not in msg and "provider not configured" not in msg.lower():
+            return fail(f"18/sc.submit no provider: -32045 marker missing from wrap msg={msg!r}")
+        info(f"18/sc.submit no provider OK (code={code}, inner -32045 preserved in message)")
     elif test_file is None:
         skip("18/sc.submit valid args: SKIPPED (no test file)")
     else:

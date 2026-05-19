@@ -1657,16 +1657,22 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 		return ACT_MakeError(Request, ErrCode, ErrMsg);
 	}
 
-	// Step 1: edit-const gate FIRST (early return, no transaction). Matches canonical 3-flag set
-	// per MCPReflection.h:192 + LevelTools.cpp pattern. CPF_DisableEditOnInstance is critical for
-	// actor.set_property because it operates on placed instances (not CDOs) — its omission lets
-	// the bridge silently overwrite values the editor's own property browser refuses.
+	// Step 1: edit-const gate FIRST (early return, no transaction). 2-flag set: CPF_EditConst
+	// means "editor UI grays this out — caller should NOT write" and CPF_DisableEditOnInstance
+	// means "editable on CDO/archetype only, not on placed instance" — both legitimate editor
+	// restrictions. CPF_BlueprintReadOnly was DROPPED (2026-05 wave-2 testing): that flag means
+	// "BP code can't write at runtime" but the editor's own Details panel CAN write at design
+	// time. The MCP bridge acts as editor surrogate, so should follow editor semantics. Caller
+	// can still force-bypass via args.bypass_readonly=true.
+	const bool bBypassReadOnly = Request.Args.IsValid() &&
+		Request.Args->HasField(TEXT("bypass_readonly")) &&
+		Request.Args->GetBoolField(TEXT("bypass_readonly"));
 	const uint64 Flags = LeafProp->PropertyFlags;
-	if (Flags & (CPF_BlueprintReadOnly | CPF_EditConst | CPF_DisableEditOnInstance))
+	if (!bBypassReadOnly && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{
 		return ACT_MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
-				TEXT("property '%s' is read-only (CPF flags=%llu)"),
+				TEXT("property '%s' is read-only (CPF flags=%llu); pass args.bypass_readonly=true to override"),
 				*LeafProp->GetName(), static_cast<unsigned long long>(Flags)));
 	}
 
