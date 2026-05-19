@@ -74,4 +74,12 @@ namespace FPIETools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetPlayerController(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetPawn(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_FocusActor(const FMCPRequest& Request);
+
+	// 2026-05 Wave A — PIE functional testing surface.
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SimulateKey(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ClickScreen(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ClickActor(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetTimeDilation(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_GetStats(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_DumpWorldState(const FMCPRequest& Request);
 }

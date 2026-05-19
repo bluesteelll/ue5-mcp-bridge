@@ -26,6 +26,18 @@
 #include "Settings/LevelEditorPlaySettings.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
+#include "UObject/UObjectIterator.h"
+
+// Wave A: input simulation + stats.
+#include "Camera/PlayerCameraManager.h"
+#include "Framework/Application/SlateApplication.h"
+#include "GameFramework/PlayerInput.h"
+#include "HAL/PlatformMemory.h"
+#include "InputCoreTypes.h"
+
+// Engine globals for stats — extern forward decl matches UnrealEngine.cpp's definitions.
+extern ENGINE_API float GAverageFPS;
+extern ENGINE_API float GAverageMS;
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -909,6 +921,364 @@ FMCPResponse Tool_FocusActor(const FMCPRequest& Request)
 	return PIE_MakeSuccessObj(Request, Out);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Wave A 2026-05 — PIE functional testing surface.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+// ─── pie.simulate_key — keyboard/mouse-button input ─────────────────────────────────────────
+//
+// Args:
+//   - key:        string (required)  FKey name (e.g. "W", "Space", "F", "LeftMouseButton")
+//   - action:     string (optional)  "press" | "release" | "tap" (down+up). Default "tap".
+//   - player_index: int  (optional)  0
+//
+// Routes through PlayerController::InputKey rather than Slate so game-side input handlers
+// fire correctly. For pure UI focus events use pie.click_screen.
+FMCPResponse Tool_SimulateKey(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	if (!Request.Args.IsValid())
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("pie.simulate_key requires args.key"));
+	}
+	FString KeyName, Action(TEXT("tap"));
+	int32 PlayerIdx = 0;
+	if (!Request.Args->TryGetStringField(TEXT("key"), KeyName) || KeyName.IsEmpty())
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing required string 'key'"));
+	}
+	Request.Args->TryGetStringField(TEXT("action"), Action);
+	Request.Args->TryGetNumberField(TEXT("player_index"), PlayerIdx);
+
+	const FKey TheKey(*KeyName);
+	if (!TheKey.IsValid())
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+			FString::Printf(TEXT("unknown FKey name '%s' (see FKey reference, e.g. 'W', 'Space', 'LeftMouseButton')"), *KeyName));
+	}
+
+	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
+	if (!PC)
+	{
+		return PIE_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no PlayerController at player_index=%d"), PlayerIdx));
+	}
+
+	const FString ActionLower = Action.ToLower();
+	if (ActionLower == TEXT("press") || ActionLower == TEXT("tap"))
+	{
+		PC->InputKey(FInputKeyParams(TheKey, IE_Pressed, 1.0, false));
+	}
+	if (ActionLower == TEXT("release") || ActionLower == TEXT("tap"))
+	{
+		PC->InputKey(FInputKeyParams(TheKey, IE_Released, 0.0, false));
+	}
+	if (ActionLower != TEXT("press") && ActionLower != TEXT("release") && ActionLower != TEXT("tap"))
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+			FString::Printf(TEXT("unknown action '%s'; use 'press', 'release', or 'tap'"), *Action));
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("simulated"), true);
+	Out->SetStringField(TEXT("key"), KeyName);
+	Out->SetStringField(TEXT("action"), ActionLower);
+	return PIE_MakeSuccessObj(Request, Out);
+}
+
+// ─── pie.click_screen — synthesize a click at screen coordinates ────────────────────────────
+//
+// Args:
+//   - x, y:         number (required)
+//   - button:       string (optional)  "left" | "right" | "middle". Default "left".
+//   - player_index: int    (optional)  0
+//
+// Sends MouseButton DOWN + UP at the given screen coord through PC->InputKey AND moves cursor
+// position. Works for UI buttons (UMG OnClicked fires) AND world clicks (PC->ProjectMouseClick).
+FMCPResponse Tool_ClickScreen(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	if (!Request.Args.IsValid())
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("pie.click_screen requires args.x + args.y"));
+	}
+
+	double X = -1, Y = -1;
+	if (!Request.Args->TryGetNumberField(TEXT("x"), X) || !Request.Args->TryGetNumberField(TEXT("y"), Y))
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.x or args.y"));
+	}
+	FString Button(TEXT("left"));
+	Request.Args->TryGetStringField(TEXT("button"), Button);
+	int32 PlayerIdx = 0;
+	Request.Args->TryGetNumberField(TEXT("player_index"), PlayerIdx);
+
+	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
+	if (!PC)
+	{
+		return PIE_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no PlayerController at player_index=%d"), PlayerIdx));
+	}
+
+	FKey MouseKey = EKeys::LeftMouseButton;
+	const FString BLow = Button.ToLower();
+	if      (BLow == TEXT("left"))   { MouseKey = EKeys::LeftMouseButton; }
+	else if (BLow == TEXT("right"))  { MouseKey = EKeys::RightMouseButton; }
+	else if (BLow == TEXT("middle")) { MouseKey = EKeys::MiddleMouseButton; }
+	else
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+			FString::Printf(TEXT("unknown button '%s'; use left/right/middle"), *Button));
+	}
+
+	// Move cursor to (x,y) so UI hit-test routes correctly. UPlayerController has SetMouseLocation.
+	PC->SetMouseLocation(static_cast<int32>(X), static_cast<int32>(Y));
+
+	// Slate-level button event so UMG button OnClicked fires properly.
+	if (FSlateApplication::IsInitialized())
+	{
+		FSlateApplication& Slate = FSlateApplication::Get();
+		FPointerEvent PointerDown(0, FVector2D(X, Y), FVector2D(X, Y),
+			TSet<FKey>{MouseKey}, MouseKey,
+			0.f, FModifierKeysState());
+		Slate.ProcessMouseButtonDownEvent(nullptr, PointerDown);
+		FPointerEvent PointerUp(0, FVector2D(X, Y), FVector2D(X, Y),
+			TSet<FKey>(), MouseKey,
+			0.f, FModifierKeysState());
+		Slate.ProcessMouseButtonUpEvent(PointerUp);
+	}
+
+	// Game-side: InputKey press+release for in-world click handlers.
+	PC->InputKey(FInputKeyParams(MouseKey, IE_Pressed, 1.0, false));
+	PC->InputKey(FInputKeyParams(MouseKey, IE_Released, 0.0, false));
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("clicked"), true);
+	Out->SetNumberField(TEXT("x"), X);
+	Out->SetNumberField(TEXT("y"), Y);
+	Out->SetStringField(TEXT("button"), BLow);
+	return PIE_MakeSuccessObj(Request, Out);
+}
+
+// ─── pie.click_actor — project actor world pos to screen, then click ────────────────────────
+FMCPResponse Tool_ClickActor(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	if (!Request.Args.IsValid())
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("pie.click_actor requires args.actor_path"));
+	}
+	FString ActorPath, Button(TEXT("left"));
+	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath))
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.actor_path"));
+	}
+	Request.Args->TryGetStringField(TEXT("button"), Button);
+	int32 PlayerIdx = 0;
+	Request.Args->TryGetNumberField(TEXT("player_index"), PlayerIdx);
+
+	bool bAmbig = false;
+	FString AmbigHint, ResolveErr;
+	AActor* Target = FMCPActorPathUtils::ResolveActor(ActorPath, /*bRejectPIE*/ false,
+		bAmbig, AmbigHint, ResolveErr);
+	if (!Target)
+	{
+		return PIE_MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
+	}
+
+	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
+	if (!PC)
+	{
+		return PIE_MakeError(Request, kMCPErrorObjectNotFound, TEXT("no PlayerController for projection"));
+	}
+
+	FVector2D ScreenPos(0, 0);
+	const bool bProj = PC->ProjectWorldLocationToScreen(Target->GetActorLocation(), ScreenPos);
+	if (!bProj)
+	{
+		return PIE_MakeError(Request, kPIEErrorInternal,
+			TEXT("could not project actor world location to screen (behind camera?)"));
+	}
+
+	// Reuse Tool_ClickScreen by hand-constructing a click here (cheaper than re-dispatch).
+	const FString BLow = Button.ToLower();
+	FKey MouseKey = EKeys::LeftMouseButton;
+	if (BLow == TEXT("right"))  { MouseKey = EKeys::RightMouseButton; }
+	if (BLow == TEXT("middle")) { MouseKey = EKeys::MiddleMouseButton; }
+
+	PC->SetMouseLocation(static_cast<int32>(ScreenPos.X), static_cast<int32>(ScreenPos.Y));
+	if (FSlateApplication::IsInitialized())
+	{
+		FSlateApplication& Slate = FSlateApplication::Get();
+		FPointerEvent Down(0, ScreenPos, ScreenPos, TSet<FKey>{MouseKey}, MouseKey, 0.f, FModifierKeysState());
+		FPointerEvent Up  (0, ScreenPos, ScreenPos, TSet<FKey>(),         MouseKey, 0.f, FModifierKeysState());
+		Slate.ProcessMouseButtonDownEvent(nullptr, Down);
+		Slate.ProcessMouseButtonUpEvent(Up);
+	}
+	PC->InputKey(FInputKeyParams(MouseKey, IE_Pressed,  1.0, false));
+	PC->InputKey(FInputKeyParams(MouseKey, IE_Released, 0.0, false));
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("clicked"), true);
+	Out->SetStringField(TEXT("actor_path"), Target->GetPathName());
+	Out->SetNumberField(TEXT("screen_x"), ScreenPos.X);
+	Out->SetNumberField(TEXT("screen_y"), ScreenPos.Y);
+	Out->SetStringField(TEXT("button"), BLow);
+	return PIE_MakeSuccessObj(Request, Out);
+}
+
+// ─── pie.set_time_dilation — global time scale via UGameplayStatics::SetGlobalTimeDilation ──
+FMCPResponse Tool_SetTimeDilation(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	if (!Request.Args.IsValid())
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("pie.set_time_dilation requires args.scale"));
+	}
+	double Scale = 1.0;
+	if (!Request.Args->TryGetNumberField(TEXT("scale"), Scale))
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.scale"));
+	}
+	if (Scale < 0.0001 || Scale > 100.0)
+	{
+		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+			FString::Printf(TEXT("scale=%g outside [0.0001, 100.0]"), Scale));
+	}
+	const float Prior = UGameplayStatics::GetGlobalTimeDilation(GEditor->PlayWorld);
+	UGameplayStatics::SetGlobalTimeDilation(GEditor->PlayWorld, static_cast<float>(Scale));
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("applied"), true);
+	Out->SetNumberField(TEXT("prior_scale"), static_cast<double>(Prior));
+	Out->SetNumberField(TEXT("new_scale"), Scale);
+	return PIE_MakeSuccessObj(Request, Out);
+}
+
+// ─── pie.get_stats — collect runtime stats snapshot ────────────────────────────────────────
+FMCPResponse Tool_GetStats(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	UWorld* W = GEditor->PlayWorld;
+
+	const float DeltaTime = W->DeltaTimeSeconds;
+	const double InstantFPS = (DeltaTime > 0.f) ? (1.0 / DeltaTime) : 0.0;
+
+	// Average FPS via engine smoothed stats.
+	const double AvgFPS = static_cast<double>(GAverageFPS);
+	const double AvgMS  = static_cast<double>(GAverageMS);
+
+	const FPlatformMemoryStats MemStats = FPlatformMemory::GetStats();
+
+	int32 ActorCount = 0;
+	for (TActorIterator<AActor> It(W); It; ++It) { ++ActorCount; }
+
+	TSharedRef<FJsonObject> MemObj = MakeShared<FJsonObject>();
+	MemObj->SetNumberField(TEXT("used_physical_mb"),  static_cast<double>(MemStats.UsedPhysical)  / (1024.0 * 1024.0));
+	MemObj->SetNumberField(TEXT("used_virtual_mb"),   static_cast<double>(MemStats.UsedVirtual)   / (1024.0 * 1024.0));
+	MemObj->SetNumberField(TEXT("available_physical_mb"), static_cast<double>(MemStats.AvailablePhysical) / (1024.0 * 1024.0));
+	MemObj->SetNumberField(TEXT("peak_used_physical_mb"), static_cast<double>(MemStats.PeakUsedPhysical) / (1024.0 * 1024.0));
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetNumberField(TEXT("delta_time_ms"), static_cast<double>(DeltaTime) * 1000.0);
+	Out->SetNumberField(TEXT("instant_fps"),   InstantFPS);
+	Out->SetNumberField(TEXT("avg_fps"),       AvgFPS);
+	Out->SetNumberField(TEXT("avg_ms"),        AvgMS);
+	Out->SetObjectField(TEXT("memory"),        MemObj);
+	Out->SetNumberField(TEXT("actor_count"),   static_cast<double>(ActorCount));
+	Out->SetNumberField(TEXT("time_seconds"),  W->GetTimeSeconds());
+	Out->SetNumberField(TEXT("time_dilation"), static_cast<double>(UGameplayStatics::GetGlobalTimeDilation(W)));
+	Out->SetStringField(TEXT("world_path"),    W->GetPathName());
+	return PIE_MakeSuccessObj(Request, Out);
+}
+
+// ─── pie.dump_world_state — JSON snapshot of all PIE actors (compact form) ─────────────────
+FMCPResponse Tool_DumpWorldState(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	UWorld* W = GEditor->PlayWorld;
+
+	FString ClassFilter;
+	if (Request.Args.IsValid()) { Request.Args->TryGetStringField(TEXT("class_filter"), ClassFilter); }
+
+	UClass* FilterClass = nullptr;
+	if (!ClassFilter.IsEmpty())
+	{
+		FilterClass = LoadClass<UObject>(nullptr, *ClassFilter);
+		if (!FilterClass)
+		{
+			const FString WithC = ClassFilter.EndsWith(TEXT("_C")) ? ClassFilter : (ClassFilter + TEXT("_C"));
+			FilterClass = LoadClass<UObject>(nullptr, *WithC);
+		}
+		if (!FilterClass)
+		{
+			return PIE_MakeError(Request, kMCPErrorClassNotFound,
+				FString::Printf(TEXT("could not resolve class_filter '%s'"), *ClassFilter));
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Actors;
+	int32 Total = 0;
+	for (TActorIterator<AActor> It(W); It; ++It)
+	{
+		AActor* A = *It;
+		if (!A) { continue; }
+		if (FilterClass && !A->GetClass()->IsChildOf(FilterClass)) { continue; }
+		++Total;
+
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("actor_path"), A->GetPathName());
+		Obj->SetStringField(TEXT("class"),      A->GetClass()->GetPathName());
+		Obj->SetStringField(TEXT("label"),      A->GetActorLabel());
+
+		const FVector L = A->GetActorLocation();
+		const FRotator R = A->GetActorRotation();
+		const FVector S = A->GetActorScale3D();
+		TSharedRef<FJsonObject> TfObj = MakeShared<FJsonObject>();
+		TfObj->SetNumberField(TEXT("loc_x"), L.X); TfObj->SetNumberField(TEXT("loc_y"), L.Y); TfObj->SetNumberField(TEXT("loc_z"), L.Z);
+		TfObj->SetNumberField(TEXT("rot_p"), R.Pitch); TfObj->SetNumberField(TEXT("rot_y"), R.Yaw); TfObj->SetNumberField(TEXT("rot_r"), R.Roll);
+		TfObj->SetNumberField(TEXT("scl_x"), S.X); TfObj->SetNumberField(TEXT("scl_y"), S.Y); TfObj->SetNumberField(TEXT("scl_z"), S.Z);
+		Obj->SetObjectField(TEXT("transform"), TfObj);
+
+		Obj->SetBoolField(TEXT("hidden"),     A->IsHidden());
+		Obj->SetBoolField(TEXT("pending_kill"), !IsValid(A));
+		Actors.Add(MakeShared<FJsonValueObject>(Obj));
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("world_path"), W->GetPathName());
+	Out->SetNumberField(TEXT("total"),      static_cast<double>(Total));
+	Out->SetArrayField(TEXT("actors"),      Actors);
+	return PIE_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -917,6 +1287,14 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		Queue.RegisterHandler(MethodName, MoveTemp(Handler), bThreadSafe);
 		OutRegisteredMethodNames.Add(MethodName);
 	};
+
+	// Wave A 2026-05: PIE functional testing surface.
+	RegisterTool(TEXT("pie.simulate_key"),     &Tool_SimulateKey,     /*Lane A*/ false);
+	RegisterTool(TEXT("pie.click_screen"),     &Tool_ClickScreen,     /*Lane A*/ false);
+	RegisterTool(TEXT("pie.click_actor"),      &Tool_ClickActor,      /*Lane A*/ false);
+	RegisterTool(TEXT("pie.set_time_dilation"),&Tool_SetTimeDilation, /*Lane A*/ false);
+	RegisterTool(TEXT("pie.get_stats"),        &Tool_GetStats,        /*Lane A*/ false);
+	RegisterTool(TEXT("pie.dump_world_state"), &Tool_DumpWorldState,  /*Lane A*/ false);
 
 	// PIE lifecycle.
 	RegisterTool(TEXT("pie.start"),      &Tool_Start,      /*Lane A*/ false);
@@ -935,7 +1313,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("pie.focus_actor"),           &Tool_FocusActor,          /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 5 Chunk A: registered 10 pie.* handlers (lifecycle + introspection + actor identity, all Lane A)"));
+		TEXT("Phase 5 Chunk A + Wave A: registered 16 pie.* handlers (lifecycle + introspection + actor identity + input/stats/testing, all Lane A)"));
 }
 
 } // namespace FPIETools

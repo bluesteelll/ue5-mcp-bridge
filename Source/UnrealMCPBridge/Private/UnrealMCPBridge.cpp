@@ -31,6 +31,7 @@
 #include "Tools/SequencerTools.h"
 #include "Tools/SourceControlCompositeTools.h"
 #include "Tools/SourceControlTools.h"
+#include "Tools/StatsTools.h"
 #include "Tools/TestCompositeTools.h"
 #include "Tools/TestTools.h"
 #include "Tools/UFunctionTools.h"
@@ -258,6 +259,9 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// plus discovery tool. Covers UFlecsContainerLibrary + any future crafting/inventory
 	// BP function libraries without per-system bespoke tools.
 	FUFunctionTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave A 2026-05: stats surface (engine + memory snapshots, Lane A, editor-context safe).
+	FStatsTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038

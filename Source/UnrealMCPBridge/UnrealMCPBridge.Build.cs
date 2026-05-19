@@ -30,6 +30,7 @@ public class UnrealMCPBridge : ModuleRules
 				"Core",
 				"CoreUObject",
 				"Engine",
+				"InputCore",
 				"Json",
 				"JsonUtilities",
 			}
