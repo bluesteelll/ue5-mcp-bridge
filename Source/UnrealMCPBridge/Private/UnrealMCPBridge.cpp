@@ -419,6 +419,13 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// editor world otherwise (selectable transparently via world resolution helpers). New error codes
 	// landed in MCPTypes.h: -32039 WidgetNotFound, -32041 InvalidCollisionChannel; -32040 reserved for
 	// future niagara.set_user_param.
+	//
+	// Wave G Surface 1: physics.* runtime writes (4 tools, all Lane A, registered alongside the Phase
+	// 5 traces inside ``FPhysicsTools::Register``). apply_impulse / set_simulation / set_velocity /
+	// overlap_test wrap UPrimitiveComponent + UWorld::OverlapMultiByChannel. NO PIE guard, NO
+	// FScopedTransaction, NO MarkPackageDirty — physics state is runtime (Chaos solver), not an
+	// undoable asset edit. Reuses -32004 ObjectNotFound, -32011 WrongClass, -32602 InvalidParams,
+	// -32603 Internal, and -32041 InvalidCollisionChannel — no new codes added in MCPTypes.h.
 	FUMGTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FNiagaraTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FPhysicsTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);

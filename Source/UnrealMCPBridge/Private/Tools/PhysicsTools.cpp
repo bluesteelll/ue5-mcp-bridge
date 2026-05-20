@@ -5,14 +5,17 @@
 #include "FMCPDispatchQueue.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
+#include "Utils/MCPComponentPathUtils.h"
 #include "Utils/MCPWorldContext.h"
 
 #include "CollisionQueryParams.h"
 #include "CollisionShape.h"
+#include "Components/ActorComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Editor.h"
 #include "Engine/Engine.h"
 #include "Engine/HitResult.h"
+#include "Engine/OverlapResult.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
@@ -27,8 +30,10 @@
 namespace
 {
 	// PHY_ prefix per the unity-build symbol-collision pattern.
-	constexpr int32 kPHYErrorInvalidParams = -32602;
-	constexpr int32 kPHYErrorInternal      = -32603;
+	constexpr int32 kPHYErrorInvalidParams    = -32602;
+	constexpr int32 kPHYErrorInternal         = -32603;
+	constexpr int32 kPHYErrorObjectNotFound   = kMCPErrorObjectNotFound;  // -32004
+	constexpr int32 kPHYErrorWrongClass       = kMCPErrorWrongClass;      // -32011
 
 	void PHY_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
 	{
@@ -253,6 +258,47 @@ namespace
 			}
 		}
 		return IgnoredCount;
+	}
+
+	// ─── Component resolution (Wave G S1 writes) ────────────────────────────────────────────────
+
+	/**
+	 * Locate the target UPrimitiveComponent on an actor.
+	 *
+	 *   - Empty ``CompName``  → return Actor->GetRootComponent() cast to UPrimitiveComponent.
+	 *     Returns null if the root is non-primitive (e.g. USceneComponent on a billboard actor).
+	 *   - Non-empty           → iterate ``GetComponents(UPrimitiveComponent::StaticClass())`` and
+	 *     match against ``UActorComponent::GetName()`` (the internal FName, matches the wire
+	 *     ``component_name`` convention used elsewhere in MCP). Returns null on miss.
+	 *
+	 * ``bOutWrongClass`` is set true iff the supplied component name DID resolve to a UActorComponent
+	 * but the cast to UPrimitiveComponent failed (e.g. a USceneComponent or UMovementComponent name
+	 * was passed). Callers route this to -32011 WrongClass; a true "not found" leaves the flag false
+	 * and is routed to -32004 ObjectNotFound.
+	 */
+	UPrimitiveComponent* PHY_GetTargetPrimitive(AActor* Actor, const FString& CompName, bool& bOutWrongClass)
+	{
+		check(Actor);
+		bOutWrongClass = false;
+		if (CompName.IsEmpty())
+		{
+			return Cast<UPrimitiveComponent>(Actor->GetRootComponent());
+		}
+		// Look across ALL UActorComponents so we can distinguish "name found but not primitive"
+		// (-> kMCPErrorWrongClass) from "name not found at all" (-> kMCPErrorObjectNotFound).
+		TArray<UActorComponent*> Components;
+		Actor->GetComponents(UActorComponent::StaticClass(), Components);
+		for (UActorComponent* C : Components)
+		{
+			if (!C) { continue; }
+			if (C->GetName() == CompName)
+			{
+				if (UPrimitiveComponent* P = Cast<UPrimitiveComponent>(C)) { return P; }
+				bOutWrongClass = true;
+				return nullptr;
+			}
+		}
+		return nullptr;
 	}
 
 	// ─── FHitResult → JSON ───────────────────────────────────────────────────────────────────────
@@ -562,6 +608,534 @@ FMCPResponse Tool_SweepCapsule(const FMCPRequest& Request)
 	return PHY_MakeSuccessObj(Request, Out);
 }
 
+// ─── physics.apply_impulse ─────────────────────────────────────────────────────────────────────
+//
+// Args:
+//   actor_path     : string                             required
+//   impulse        : [x, y, z]                          required
+//   world_or_local : "world"|"local" (default "world")
+//   velocity_change: bool   (default false)             when true, impulse is treated as a
+//                                                       velocity delta (cm/s) ignoring mass — wraps
+//                                                       UPrimitiveComponent::AddImpulse's bVelChange
+//   component_name : string (default "" → root primitive)
+//
+// Result:
+//   {
+//     applied        : true,
+//     component_path : string,   // canonical "actor_path/component_name"
+//     impulse        : [x,y,z],  // the (world-space) impulse vector that was applied
+//     velocity_change: bool,     // echoed back
+//     world          : string,
+//     world_kind     : "PIE"|"Editor"|...
+//   }
+//
+// Errors:
+//   -32602 InvalidParams      missing/malformed args; invalid world_or_local
+//   -32004 ObjectNotFound     actor_path doesn't resolve OR component_name not found OR root is non-primitive
+//   -32011 WrongClass         component_name found but it's not a UPrimitiveComponent
+//   -32603 Internal           no world (commandlet)
+//
+// Notes:
+//   - NOT PIE-guarded. Operates on whichever world resolves (PIE > editor).
+//   - No FScopedTransaction / MarkPackageDirty — physics is runtime state, not an undoable asset edit.
+//   - For impulse to do anything visible the target must be ``IsSimulatingPhysics() == true``. We
+//     do NOT check or auto-enable here; caller pairs with ``physics.set_simulation`` when needed.
+FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!Request.Args.IsValid())
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FString ActorPath;
+	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
+	}
+
+	FVector ImpulseVec;
+	FString ArgErr;
+	if (!PHY_ReadVectorArray(Request.Args, TEXT("impulse"), ImpulseVec, ArgErr))
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+	}
+
+	FString WorldOrLocal = TEXT("world");
+	Request.Args->TryGetStringField(TEXT("world_or_local"), WorldOrLocal);
+	if (!WorldOrLocal.Equals(TEXT("world"), ESearchCase::IgnoreCase)
+		&& !WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase))
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams,
+			FString::Printf(TEXT("'world_or_local' must be 'world' or 'local' (got '%s')"), *WorldOrLocal));
+	}
+	const bool bLocal = WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase);
+
+	bool bVelocityChange = false;
+	Request.Args->TryGetBoolField(TEXT("velocity_change"), bVelocityChange);
+
+	FString CompName;
+	Request.Args->TryGetStringField(TEXT("component_name"), CompName);
+
+	UWorld* World = PHY_ResolveTraceWorld();
+	if (!World)
+	{
+		return PHY_MakeError(Request, kPHYErrorInternal,
+			TEXT("no world available (GEditor missing OR no level loaded)"));
+	}
+
+	bool bAmbiguous = false;
+	FString AmbiguityHint, ResolveErr;
+	AActor* Actor = FMCPActorPathUtils::ResolveActor(
+		ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
+	if (!Actor)
+	{
+		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
+	}
+
+	bool bWrongClass = false;
+	UPrimitiveComponent* Prim = PHY_GetTargetPrimitive(Actor, CompName, bWrongClass);
+	if (!Prim)
+	{
+		if (bWrongClass)
+		{
+			return PHY_MakeError(Request, kPHYErrorWrongClass,
+				FString::Printf(TEXT("component '%s' on actor '%s' is not a UPrimitiveComponent"),
+					*CompName, *ActorPath));
+		}
+		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+			CompName.IsEmpty()
+				? FString::Printf(TEXT("actor '%s' has no UPrimitiveComponent root"), *ActorPath)
+				: FString::Printf(TEXT("component '%s' not found on actor '%s'"), *CompName, *ActorPath));
+	}
+
+	FVector AppliedImpulse = ImpulseVec;
+	if (bLocal)
+	{
+		AppliedImpulse = Prim->GetComponentTransform().TransformVector(ImpulseVec);
+	}
+
+	Prim->AddImpulse(AppliedImpulse, NAME_None, bVelocityChange);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("applied"), true);
+	Out->SetStringField(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Prim));
+	Out->SetArrayField(TEXT("impulse"), PHY_VectorToArray(AppliedImpulse));
+	Out->SetBoolField(TEXT("velocity_change"), bVelocityChange);
+	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
+	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
+	return PHY_MakeSuccessObj(Request, Out);
+}
+
+// ─── physics.set_simulation ────────────────────────────────────────────────────────────────────
+//
+// Args:
+//   actor_path     : string  required
+//   simulate       : bool    required
+//   component_name : string  (default "" → root primitive; ignored when recurse=true)
+//   recurse        : bool    (default false) — when true, set SimulatePhysics on ALL primitive
+//                            components of the actor (component_name ignored).
+//
+// Result:
+//   recurse=false:
+//   {
+//     component_path     : string,
+//     prior_simulating   : bool,
+//     now_simulating     : bool,
+//     world / world_kind : ...
+//   }
+//   recurse=true:
+//   {
+//     recursive          : true,
+//     component_count    : int,
+//     components         : [{ component_path, prior_simulating, now_simulating }, ...],
+//     world / world_kind : ...
+//   }
+//
+// Errors: -32602 / -32004 / -32011 / -32603 (same family as apply_impulse).
+//
+// Notes:
+//   - "now_simulating" reads back ``IsSimulatingPhysics()`` AFTER the SetSimulatePhysics call so the
+//     caller sees the actual resulting state (some primitives — e.g. static-body USceneComponent
+//     subclasses — silently refuse the set). prior_simulating is the pre-call value.
+//   - Recursive form iterates ALL UPrimitiveComponents on the actor (including non-scene-attached
+//     ones, e.g. UInstancedStaticMeshComponent under a custom outer). NO undo / no transaction.
+FMCPResponse Tool_SetSimulation(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!Request.Args.IsValid())
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FString ActorPath;
+	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
+	}
+
+	bool bSimulate = false;
+	if (!Request.Args->TryGetBoolField(TEXT("simulate"), bSimulate))
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required bool field 'simulate'"));
+	}
+
+	bool bRecurse = false;
+	Request.Args->TryGetBoolField(TEXT("recurse"), bRecurse);
+
+	FString CompName;
+	Request.Args->TryGetStringField(TEXT("component_name"), CompName);
+
+	UWorld* World = PHY_ResolveTraceWorld();
+	if (!World)
+	{
+		return PHY_MakeError(Request, kPHYErrorInternal,
+			TEXT("no world available (GEditor missing OR no level loaded)"));
+	}
+
+	bool bAmbiguous = false;
+	FString AmbiguityHint, ResolveErr;
+	AActor* Actor = FMCPActorPathUtils::ResolveActor(
+		ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
+	if (!Actor)
+	{
+		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+
+	if (bRecurse)
+	{
+		TArray<UPrimitiveComponent*> Children;
+		Actor->GetComponents(UPrimitiveComponent::StaticClass(), Children);
+		TArray<TSharedPtr<FJsonValue>> Entries;
+		Entries.Reserve(Children.Num());
+		for (UPrimitiveComponent* P : Children)
+		{
+			if (!P) { continue; }
+			const bool bPrior = P->IsSimulatingPhysics();
+			P->SetSimulatePhysics(bSimulate);
+			const bool bNow = P->IsSimulatingPhysics();
+			TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(P));
+			Entry->SetBoolField(TEXT("prior_simulating"), bPrior);
+			Entry->SetBoolField(TEXT("now_simulating"), bNow);
+			Entries.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+		Out->SetBoolField(TEXT("recursive"), true);
+		Out->SetNumberField(TEXT("component_count"), Entries.Num());
+		Out->SetArrayField(TEXT("components"), Entries);
+	}
+	else
+	{
+		bool bWrongClass = false;
+		UPrimitiveComponent* Prim = PHY_GetTargetPrimitive(Actor, CompName, bWrongClass);
+		if (!Prim)
+		{
+			if (bWrongClass)
+			{
+				return PHY_MakeError(Request, kPHYErrorWrongClass,
+					FString::Printf(TEXT("component '%s' on actor '%s' is not a UPrimitiveComponent"),
+						*CompName, *ActorPath));
+			}
+			return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+				CompName.IsEmpty()
+					? FString::Printf(TEXT("actor '%s' has no UPrimitiveComponent root"), *ActorPath)
+					: FString::Printf(TEXT("component '%s' not found on actor '%s'"), *CompName, *ActorPath));
+		}
+
+		const bool bPrior = Prim->IsSimulatingPhysics();
+		Prim->SetSimulatePhysics(bSimulate);
+		const bool bNow = Prim->IsSimulatingPhysics();
+
+		Out->SetBoolField(TEXT("recursive"), false);
+		Out->SetStringField(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Prim));
+		Out->SetBoolField(TEXT("prior_simulating"), bPrior);
+		Out->SetBoolField(TEXT("now_simulating"), bNow);
+	}
+
+	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
+	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
+	return PHY_MakeSuccessObj(Request, Out);
+}
+
+// ─── physics.set_velocity ──────────────────────────────────────────────────────────────────────
+//
+// Args:
+//   actor_path     : string  required
+//   linear         : [x, y, z]                        optional
+//   angular        : [x, y, z] in degrees/sec         optional
+//   component_name : string  (default "" → root primitive)
+//   world_or_local : "world"|"local" (default "world") — affects ``linear`` only;
+//                                                       angular is always world-space (matches
+//                                                       SetPhysicsAngularVelocityInDegrees API)
+//
+// At least ONE of ``linear`` / ``angular`` must be supplied. Both absent → -32602.
+//
+// Result:
+//   {
+//     component_path : string,
+//     prior_linear   : [x,y,z], prior_angular : [x,y,z],
+//     new_linear     : [x,y,z], new_angular   : [x,y,z],
+//     world / world_kind : ...
+//   }
+//
+// Errors: -32602 / -32004 / -32011 / -32603 (same family).
+FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!Request.Args.IsValid())
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FString ActorPath;
+	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
+	}
+
+	const bool bHasLinear  = Request.Args->HasField(TEXT("linear"));
+	const bool bHasAngular = Request.Args->HasField(TEXT("angular"));
+	if (!bHasLinear && !bHasAngular)
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams,
+			TEXT("at least one of 'linear' or 'angular' must be supplied"));
+	}
+
+	FVector LinearVec = FVector::ZeroVector;
+	FVector AngularVec = FVector::ZeroVector;
+	FString ArgErr;
+	if (bHasLinear)
+	{
+		if (!PHY_ReadVectorArray(Request.Args, TEXT("linear"), LinearVec, ArgErr))
+		{
+			return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		}
+	}
+	if (bHasAngular)
+	{
+		if (!PHY_ReadVectorArray(Request.Args, TEXT("angular"), AngularVec, ArgErr))
+		{
+			return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		}
+	}
+
+	FString WorldOrLocal = TEXT("world");
+	Request.Args->TryGetStringField(TEXT("world_or_local"), WorldOrLocal);
+	if (!WorldOrLocal.Equals(TEXT("world"), ESearchCase::IgnoreCase)
+		&& !WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase))
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams,
+			FString::Printf(TEXT("'world_or_local' must be 'world' or 'local' (got '%s')"), *WorldOrLocal));
+	}
+	const bool bLocal = WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase);
+
+	FString CompName;
+	Request.Args->TryGetStringField(TEXT("component_name"), CompName);
+
+	UWorld* World = PHY_ResolveTraceWorld();
+	if (!World)
+	{
+		return PHY_MakeError(Request, kPHYErrorInternal,
+			TEXT("no world available (GEditor missing OR no level loaded)"));
+	}
+
+	bool bAmbiguous = false;
+	FString AmbiguityHint, ResolveErr;
+	AActor* Actor = FMCPActorPathUtils::ResolveActor(
+		ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
+	if (!Actor)
+	{
+		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
+	}
+
+	bool bWrongClass = false;
+	UPrimitiveComponent* Prim = PHY_GetTargetPrimitive(Actor, CompName, bWrongClass);
+	if (!Prim)
+	{
+		if (bWrongClass)
+		{
+			return PHY_MakeError(Request, kPHYErrorWrongClass,
+				FString::Printf(TEXT("component '%s' on actor '%s' is not a UPrimitiveComponent"),
+					*CompName, *ActorPath));
+		}
+		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+			CompName.IsEmpty()
+				? FString::Printf(TEXT("actor '%s' has no UPrimitiveComponent root"), *ActorPath)
+				: FString::Printf(TEXT("component '%s' not found on actor '%s'"), *CompName, *ActorPath));
+	}
+
+	const FVector PriorLin = Prim->GetPhysicsLinearVelocity();
+	const FVector PriorAng = Prim->GetPhysicsAngularVelocityInDegrees();
+
+	if (bHasLinear)
+	{
+		FVector V = LinearVec;
+		if (bLocal)
+		{
+			V = Prim->GetComponentTransform().TransformVector(LinearVec);
+		}
+		Prim->SetPhysicsLinearVelocity(V, /*bAddToCurrent*/ false);
+	}
+	if (bHasAngular)
+	{
+		// Angular is always world-space — SetPhysicsAngularVelocityInDegrees doesn't model a local
+		// frame on the wire side, and rotating a (pitch,yaw,roll) deg/sec triplet through the
+		// component transform doesn't have a single canonical meaning.
+		Prim->SetPhysicsAngularVelocityInDegrees(AngularVec, /*bAddToCurrent*/ false);
+	}
+
+	const FVector NewLin = Prim->GetPhysicsLinearVelocity();
+	const FVector NewAng = Prim->GetPhysicsAngularVelocityInDegrees();
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Prim));
+	Out->SetArrayField(TEXT("prior_linear"),  PHY_VectorToArray(PriorLin));
+	Out->SetArrayField(TEXT("prior_angular"), PHY_VectorToArray(PriorAng));
+	Out->SetArrayField(TEXT("new_linear"),    PHY_VectorToArray(NewLin));
+	Out->SetArrayField(TEXT("new_angular"),   PHY_VectorToArray(NewAng));
+	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
+	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
+	return PHY_MakeSuccessObj(Request, Out);
+}
+
+// ─── physics.overlap_test ──────────────────────────────────────────────────────────────────────
+//
+// Args:
+//   location       : [x, y, z]                        required
+//   radius         : number                           required, > 0
+//   channel        : string (default "WorldStatic")
+//   ignore_actors  : array<string> (default [])
+//
+// Result:
+//   {
+//     world / world_kind : ...,
+//     ignored_count : int,
+//     hit_count     : int,
+//     hits          : [
+//       { actor_guid, actor_path, component, location, blocking }, ...
+//     ]
+//   }
+//
+// Errors:
+//   -32602 InvalidParams              missing/malformed args, radius <= 0
+//   -32041 InvalidCollisionChannel    channel string unknown
+//   -32603 Internal                   no world
+//
+// Notes:
+//   - Sphere only — for box/capsule overlaps use the dedicated sweep tools.
+//   - ``location`` in FOverlapResult JSON comes from ``Component->GetComponentLocation()`` (overlaps
+//     don't carry a single impact point the way hits do). It's a "where is the overlapping body's
+//     anchor" hint, not an intersection point.
+//   - **Channel default differs from line_trace/sweep_capsule.** Overlap callers typically want
+//     "what static geometry am I touching at this point" — Visibility is rarely the answer because
+//     UE meshes default to NoCollision on the Visibility channel. WorldStatic is the natural default
+//     and is documented in the channel-list message.
+FMCPResponse Tool_OverlapTest(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!Request.Args.IsValid())
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FVector Location;
+	FString ArgErr;
+	if (!PHY_ReadVectorArray(Request.Args, TEXT("location"), Location, ArgErr))
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+	}
+
+	double Radius = 0.0;
+	if (!PHY_ReadClampedNumber(Request.Args, TEXT("radius"), 0.001, 1000000.0, Radius, ArgErr))
+	{
+		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+	}
+
+	// Channel default = "WorldStatic" (NOT Visibility — see header comment). Empty string also OK,
+	// PHY_ParseCollisionChannel maps empty to Visibility, but for overlap we want WorldStatic.
+	FString ChannelStr = TEXT("WorldStatic");
+	Request.Args->TryGetStringField(TEXT("channel"), ChannelStr);
+	if (ChannelStr.IsEmpty()) { ChannelStr = TEXT("WorldStatic"); }
+	ECollisionChannel Channel = ECC_WorldStatic;
+	if (!PHY_ParseCollisionChannel(ChannelStr, Channel))
+	{
+		return PHY_MakeError(Request, kMCPErrorInvalidCollisionChannel,
+			FString::Printf(TEXT("channel '%s' not recognised; accepted: %s"),
+				*ChannelStr, PHY_AcceptedChannelNames));
+	}
+
+	UWorld* World = PHY_ResolveTraceWorld();
+	if (!World)
+	{
+		return PHY_MakeError(Request, kPHYErrorInternal,
+			TEXT("no world available (GEditor missing OR no level loaded)"));
+	}
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(MCPOverlap), /*bTraceComplex*/ false);
+	const int32 IgnoredCount = PHY_AddIgnoredActors(Request.Args, Params);
+
+	TArray<FOverlapResult> Overlaps;
+	World->OverlapMultiByChannel(
+		Overlaps,
+		Location,
+		FQuat::Identity,
+		Channel,
+		FCollisionShape::MakeSphere(static_cast<float>(Radius)),
+		Params);
+
+	TArray<TSharedPtr<FJsonValue>> HitsArr;
+	HitsArr.Reserve(Overlaps.Num());
+	for (const FOverlapResult& O : Overlaps)
+	{
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		AActor* HitActor = O.GetActor();
+		if (HitActor)
+		{
+			const FGuid Guid = HitActor->GetActorGuid();
+			Obj->SetStringField(TEXT("actor_guid"),
+				Guid.IsValid() ? Guid.ToString(EGuidFormats::DigitsWithHyphens) : FString());
+			Obj->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(HitActor));
+		}
+		else
+		{
+			Obj->SetField(TEXT("actor_guid"), MakeShared<FJsonValueNull>());
+			Obj->SetField(TEXT("actor_path"), MakeShared<FJsonValueNull>());
+		}
+
+		UPrimitiveComponent* HitComp = O.GetComponent();
+		if (HitComp)
+		{
+			Obj->SetStringField(TEXT("component"), HitComp->GetName());
+			Obj->SetArrayField(TEXT("location"), PHY_VectorToArray(HitComp->GetComponentLocation()));
+		}
+		else
+		{
+			Obj->SetField(TEXT("component"), MakeShared<FJsonValueNull>());
+			Obj->SetField(TEXT("location"),  MakeShared<FJsonValueNull>());
+		}
+
+		Obj->SetBoolField(TEXT("blocking"), O.bBlockingHit != 0);
+		HitsArr.Add(MakeShared<FJsonValueObject>(Obj));
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
+	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
+	Out->SetNumberField(TEXT("ignored_count"), IgnoredCount);
+	Out->SetNumberField(TEXT("hit_count"), HitsArr.Num());
+	Out->SetArrayField(TEXT("hits"), HitsArr);
+	return PHY_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -571,11 +1145,18 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
+	// Phase 5 Chunk C — read-only traces.
 	RegisterTool(TEXT("physics.line_trace"),    &Tool_LineTrace,    /*Lane A*/ false);
 	RegisterTool(TEXT("physics.sweep_capsule"), &Tool_SweepCapsule, /*Lane A*/ false);
 
+	// Wave G Surface 1 — runtime mutation (impulse / sim toggle / velocity / overlap).
+	RegisterTool(TEXT("physics.apply_impulse"),  &Tool_ApplyImpulse,  /*Lane A*/ false);
+	RegisterTool(TEXT("physics.set_simulation"), &Tool_SetSimulation, /*Lane A*/ false);
+	RegisterTool(TEXT("physics.set_velocity"),   &Tool_SetVelocity,   /*Lane A*/ false);
+	RegisterTool(TEXT("physics.overlap_test"),   &Tool_OverlapTest,   /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 5 Chunk C (Physics): registered 2 physics.* handlers (line_trace + sweep_capsule, all Lane A)"));
+		TEXT("Phase 5 Chunk C + Wave G S1 (Physics): registered 6 physics.* handlers (2 traces + 4 writes, all Lane A)"));
 }
 
 } // namespace FPhysicsTools

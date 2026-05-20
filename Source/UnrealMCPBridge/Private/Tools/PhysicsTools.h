@@ -8,19 +8,37 @@
 class FMCPDispatchQueue;
 
 /**
- * Phase 5 — Chunk C, Category E (Physics traces). 2 user-visible tools, all Lane A.
+ * Phase 5 — Chunk C, Category E (Physics traces). 2 read tools (Phase 5) + 4 write tools (Wave G S1),
+ * 6 user-visible tools total. All Lane A.
  *
- * Tool roster (per Phase 5 plan §C-Physics lines 799-896):
- *   physics.line_trace      → line trace from start to end against a collision channel
- *   physics.sweep_capsule   → capsule sweep with optional rotation
+ * Tool roster:
+ *   Phase 5 Chunk C — read-only traces:
+ *     physics.line_trace        → line trace from start to end against a collision channel
+ *     physics.sweep_capsule     → capsule sweep with optional rotation
+ *   Wave G Surface 1 — runtime mutation:
+ *     physics.apply_impulse     → AddImpulse on a UPrimitiveComponent (world/local frame)
+ *     physics.set_simulation    → SetSimulatePhysics on/off (single or recursive)
+ *     physics.set_velocity      → SetPhysicsLinearVelocity + SetPhysicsAngularVelocityInDegrees
+ *     physics.overlap_test      → OverlapMultiByChannel sphere query at a world point
  *
- * **All 2 tools are Lane A** (``bThreadSafe=false``). Reasons:
- *   - ``UWorld::LineTraceMultiByChannel`` / ``SweepMultiByChannel`` walk Chaos physics state under
- *     scene locks — calling from non-GT can deadlock with the physics tick.
+ * **All 6 tools are Lane A** (``bThreadSafe=false``). Reasons:
+ *   - ``UWorld::LineTraceMultiByChannel`` / ``SweepMultiByChannel`` / ``OverlapMultiByChannel`` walk
+ *     Chaos physics state under scene locks — calling from non-GT can deadlock with the physics tick.
+ *   - ``UPrimitiveComponent::AddImpulse`` / ``SetSimulatePhysics`` / ``SetPhysicsLinearVelocity`` /
+ *     ``SetPhysicsAngularVelocityInDegrees`` all reach into the Chaos solver under the same lock
+ *     and require GT.
  *   - PIE world resolution touches ``GEditor->PlayWorld`` and the global world-context array,
  *     both GT-only.
- *   - Actor resolution for ``ignore_actors`` uses ``FMCPActorPathUtils::ResolveActor`` which
- *     walks ``UWorld::GetLevels`` (GT-only).
+ *   - Actor resolution for ``ignore_actors`` / ``actor_path`` uses ``FMCPActorPathUtils::ResolveActor``
+ *     which walks ``UWorld::GetLevels`` (GT-only).
+ *
+ * **PIE guard policy — runtime physics tools are NOT PIE-guarded.** The four Wave-G writes
+ * (apply_impulse / set_simulation / set_velocity / overlap_test) operate transparently on whichever
+ * world resolves first (PIE > editor) just like the traces. Physics manipulation is a runtime concern
+ * (Chaos solver state) rather than an undoable asset edit — no FScopedTransaction, no MarkPackageDirty.
+ * The caller is responsible for choosing the correct world context (start PIE first if the intent is
+ * runtime sim manipulation; otherwise the editor-world bodies are typically inert until simulation
+ * is enabled).
  *
  * **World selection.** PIE world takes precedence when ``GEditor->PlayWorld`` is non-null;
  * otherwise the editor world from ``FMCPWorldContext::GetEditorWorld()``. This mirrors the
@@ -60,7 +78,13 @@ namespace FPhysicsTools
 {
 	UNREALMCPBRIDGE_API void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames);
 
-	// ─── Category E: Physics traces ─────────────────────────────────────────────────────────────
+	// ─── Category E: Physics traces (Phase 5 Chunk C) ───────────────────────────────────────────
 	UNREALMCPBRIDGE_API FMCPResponse Tool_LineTrace(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_SweepCapsule(const FMCPRequest& Request);
+
+	// ─── Wave G Surface 1: runtime physics writes ────────────────────────────────────────────────
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetSimulation(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetVelocity(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_OverlapTest(const FMCPRequest& Request);
 }
