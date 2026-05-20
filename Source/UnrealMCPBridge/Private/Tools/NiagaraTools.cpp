@@ -10,13 +10,16 @@
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraEmitterFactoryNew.h"
+#include "NiagaraFunctionLibrary.h"
 #include "NiagaraParameterStore.h"
 #include "NiagaraScript.h"
 #include "NiagaraSystem.h"
 #include "NiagaraTypes.h"
 #include "NiagaraUserRedirectionParameterStore.h"
+#include "Engine/World.h"
 #include "UObject/Class.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UObjectIterator.h"
 
 #include "AssetToolsModule.h"
 #include "Editor.h"
@@ -524,6 +527,71 @@ namespace
 		return false;
 	}
 
+	// ─── world resolution (Wave E S2 runtime tools) ─────────────────────────────────────────────
+	//
+	// Mirrors DebugTools / PhysicsTools — PIE world first ("the window the user is watching"),
+	// editor world fallback. Returns null only when GEditor itself is missing (commandlet / cooker).
+	UWorld* NIA_ResolveWorld()
+	{
+		check(IsInGameThread());
+		if (GEditor && GEditor->PlayWorld)
+		{
+			return GEditor->PlayWorld;
+		}
+		return FMCPWorldContext::GetEditorWorld();
+	}
+
+	const TCHAR* NIA_WorldKindName(const UWorld* World)
+	{
+		if (!World) { return TEXT("none"); }
+		return World->WorldType == EWorldType::PIE ? TEXT("pie") : TEXT("editor");
+	}
+
+	/** Required [x,y,z] number array. Populates OutError + returns false on missing/malformed. */
+	bool NIA_ReadVector3(
+		const TSharedPtr<FJsonObject>& Args,
+		const TCHAR* FieldName,
+		FVector& OutV,
+		FString& OutError)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!Args.IsValid() || !Args->TryGetArrayField(FieldName, Arr) || !Arr)
+		{
+			OutError = FString::Printf(TEXT("missing required array field '%s' ([x,y,z])"), FieldName);
+			return false;
+		}
+		if (Arr->Num() != 3)
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' must be [x,y,z] (3 numbers); got %d entries"), FieldName, Arr->Num());
+			return false;
+		}
+		double X = 0.0, Y = 0.0, Z = 0.0;
+		if (!(*Arr)[0]->TryGetNumber(X) || !(*Arr)[1]->TryGetNumber(Y) || !(*Arr)[2]->TryGetNumber(Z))
+		{
+			OutError = FString::Printf(TEXT("'%s' entries must all be numbers"), FieldName);
+			return false;
+		}
+		OutV = FVector(X, Y, Z);
+		return true;
+	}
+
+	/** Optional [x,y,z] number array. Returns DefaultValue when missing; errors when present-but-malformed. */
+	bool NIA_ReadOptionalVector3(
+		const TSharedPtr<FJsonObject>& Args,
+		const TCHAR* FieldName,
+		const FVector& DefaultValue,
+		FVector& OutV,
+		FString& OutError)
+	{
+		if (!Args.IsValid() || !Args->HasField(FieldName))
+		{
+			OutV = DefaultValue;
+			return true;
+		}
+		return NIA_ReadVector3(Args, FieldName, OutV, OutError);
+	}
+
 	/** Find a Niagara user-param by FName. Returns whether it was found + writes Var by-ref. */
 	bool NIA_FindUserParamByName(
 		const FNiagaraUserRedirectionParameterStore& Store,
@@ -973,6 +1041,194 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 	return NIA_MakeSuccessObj(Request, Out);
 }
 
+// ─── niagara.spawn_at_location ────────────────────────────────────────────────────────────────
+//
+// Args:    { system_path: string, location: [x,y,z], rotation?: [pitch,yaw,roll] degrees,
+//            scale?: [x,y,z] (default [1,1,1]), auto_destroy?: bool (default true) }
+// Result:  { component_path: string, world: "editor"|"pie" }
+//
+// One-shot spawn via UNiagaraFunctionLibrary::SpawnSystemAtLocation. NO PIE guard — works in
+// both editor and PIE worlds. World resolution: PIE first, editor fallback (mirrors DebugTools).
+//
+// Errors:
+//   -32602 InvalidParams      missing system_path / location, or malformed vector
+//   -32010 InvalidPath        system_path malformed / unknown mount
+//   -32004 ObjectNotFound     system asset couldn't be loaded
+//   -32011 WrongClass         asset isn't UNiagaraSystem
+//   -32603 InternalError      no world available (GEditor missing — commandlet/cooker)
+//                             OR SpawnSystemAtLocation returned null (e.g. system invalid for spawn)
+FMCPResponse Tool_SpawnAtLocation(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	UWorld* World = NIA_ResolveWorld();
+	if (!World)
+	{
+		return NIA_MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
+	}
+
+	FString Path;
+	FMCPResponse Err;
+	if (!NIA_RequireStringField(Request, TEXT("system_path"), Path, Err)) { return Err; }
+
+	FVector Location, Rotation, Scale;
+	FString ErrStr;
+	if (!NIA_ReadVector3(Request.Args, TEXT("location"), Location, ErrStr))
+	{
+		return NIA_MakeError(Request, kNIAErrorInvalidParams, ErrStr);
+	}
+	if (!NIA_ReadOptionalVector3(Request.Args, TEXT("rotation"), FVector::ZeroVector, Rotation, ErrStr))
+	{
+		return NIA_MakeError(Request, kNIAErrorInvalidParams, ErrStr);
+	}
+	if (!NIA_ReadOptionalVector3(Request.Args, TEXT("scale"), FVector(1.0, 1.0, 1.0), Scale, ErrStr))
+	{
+		return NIA_MakeError(Request, kNIAErrorInvalidParams, ErrStr);
+	}
+
+	bool bAutoDestroy = true;
+	Request.Args->TryGetBoolField(TEXT("auto_destroy"), bAutoDestroy);
+
+	int32 ErrCode = 0;
+	FString ErrMsg;
+	UNiagaraSystem* System = NIA_LoadNiagaraSystemByPath(Path, ErrCode, ErrMsg);
+	if (!System) { return NIA_MakeError(Request, ErrCode, ErrMsg); }
+
+	// [pitch, yaw, roll] (degrees) → FRotator.
+	const FRotator Rot(
+		static_cast<float>(Rotation.X),
+		static_cast<float>(Rotation.Y),
+		static_cast<float>(Rotation.Z));
+
+	UNiagaraComponent* Comp = UNiagaraFunctionLibrary::SpawnSystemAtLocation(
+		World, System, Location, Rot, Scale,
+		bAutoDestroy, /*bAutoActivate*/ true,
+		ENCPoolMethod::None, /*bPreCullCheck*/ true);
+
+	if (!Comp)
+	{
+		return NIA_MakeError(Request, kNIAErrorInternal,
+			FString::Printf(TEXT("UNiagaraFunctionLibrary::SpawnSystemAtLocation returned null for system '%s' "
+				"(asset may be invalid for spawning, or world is uninitialised)"),
+				*System->GetPathName()));
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("component_path"), Comp->GetPathName());
+	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
+	Out->SetBoolField(TEXT("auto_destroy"), bAutoDestroy);
+	return NIA_MakeSuccessObj(Request, Out);
+}
+
+// ─── niagara.stop_all ─────────────────────────────────────────────────────────────────────────
+//
+// Args:    (none)
+// Result:  { stopped_count: int, world: "editor"|"pie" }
+//
+// Enumerate every live UNiagaraComponent in the current world via TObjectIterator (filtered by
+// GetWorld()), call DeactivateImmediate() on each. NO PIE guard. Returns the number of components
+// that were active when stopped.
+//
+// Errors:
+//   -32603 InternalError      no world available
+FMCPResponse Tool_StopAll(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	UWorld* World = NIA_ResolveWorld();
+	if (!World)
+	{
+		return NIA_MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
+	}
+
+	int32 StoppedCount = 0;
+	for (TObjectIterator<UNiagaraComponent> It; It; ++It)
+	{
+		UNiagaraComponent* NC = *It;
+		if (!IsValid(NC)) { continue; }
+		if (NC->GetWorld() != World) { continue; }
+		// IsActive captures the engine's "running" state; pooled-but-released components return false.
+		if (!NC->IsActive()) { continue; }
+		NC->DeactivateImmediate();
+		++StoppedCount;
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetNumberField(TEXT("stopped_count"), static_cast<double>(StoppedCount));
+	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
+	return NIA_MakeSuccessObj(Request, Out);
+}
+
+// ─── niagara.list_active ──────────────────────────────────────────────────────────────────────
+//
+// Args:    (none)
+// Result:  { components: [{ component_path, owner_actor?, asset_path?, location, is_active,
+//                            last_render_time }, ...],
+//            count: int,
+//            world: "editor"|"pie" }
+//
+// Walks TObjectIterator<UNiagaraComponent> filtered to the current world. Reports both active
+// and recently-deactivated components (filter by ``is_active`` field on the caller side if you
+// want only running ones). ``owner_actor`` is the outer AActor's path name if attached, else
+// omitted (one-shot spawns parent themselves to the persistent level world settings, which is
+// still an AActor — just typically the WorldSettings). NO PIE guard.
+//
+// ``last_render_time`` is ``UPrimitiveComponent::GetLastRenderTime()`` — the engine's
+// game-time-seconds of the last frame this component was rendered. Compare against
+// ``World->GetTimeSeconds()`` for "age since rendered".
+//
+// Errors:
+//   -32603 InternalError      no world available
+FMCPResponse Tool_ListActive(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	UWorld* World = NIA_ResolveWorld();
+	if (!World)
+	{
+		return NIA_MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Components;
+	for (TObjectIterator<UNiagaraComponent> It; It; ++It)
+	{
+		UNiagaraComponent* NC = *It;
+		if (!IsValid(NC)) { continue; }
+		if (NC->GetWorld() != World) { continue; }
+
+		TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("component_path"), NC->GetPathName());
+
+		if (AActor* Owner = NC->GetOwner())
+		{
+			Entry->SetStringField(TEXT("owner_actor"), Owner->GetPathName());
+		}
+
+		if (UNiagaraSystem* Asset = NC->GetAsset())
+		{
+			Entry->SetStringField(TEXT("asset_path"), Asset->GetPathName());
+		}
+
+		const FVector Loc = NC->GetComponentLocation();
+		TArray<TSharedPtr<FJsonValue>> LocArr;
+		LocArr.Add(MakeShared<FJsonValueNumber>(Loc.X));
+		LocArr.Add(MakeShared<FJsonValueNumber>(Loc.Y));
+		LocArr.Add(MakeShared<FJsonValueNumber>(Loc.Z));
+		Entry->SetArrayField(TEXT("location"), LocArr);
+
+		Entry->SetBoolField(TEXT("is_active"), NC->IsActive());
+		Entry->SetNumberField(TEXT("last_render_time"), static_cast<double>(NC->GetLastRenderTime()));
+
+		Components.Add(MakeShared<FJsonValueObject>(Entry));
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetArrayField(TEXT("components"), Components);
+	Out->SetNumberField(TEXT("count"), static_cast<double>(Components.Num()));
+	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
+	return NIA_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -987,9 +1243,13 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("niagara.set_user_param"),      &Tool_SetUserParam,      /*Lane A*/ false);
 	RegisterTool(TEXT("niagara.create_emitter"),      &Tool_CreateEmitter,     /*Lane A*/ false);
 	RegisterTool(TEXT("niagara.set_emitter_enabled"), &Tool_SetEmitterEnabled, /*Lane A*/ false);
+	// Wave E S2 (2026-05): Niagara runtime spawn / lifecycle.
+	RegisterTool(TEXT("niagara.spawn_at_location"),   &Tool_SpawnAtLocation,   /*Lane A*/ false);
+	RegisterTool(TEXT("niagara.stop_all"),            &Tool_StopAll,           /*Lane A*/ false);
+	RegisterTool(TEXT("niagara.list_active"),         &Tool_ListActive,        /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Niagara surface registered: 1 read (list_parameters) + 3 writes (set_user_param / create_emitter / set_emitter_enabled), all Lane A"));
+		TEXT("Niagara surface registered: 1 read (list_parameters) + 3 writes (set_user_param / create_emitter / set_emitter_enabled) + 3 runtime (spawn_at_location / stop_all / list_active), all Lane A"));
 }
 
 } // namespace FNiagaraTools

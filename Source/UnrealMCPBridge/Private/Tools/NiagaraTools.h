@@ -8,14 +8,17 @@
 class FMCPDispatchQueue;
 
 /**
- * Phase 5 — Chunk C, Category D (Niagara read-only) + Wave B (Niagara writes).
- * 4 user-visible tools, all Lane A.
+ * Phase 5 — Chunk C, Category D (Niagara read-only) + Wave B (Niagara writes) + Wave E S2 (runtime).
+ * 7 user-visible tools, all Lane A.
  *
  * Tool roster:
  *   niagara.list_parameters       → enumerate user / system / emitter-scoped parameters of a System (Phase 5)
  *   niagara.set_user_param        → write a typed value into UNiagaraSystem::GetExposedParameters() (Wave B)
  *   niagara.create_emitter        → spawn a UNiagaraEmitter asset via UNiagaraEmitterFactoryNew (Wave B)
  *   niagara.set_emitter_enabled   → toggle UNiagaraComponent::SetEmitterEnable on a placed actor (Wave B)
+ *   niagara.spawn_at_location     → one-shot SpawnSystemAtLocation into current world (Wave E S2)
+ *   niagara.stop_all              → DeactivateImmediate on every live UNiagaraComponent in world (Wave E S2)
+ *   niagara.list_active           → enumerate live UNiagaraComponents in current world (Wave E S2)
  *
  * **Lane A only** (``bThreadSafe=false``). Reasons:
  *   - ``LoadObject<UNiagaraSystem>`` may trigger asset-load delegates + shader-cache touches; GT-only.
@@ -80,4 +83,21 @@ namespace FNiagaraTools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_SetUserParam(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request);
+
+	// ─── Wave E Surface 2: Niagara runtime (3 tools) ────────────────────────────────────────────
+	//
+	// Tool_SpawnAtLocation — one-shot ``UNiagaraFunctionLibrary::SpawnSystemAtLocation`` into the
+	//   current world (PIE if running, otherwise editor world). NO PIE guard — works in both.
+	//   Returns the spawned component's path + which world it landed in.
+	//
+	// Tool_StopAll — enumerate every live UNiagaraComponent in the current world via
+	//   TObjectIterator filtered by GetWorld(), call DeactivateImmediate on each. Useful for
+	//   nuking all VFX before a test or when the editor world is cluttered.
+	//
+	// Tool_ListActive — enumerate live UNiagaraComponents in the current world. Reports
+	//   component_path / owner_actor / asset_path / location / is_active / last_render_time per
+	//   component. NO PIE guard — works in both editor + PIE worlds.
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SpawnAtLocation(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_StopAll(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ListActive(const FMCPRequest& Request);
 }
