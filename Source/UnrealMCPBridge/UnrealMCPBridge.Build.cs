@@ -132,6 +132,11 @@ public class UnrealMCPBridge : ModuleRules
 				// subsystem.list. UEngineSubsystem / UWorldSubsystem / UGameInstanceSubsystem /
 				// ULocalPlayerSubsystem all live in Engine (already a public dep).
 				"EditorSubsystem",
+				// Wave G Surface 3 2026-05 — Navigation system query surface.
+				// UNavigationSystemV1 / ANavigationData / ARecastNavMesh / FPathFindingQuery /
+				// FPathFindingResult / FNavLocation / FNavPathPoint all live in the NavigationSystem
+				// module (runtime). The plugin is editor-only so this dep is safe.
+				"NavigationSystem",
 			}
 		);
 

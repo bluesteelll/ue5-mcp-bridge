@@ -36,6 +36,7 @@
 #include "Tools/LogTools.h"
 #include "Tools/MaterialTools.h"
 #include "Tools/MeshTools.h"
+#include "Tools/NavMeshTools.h"
 #include "Tools/NiagaraTools.h"
 #include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
@@ -429,6 +430,26 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	FUMGTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FNiagaraTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 	FPhysicsTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave G Surface 3 2026-05: NavMesh query surface (4 tools, all Lane A).
+	//   navmesh.list                 - enumerate ARecastNavMesh actors + key config fields
+	//                                   (agent radius/height, cell size, tile size, init flag).
+	//                                   Read-only, no PIE guard.
+	//   navmesh.rebuild              - UNavigationSystemV1::Build() (system-wide) OR per-actor
+	//                                   ARecastNavMesh::RebuildAll() when navmesh_actor_path is
+	//                                   supplied. PIE-guarded (build is editor-time only).
+	//                                   Returns wall-clock duration of build KICK-OFF (build is
+	//                                   asynchronous; caller polls navmesh.list is_initialized).
+	//   navmesh.find_path            - FindPathSync between two world points; returns waypoint
+	//                                   list + cumulative path_length. Read-only, no PIE guard.
+	//                                   When no navmesh built -> found=false with empty waypoints
+	//                                   (NOT -32603; legitimate planner branch).
+	//   navmesh.project_to_navmesh   - ProjectPointToNavigation within a box of +/-search_extent
+	//                                   around location. Read-only, no PIE guard. When no
+	//                                   navmesh -> projected=false with original location echoed.
+	// Reuses existing error codes - no new codes introduced: -32004 / -32027 / -32602 / -32603.
+	// Build.cs adds NavigationSystem private dep (runtime module).
+	FNavMeshTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk D: Sequencer read-only surface (5 tools, all Lane A). list_cinematics enumerates
 	// ULevelSequence assets via FARFilter; get_tracks/get_camera_cuts walk the MovieScene's master
