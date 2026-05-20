@@ -357,6 +357,23 @@ inline constexpr int32 kMCPErrorNotifyTrackNotFound              = -32055;
 inline constexpr int32 kMCPErrorFolderNotFound                   = -32056;
 
 /**
+ * Wave F Surface 2 — Blueprint function signature editing (``bp.add_function_parameter`` /
+ * ``bp.remove_function_parameter`` / ``bp.list_function_parameters`` / ``bp.set_function_metadata``).
+ *
+ *   -32057 FunctionParameterDuplicate   ``bp.add_function_parameter`` — a UserDefinedPin with the
+ *                                       requested ``param_name`` already exists on the same
+ *                                       terminator (K2Node_FunctionEntry for inputs OR
+ *                                       K2Node_FunctionResult for outputs). UE's
+ *                                       ``CreateUserDefinedPin`` would silently rename via
+ *                                       ``bUseUniqueName`` — we reject up-front so AI callers
+ *                                       can choose: pick a unique name, or call
+ *                                       ``bp.remove_function_parameter`` first. Caller's recovery:
+ *                                       ``bp.list_function_parameters`` to inspect current
+ *                                       inputs[]/outputs[].
+ */
+inline constexpr int32 kMCPErrorFunctionParameterDuplicate       = -32057;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */

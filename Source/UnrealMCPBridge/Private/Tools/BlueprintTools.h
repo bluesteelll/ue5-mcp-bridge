@@ -109,4 +109,16 @@ namespace FBlueprintTools
 
 	// ─── 2026-05: generic BP asset creator with explicit parent class ────────────────────────────
 	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request);
+
+	// ─── Wave F Surface 2 — Blueprint function signature editing (4 tools) ───────────────────────
+	//
+	// Edits the UserDefinedPins arrays on K2Node_FunctionEntry / K2Node_FunctionResult and the
+	// per-entry FKismetUserDeclaredFunctionMetadata stored on the function entry node. PIE-guarded
+	// (except list which is read). FScopedTransaction-wrapped writes. New error code -32057
+	// FunctionParameterDuplicate on name collision. All Lane A — UEdGraph mutation + Blueprint
+	// recompile demand the game thread.
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ListFunctionParameters(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request);
 }

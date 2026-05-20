@@ -711,6 +711,218 @@ namespace
 			// Info / Notes silently dropped — they're advisory noise that AI clients don't action.
 		}
 	}
+
+	// ─── Wave F2: function-signature edit helpers ────────────────────────────────────────────────
+
+	/**
+	 * Parse the ``direction`` arg ("input"/"output") into an EEdGraphPinDirection on the OWNING
+	 * terminator. KEY semantic flip: user-facing INPUT params show up as OUTPUT pins on the
+	 * K2Node_FunctionEntry node (the function "takes" them out), and user-facing OUTPUT params
+	 * show up as INPUT pins on the K2Node_FunctionResult. So:
+	 *   direction="input"  → terminator = Entry,  pin direction on terminator = EGPD_Output
+	 *   direction="output" → terminator = Result, pin direction on terminator = EGPD_Input
+	 *
+	 * This mirrors the convention used by ``BP_BuildSignaturePins`` above (which filters
+	 * Entry.Pins[Direction==Output] for inputs and Result.Pins[Direction==Input] for outputs).
+	 */
+	bool BP_ParseDirectionArg(
+		const FMCPRequest& Request,
+		FString& OutDirectionStr,
+		bool& bIsInputDir,
+		FMCPResponse& OutError)
+	{
+		if (!Request.Args->TryGetStringField(TEXT("direction"), OutDirectionStr) || OutDirectionStr.IsEmpty())
+		{
+			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+				TEXT("missing required string field 'direction' ('input' or 'output')"));
+			return false;
+		}
+		if (OutDirectionStr.Equals(TEXT("input"), ESearchCase::IgnoreCase))
+		{
+			bIsInputDir = true;
+			return true;
+		}
+		if (OutDirectionStr.Equals(TEXT("output"), ESearchCase::IgnoreCase))
+		{
+			bIsInputDir = false;
+			return true;
+		}
+		OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+			FString::Printf(TEXT("'direction' must be 'input' or 'output', got '%s'"), *OutDirectionStr));
+		return false;
+	}
+
+	/**
+	 * Build a JSON summary of one FUserPinInfo (function-signature pin authoring entry).
+	 *
+	 * Shape (mirrors bp.list_functions's signature.inputs/outputs entries but adds default_value):
+	 *   {
+	 *     "name":          "FName from FUserPinInfo::PinName",
+	 *     "pin_type":      { ...MCPPinTypeUtils JSON... },
+	 *     "default_value": "PinDefaultValue" | null
+	 *   }
+	 *
+	 * Reads UserDefinedPins (the authoring array) NOT Pins[] — bp.list_function_parameters cares
+	 * about USER-declared params, not the compile-time resolved pin set (which would include
+	 * inherited override signature pins for interface implementations).
+	 *
+	 * Returns nullptr if the pin type cannot be serialised (-32032 surfaced via OutError).
+	 */
+	TSharedPtr<FJsonObject> BP_BuildUserDefinedPinSummary(
+		const FMCPRequest& Request,
+		const FUserPinInfo& Info,
+		FMCPResponse& OutError)
+	{
+		TSharedPtr<FJsonObject> PinTypeObj = BP_PinTypeToJsonOrError(Request, Info.PinType, OutError);
+		if (!PinTypeObj.IsValid())
+		{
+			return nullptr;
+		}
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("name"), Info.PinName.ToString());
+		Obj->SetObjectField(TEXT("pin_type"), PinTypeObj);
+		if (Info.PinDefaultValue.IsEmpty())
+		{
+			Obj->SetField(TEXT("default_value"), MakeShared<FJsonValueNull>());
+		}
+		else
+		{
+			Obj->SetStringField(TEXT("default_value"), Info.PinDefaultValue);
+		}
+		return Obj;
+	}
+
+	/**
+	 * Locate the K2Node_FunctionResult on a function graph, creating it if missing. Used by
+	 * ``bp.add_function_parameter`` when a caller adds the first output to a function that
+	 * previously had none.
+	 *
+	 * Mirrors the lazy-creation pattern in ``Tool_AddFunction`` (Days 8): we spawn the node via
+	 * ``FGraphNodeCreator`` so UE wires it into the graph's Nodes[] correctly, then link the
+	 * entry's Then exec pin to the new result's Execute pin so the function still has flow. The
+	 * existing entry→prior-terminus link (if any) is left intact — UE's schema will reconcile via
+	 * the recompile triggered downstream by MarkBlueprintAsModified.
+	 */
+	UK2Node_FunctionResult* BP_GetOrCreateFunctionResult(
+		UEdGraph* Graph,
+		UK2Node_FunctionEntry* EntryNode,
+		const FName& FunctionName)
+	{
+		check(Graph);
+		check(EntryNode);
+
+		UK2Node_FunctionEntry* TmpEntry = nullptr;
+		UK2Node_FunctionResult* ExistingResult = nullptr;
+		BP_GetFunctionTerminators(Graph, TmpEntry, ExistingResult);
+		if (ExistingResult)
+		{
+			return ExistingResult;
+		}
+
+		FGraphNodeCreator<UK2Node_FunctionResult> Creator(*Graph);
+		UK2Node_FunctionResult* NewResult = Creator.CreateNode();
+		NewResult->FunctionReference.SetSelfMember(FunctionName);
+		Creator.Finalize();
+
+		UEdGraphPin* EntryThen = EntryNode->FindPin(UEdGraphSchema_K2::PN_Then);
+		UEdGraphPin* ResultExec = NewResult->FindPin(UEdGraphSchema_K2::PN_Execute);
+		if (EntryThen && ResultExec)
+		{
+			EntryThen->MakeLinkTo(ResultExec);
+		}
+		return NewResult;
+	}
+
+	/**
+	 * Resolve a function graph + its entry+result terminators in one shot, populating standard
+	 * not-found / invalid-args errors via OutError. Used by every Wave F2 tool entry point so the
+	 * boilerplate doesn't repeat.
+	 *
+	 * Returns true on success. On failure populates OutError and returns false. Caller MUST check
+	 * EntryOut for null before dereferencing — it's permitted to be null only if the function graph
+	 * is corrupt (which we surface as -32603 Internal); a normal user-defined function ALWAYS has
+	 * an entry node (Result may be null if no outputs were declared yet — that's normal).
+	 */
+	bool BP_ResolveFunctionContext(
+		const FMCPRequest& Request,
+		FString& OutPath,
+		FString& OutFnNameStr,
+		UBlueprint*& OutBlueprint,
+		UEdGraph*& OutGraph,
+		UK2Node_FunctionEntry*& OutEntry,
+		UK2Node_FunctionResult*& OutResult,
+		FMCPResponse& OutError)
+	{
+		if (!BP_RequireBlueprintPath(Request, OutPath, OutError))
+		{
+			return false;
+		}
+		if (!Request.Args->TryGetStringField(TEXT("function_name"), OutFnNameStr) || OutFnNameStr.IsEmpty())
+		{
+			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+				TEXT("missing required string field 'function_name'"));
+			return false;
+		}
+		OutBlueprint = BP_ResolveBlueprintOrError(Request, OutPath, OutError);
+		if (!OutBlueprint) { return false; }
+
+		const FName FnName(*OutFnNameStr);
+		OutGraph = FMCPBlueprintUtils::FindFunctionGraph(OutBlueprint, FnName);
+		if (!OutGraph)
+		{
+			OutError = BP_MakeError(Request, kMCPErrorVariableNotFound,
+				FString::Printf(TEXT("function '%s' not found on blueprint '%s'"),
+					*OutFnNameStr, *OutPath));
+			return false;
+		}
+
+		BP_GetFunctionTerminators(OutGraph, OutEntry, OutResult);
+		if (!OutEntry)
+		{
+			OutError = BP_MakeError(Request, kBPErrorInternal,
+				FString::Printf(
+					TEXT("function '%s' on '%s' has no UK2Node_FunctionEntry (corrupt blueprint?)"),
+					*OutFnNameStr, *OutPath));
+			return false;
+		}
+		return true;
+	}
+
+	/** Build a JSON snapshot of the current function metadata (used by set_function_metadata's prior/new). */
+	TSharedPtr<FJsonObject> BP_BuildFunctionMetadataSnapshot(
+		const UK2Node_FunctionEntry* Entry,
+		const UEdGraph* Graph)
+	{
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		if (!Entry || !Graph)
+		{
+			return Obj;
+		}
+		const int32 Flags = Entry->GetFunctionFlags();
+		Obj->SetBoolField(TEXT("is_pure"),   (Flags & FUNC_BlueprintPure) != 0);
+		Obj->SetBoolField(TEXT("is_const"),  (Flags & FUNC_Const) != 0);
+		Obj->SetStringField(TEXT("access_specifier"), BP_AccessSpecifierFromFlags(Flags).ToLower());
+
+		// Category lives on the graph-level metadata (FKismetUserDeclaredFunctionMetadata), not on
+		// the entry-node MetaData directly — the two are kept in sync but the graph-level wrapper
+		// is the canonical authoring surface.
+		FString Category;
+		if (FKismetUserDeclaredFunctionMetadata* GraphMeta =
+			FBlueprintEditorUtils::GetGraphFunctionMetaData(Graph))
+		{
+			Category = GraphMeta->Category.ToString();
+			Obj->SetStringField(TEXT("tooltip"), GraphMeta->ToolTip.ToString());
+			Obj->SetBoolField(TEXT("call_in_editor"), GraphMeta->bCallInEditor);
+		}
+		else
+		{
+			// Fallback to entry node's local copy (still readable even if the graph wrapper is null)
+			Obj->SetStringField(TEXT("tooltip"), Entry->MetaData.ToolTip.ToString());
+			Obj->SetBoolField(TEXT("call_in_editor"), Entry->MetaData.bCallInEditor);
+		}
+		Obj->SetStringField(TEXT("category"), Category);
+		return Obj;
+	}
 } // namespace
 
 namespace FBlueprintTools
@@ -2081,6 +2293,462 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 	return BP_MakeSuccessObj(Request, Out);
 }
 
+// ─── bp.add_function_parameter (Lane A, PIE-guarded) ─────────────────────────────────────────
+//
+// Appends a new UserDefinedPin to either the K2Node_FunctionEntry (direction="input") or the
+// K2Node_FunctionResult (direction="output") of an existing function graph. Auto-creates the
+// result node + entry→result exec wire when adding the first output to a function that had
+// none. Pin type goes through the standard MCPPinTypeUtils round-trip. The pin is appended via
+// ``CreateUserDefinedPin(bUseUniqueName=false)`` and we pre-check for name collision so the
+// caller gets -32057 instead of UE silently appending a suffix.
+//
+// Args:    { blueprint_path: string, function_name: string, param_name: string,
+//            pin_type: { ...MCPPinTypeUtils JSON... },
+//            direction: "input"|"output", default_value?: string }
+// Result:  { added: bool, param_name: string, direction: string }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams         — missing function_name / param_name / pin_type / direction;
+//                                  direction not "input"|"output"
+//   -32037 VariableNotFound      — function graph not present
+//   -32032 PinTypeUnsupported    — bad pin_type JSON
+//   -32057 FunctionParameterDuplicate — param_name already exists on the terminator
+//   -32603 Internal              — function graph corrupt (no entry terminator)
+FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path, FnNameStr;
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	UK2Node_FunctionEntry* Entry = nullptr;
+	UK2Node_FunctionResult* Result = nullptr;
+	FMCPResponse CtxErr;
+	if (!BP_ResolveFunctionContext(Request, Path, FnNameStr, Blueprint, Graph, Entry, Result, CtxErr))
+	{
+		return CtxErr;
+	}
+
+	FString ParamNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("param_name"), ParamNameStr) || ParamNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'param_name'"));
+	}
+
+	FString DirectionStr;
+	bool bIsInputDir = false;
+	FMCPResponse DirErr;
+	if (!BP_ParseDirectionArg(Request, DirectionStr, bIsInputDir, DirErr)) { return DirErr; }
+
+	FEdGraphPinType PinType;
+	FMCPResponse PinTypeErr;
+	if (!BP_RequirePinTypeArg(Request, TEXT("pin_type"), PinType, PinTypeErr))
+	{
+		return PinTypeErr;
+	}
+
+	FString DefaultValue;
+	Request.Args->TryGetStringField(TEXT("default_value"), DefaultValue);
+
+	const FName ParamName(*ParamNameStr);
+	const FScopedTransaction Transaction(LOCTEXT("BPAddFunctionParameter", "MCP: add function parameter"));
+
+	// Resolve the owning terminator (Entry for inputs, Result for outputs). For outputs we lazily
+	// create the result node if it doesn't yet exist on the function graph.
+	UK2Node_EditablePinBase* Owner = nullptr;
+	if (bIsInputDir)
+	{
+		Owner = Entry;
+	}
+	else
+	{
+		if (!Result)
+		{
+			Result = BP_GetOrCreateFunctionResult(Graph, Entry, FName(*FnNameStr));
+		}
+		Owner = Result;
+	}
+	if (!Owner)
+	{
+		return BP_MakeError(Request, kBPErrorInternal,
+			TEXT("could not resolve or create function terminator for parameter add"));
+	}
+
+	// Pre-check duplicate: ``CreateUserDefinedPin(bUseUniqueName=false)`` would still append because
+	// the underlying ``CreateUserDefinedPin`` only rejects via existing-name-check when bUseUniqueName
+	// is TRUE. We want explicit -32057 rather than silent dedup OR silent overwrite.
+	// UserDefinedPinExists is not exported (UE5.7 BLUEPRINTGRAPH_API omission); inline the scan
+	// over UserDefinedPins[] — the same TArray that the engine helper iterates internally.
+	auto UserDefinedPinExistsInline = [](const UK2Node_EditablePinBase* Node, const FName Name) -> bool
+	{
+		for (const TSharedPtr<FUserPinInfo>& Info : Node->UserDefinedPins)
+		{
+			if (Info.IsValid() && Info->PinName == Name) { return true; }
+		}
+		return false;
+	};
+
+	if (UserDefinedPinExistsInline(Owner, ParamName))
+	{
+		return BP_MakeError(Request, kMCPErrorFunctionParameterDuplicate,
+			FString::Printf(
+				TEXT("parameter '%s' already exists on %s of function '%s' on blueprint '%s'"),
+				*ParamNameStr,
+				bIsInputDir ? TEXT("K2Node_FunctionEntry (inputs)") : TEXT("K2Node_FunctionResult (outputs)"),
+				*FnNameStr, *Path));
+	}
+
+	Owner->Modify();
+	const EEdGraphPinDirection TerminatorPinDir = bIsInputDir ? EGPD_Output : EGPD_Input;
+	UEdGraphPin* CreatedPin = Owner->CreateUserDefinedPin(ParamName, PinType, TerminatorPinDir, /*bUseUniqueName*/ false);
+	if (!CreatedPin)
+	{
+		return BP_MakeError(Request, kBPErrorInternal,
+			FString::Printf(
+				TEXT("CreateUserDefinedPin returned null for '%s' on function '%s' "
+					 "(terminator rejected the pin type via CanCreateUserDefinedPin)"),
+				*ParamNameStr, *FnNameStr));
+	}
+
+	// Apply optional default value. ``ModifyUserDefinedPinDefaultValue`` updates BOTH the
+	// UserDefinedPins entry and the live UEdGraphPin's default — the right authoring surface.
+	if (!DefaultValue.IsEmpty())
+	{
+		for (TSharedPtr<FUserPinInfo>& Info : Owner->UserDefinedPins)
+		{
+			if (Info.IsValid() && Info->PinName == ParamName)
+			{
+				Owner->ModifyUserDefinedPinDefaultValue(Info, DefaultValue);
+				break;
+			}
+		}
+	}
+
+	// Reconstruct rebuilds the live Pins[] array to match UserDefinedPins (UE convention after
+	// authoring mutation). Without it the new pin may not appear on connected K2 callers until the
+	// next BP recompile. ReconstructNode preserves existing pin links via RewireOldPinsToNewPins.
+	Owner->ReconstructNode();
+	// Signature change → StructurallyModified triggers RegenerateSkeletonOnly compile so the
+	// UFunction shape stays in sync. Mirrors what Tool_AddFunction does at end-of-creation.
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("added"), true);
+	Out->SetStringField(TEXT("param_name"), ParamNameStr);
+	Out->SetStringField(TEXT("direction"), bIsInputDir ? TEXT("input") : TEXT("output"));
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.remove_function_parameter (Lane A, PIE-guarded, idempotent on terminator side) ───────
+//
+// Removes a UserDefinedPin from whichever terminator (Entry or Result) owns it. Direction is
+// auto-detected: we scan Entry's UserDefinedPins first then Result's. Returns
+// ``{removed: false, direction: null}`` if the param doesn't exist on either terminator (caller
+// can treat as idempotent / already-removed).
+//
+// Args:    { blueprint_path: string, function_name: string, param_name: string }
+// Result:  { removed: bool, direction: "input"|"output"|null }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams         — missing function_name / param_name
+//   -32037 VariableNotFound      — function graph not present
+//   -32603 Internal              — function graph corrupt (no entry terminator)
+FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path, FnNameStr;
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	UK2Node_FunctionEntry* Entry = nullptr;
+	UK2Node_FunctionResult* Result = nullptr;
+	FMCPResponse CtxErr;
+	if (!BP_ResolveFunctionContext(Request, Path, FnNameStr, Blueprint, Graph, Entry, Result, CtxErr))
+	{
+		return CtxErr;
+	}
+
+	FString ParamNameStr;
+	if (!Request.Args->TryGetStringField(TEXT("param_name"), ParamNameStr) || ParamNameStr.IsEmpty())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required string field 'param_name'"));
+	}
+
+	const FName ParamName(*ParamNameStr);
+	// UserDefinedPinExists is not exported (UE 5.7 BLUEPRINTGRAPH_API omission); inline the scan
+	// over UserDefinedPins[] — the same TArray that the engine helper iterates internally.
+	auto UserDefinedPinExistsInline = [](const UK2Node_EditablePinBase* Node, const FName Name) -> bool
+	{
+		if (!Node) { return false; }
+		for (const TSharedPtr<FUserPinInfo>& Info : Node->UserDefinedPins)
+		{
+			if (Info.IsValid() && Info->PinName == Name) { return true; }
+		}
+		return false;
+	};
+
+	UK2Node_EditablePinBase* Owner = nullptr;
+	bool bWasInputDir = false;
+	if (UserDefinedPinExistsInline(Entry, ParamName))
+	{
+		Owner = Entry;
+		bWasInputDir = true;
+	}
+	else if (UserDefinedPinExistsInline(Result, ParamName))
+	{
+		Owner = Result;
+		bWasInputDir = false;
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	if (!Owner)
+	{
+		Out->SetBoolField(TEXT("removed"), false);
+		Out->SetField(TEXT("direction"), MakeShared<FJsonValueNull>());
+		return BP_MakeSuccessObj(Request, Out);
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("BPRemoveFunctionParameter", "MCP: remove function parameter"));
+	Owner->Modify();
+	Owner->RemoveUserDefinedPinByName(ParamName);
+	Owner->ReconstructNode();
+	// Signature change → StructurallyModified triggers RegenerateSkeletonOnly so the UFunction
+	// shape stays in sync. Same rationale as Tool_AddFunctionParameter.
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	Out->SetBoolField(TEXT("removed"), true);
+	Out->SetStringField(TEXT("direction"), bWasInputDir ? TEXT("input") : TEXT("output"));
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.list_function_parameters (Lane A, NO PIE guard — read) ───────────────────────────────
+//
+// Returns the function's user-declared parameter signature, split by direction.
+// Reads UserDefinedPins on the Entry (inputs) and Result (outputs) — NOT the resolved Pins[]
+// array. UserDefinedPins is the canonical AUTHORING surface (what the user typed in the BP
+// editor) and preserves PinDefaultValue strings for round-trip with bp.add_function_parameter.
+//
+// Args:    { blueprint_path: string, function_name: string }
+// Result:  { inputs: [{name, pin_type, default_value}], outputs: [{name, pin_type, default_value}] }
+//
+// Errors:
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams         — missing function_name
+//   -32037 VariableNotFound      — function graph not present
+//   -32032 PinTypeUnsupported    — any param's stored pin type uses an unsupported PC_* category
+//   -32603 Internal              — function graph corrupt (no entry terminator)
+FMCPResponse Tool_ListFunctionParameters(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FString Path, FnNameStr;
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	UK2Node_FunctionEntry* Entry = nullptr;
+	UK2Node_FunctionResult* Result = nullptr;
+	FMCPResponse CtxErr;
+	if (!BP_ResolveFunctionContext(Request, Path, FnNameStr, Blueprint, Graph, Entry, Result, CtxErr))
+	{
+		return CtxErr;
+	}
+
+	auto BuildArray = [&Request](const UK2Node_EditablePinBase* Owner, FMCPResponse& OutError)
+		-> TSharedPtr<FJsonValue>
+	{
+		TArray<TSharedPtr<FJsonValue>> Items;
+		if (!Owner) { return MakeShared<FJsonValueArray>(Items); }
+		Items.Reserve(Owner->UserDefinedPins.Num());
+		for (const TSharedPtr<FUserPinInfo>& Info : Owner->UserDefinedPins)
+		{
+			if (!Info.IsValid()) { continue; }
+			TSharedPtr<FJsonObject> ParamObj = BP_BuildUserDefinedPinSummary(Request, *Info, OutError);
+			if (!ParamObj.IsValid()) { return nullptr; }
+			Items.Add(MakeShared<FJsonValueObject>(ParamObj));
+		}
+		return MakeShared<FJsonValueArray>(Items);
+	};
+
+	FMCPResponse PinErr;
+	TSharedPtr<FJsonValue> InputsArr = BuildArray(Entry, PinErr);
+	if (!InputsArr.IsValid()) { return PinErr; }
+	TSharedPtr<FJsonValue> OutputsArr = BuildArray(Result, PinErr);
+	if (!OutputsArr.IsValid()) { return PinErr; }
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetField(TEXT("inputs"), InputsArr);
+	Out->SetField(TEXT("outputs"), OutputsArr);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.set_function_metadata (Lane A, PIE-guarded) ──────────────────────────────────────────
+//
+// Mutates function-level metadata on the K2Node_FunctionEntry + the function graph's
+// FKismetUserDeclaredFunctionMetadata wrapper. Every field is OPTIONAL — only the keys present
+// in args.metadata are written. Returns a prior/new snapshot pair so the caller can revert if
+// needed.
+//
+// Field mapping (UE 5.7):
+//   is_pure           → Entry->ExtraFlags |= FUNC_BlueprintPure       (or cleared)
+//   is_const          → Entry->ExtraFlags |= FUNC_Const               (or cleared)
+//   category          → graph-level FKismetUserDeclaredFunctionMetadata::Category (FText)
+//   access_specifier  → Entry->ExtraFlags FUNC_AccessSpecifiers bits (Public/Protected/Private)
+//   call_in_editor    → graph-level Meta->bCallInEditor (also synced to Entry->MetaData)
+//   tooltip           → graph-level Meta->ToolTip (also synced to Entry->MetaData)
+//
+// Note: access_specifier defaults to "public" for K2 user functions (FUNC_Public set in
+// FBlueprintEditorUtils::AddNewFunctionGraph). Writing it via ExtraFlags + ReconstructNode
+// matches what the BP editor's "Function Details" panel does internally.
+//
+// Args:    { blueprint_path: string, function_name: string,
+//            metadata: { is_pure?: bool, is_const?: bool, category?: string,
+//                        access_specifier?: "public"|"protected"|"private",
+//                        call_in_editor?: bool, tooltip?: string } }
+// Result:  { prior: { is_pure, is_const, access_specifier, category, call_in_editor, tooltip },
+//            new:   { is_pure, is_const, access_specifier, category, call_in_editor, tooltip } }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (resolve)
+//   -32602 InvalidParams         — missing function_name OR missing 'metadata' object OR
+//                                  unknown access_specifier value
+//   -32037 VariableNotFound      — function graph not present
+//   -32603 Internal              — function graph corrupt (no entry terminator)
+FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path, FnNameStr;
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	UK2Node_FunctionEntry* Entry = nullptr;
+	UK2Node_FunctionResult* Result = nullptr;
+	FMCPResponse CtxErr;
+	if (!BP_ResolveFunctionContext(Request, Path, FnNameStr, Blueprint, Graph, Entry, Result, CtxErr))
+	{
+		return CtxErr;
+	}
+
+	const TSharedPtr<FJsonObject>* MetadataObjPtr = nullptr;
+	if (!Request.Args->TryGetObjectField(TEXT("metadata"), MetadataObjPtr) || !MetadataObjPtr || !MetadataObjPtr->IsValid())
+	{
+		return BP_MakeError(Request, kBPErrorInvalidParams,
+			TEXT("missing required object field 'metadata'"));
+	}
+	const TSharedPtr<FJsonObject>& Metadata = *MetadataObjPtr;
+
+	// Validate access_specifier up-front so we don't half-apply metadata before failing.
+	EFunctionFlags NewAccessSpec = FUNC_None;
+	bool bHasAccessSpec = false;
+	{
+		FString AccessStr;
+		if (Metadata->TryGetStringField(TEXT("access_specifier"), AccessStr))
+		{
+			if (AccessStr.Equals(TEXT("public"), ESearchCase::IgnoreCase))
+			{
+				NewAccessSpec = FUNC_Public;
+			}
+			else if (AccessStr.Equals(TEXT("protected"), ESearchCase::IgnoreCase))
+			{
+				NewAccessSpec = FUNC_Protected;
+			}
+			else if (AccessStr.Equals(TEXT("private"), ESearchCase::IgnoreCase))
+			{
+				NewAccessSpec = FUNC_Private;
+			}
+			else
+			{
+				return BP_MakeError(Request, kBPErrorInvalidParams,
+					FString::Printf(
+						TEXT("metadata.access_specifier must be 'public'|'protected'|'private', got '%s'"),
+						*AccessStr));
+			}
+			bHasAccessSpec = true;
+		}
+	}
+
+	// Snapshot BEFORE we mutate.
+	TSharedPtr<FJsonObject> PriorSnap = BP_BuildFunctionMetadataSnapshot(Entry, Graph);
+
+	const FScopedTransaction Transaction(LOCTEXT("BPSetFunctionMetadata", "MCP: set function metadata"));
+	Entry->Modify();
+
+	// is_pure / is_const — written to Entry->ExtraFlags. SetExtraFlags strips FUNC_Native; we
+	// preserve everything else with explicit set/clear.
+	bool bIsPure = false;
+	if (Metadata->TryGetBoolField(TEXT("is_pure"), bIsPure))
+	{
+		if (bIsPure) { Entry->AddExtraFlags(FUNC_BlueprintPure); }
+		else          { Entry->ClearExtraFlags(FUNC_BlueprintPure); }
+	}
+	bool bIsConst = false;
+	if (Metadata->TryGetBoolField(TEXT("is_const"), bIsConst))
+	{
+		if (bIsConst) { Entry->AddExtraFlags(FUNC_Const); }
+		else           { Entry->ClearExtraFlags(FUNC_Const); }
+	}
+
+	// access_specifier — only mutates the access-specifier bits; clear all three then set the
+	// chosen one. Matches what the BP editor does when the user picks from the dropdown.
+	if (bHasAccessSpec)
+	{
+		Entry->ClearExtraFlags(FUNC_AccessSpecifiers);
+		Entry->AddExtraFlags(NewAccessSpec);
+	}
+
+	// Graph-level metadata for category / tooltip / call_in_editor. Sync to Entry->MetaData as
+	// well so reads via the entry node match (BP editor keeps both in sync).
+	FKismetUserDeclaredFunctionMetadata* GraphMeta =
+		FBlueprintEditorUtils::GetGraphFunctionMetaData(Graph);
+
+	FString CategoryStr;
+	if (Metadata->TryGetStringField(TEXT("category"), CategoryStr))
+	{
+		const FText CategoryText = FText::FromString(CategoryStr);
+		if (GraphMeta) { GraphMeta->Category = CategoryText; }
+		Entry->MetaData.Category = CategoryText;
+	}
+
+	FString TooltipStr;
+	if (Metadata->TryGetStringField(TEXT("tooltip"), TooltipStr))
+	{
+		const FText TooltipText = FText::FromString(TooltipStr);
+		if (GraphMeta) { GraphMeta->ToolTip = TooltipText; }
+		Entry->MetaData.ToolTip = TooltipText;
+	}
+
+	bool bCallInEditor = false;
+	if (Metadata->TryGetBoolField(TEXT("call_in_editor"), bCallInEditor))
+	{
+		if (GraphMeta) { GraphMeta->bCallInEditor = bCallInEditor; }
+		Entry->MetaData.bCallInEditor = bCallInEditor;
+	}
+
+	// Reconstruct rebuilds the entry node's pin set under the new flag combo (e.g. pure functions
+	// lose their Exec pins — the BP editor relies on this). StructurallyModified retriggers a
+	// skeleton compile so the UFunction's flag bits stay in sync.
+	Entry->ReconstructNode();
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	TSharedPtr<FJsonObject> NewSnap = BP_BuildFunctionMetadataSnapshot(Entry, Graph);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetObjectField(TEXT("prior"), PriorSnap);
+	Out->SetObjectField(TEXT("new"), NewSnap);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -2127,8 +2795,17 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// for proper UWidgetBlueprintFactory invocation.
 	RegisterTool(TEXT("bp.create_blueprint"), &Tool_CreateBlueprint, /*Lane A*/ false);
 
+	// Wave F Surface 2 — function-signature edit surface (4 tools, all Lane A — UEdGraph mutation
+	// + Blueprint recompile demand the game thread). The list variant is the only read-side tool
+	// (no PIE guard); add/remove/set_metadata are PIE-guarded mutators with FScopedTransaction.
+	RegisterTool(TEXT("bp.add_function_parameter"),    &Tool_AddFunctionParameter,    /*Lane A*/ false);
+	RegisterTool(TEXT("bp.remove_function_parameter"), &Tool_RemoveFunctionParameter, /*Lane A*/ false);
+	RegisterTool(TEXT("bp.list_function_parameters"),  &Tool_ListFunctionParameters,  /*Lane A*/ false);
+	RegisterTool(TEXT("bp.set_function_metadata"),     &Tool_SetFunctionMetadata,     /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 4 Days 1-10 + bp.create_blueprint: registered 14 bp.* handlers (6 reads + 6 writes + 1 compile + 1 creator, all Lane A); ")
+		TEXT("Phase 4 Days 1-10 + bp.create_blueprint + Wave F2: registered 18 bp.* handlers "
+			 "(6 reads + 6 writes + 1 compile + 1 creator + 4 function-signature, all Lane A); ")
 		TEXT("bp.compile_all_dirty registered separately via FBlueprintCompositeTools"));
 }
 
