@@ -79,4 +79,24 @@ namespace FMaterialTools
 	// ─── Day 14: MIC factory + compile error read ───────────────────────────────────────────────
 	UNREALMCPBRIDGE_API FMCPResponse Tool_CreateInstance(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetCompileErrors(const FMCPRequest& Request);
+
+	// ─── Wave G Surface 2: material graph node editing (4 tools, all Lane A, PIE-guarded) ─────
+	//
+	// Analog of bp.add_node / bp.connect_pins / bp.set_node_property / (delete) for material graphs.
+	// Operates on UMaterial assets only (NOT instances): mutating a MIC's graph is meaningless — instances
+	// inherit the parent graph and only override parameter values, which is what the Day 12-13 tools cover.
+	// Wrong asset class → -32011 WrongClass (consistent with bp.* graph tools).
+	//
+	// Lookup contract: nodes are addressed by ``UMaterialExpression::MaterialExpressionGuid`` (an FGuid
+	// populated by ``CreateMaterialExpression``). FGuid strings round-trip through
+	// EGuidFormats::Digits (32 hex chars, no hyphens) — same as bp.add_node's node_guid.
+	//
+	// Mutation contract: every tool wraps writes in ``Material->PreEditChange(nullptr)`` BEFORE and
+	// ``Material->PostEditChange()`` AFTER. This triggers UE's per-tick material update cascade
+	// (RecompileMaterial → RebuildMaterialInstanceEditors → shader compile queue submission). Plus
+	// FScopedTransaction (editor Undo) + MarkPackageDirty.
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddExpression(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ConnectExpressions(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_DeleteExpression(const FMCPRequest& Request);
 }

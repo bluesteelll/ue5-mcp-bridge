@@ -15,6 +15,8 @@
 #include "Factories/MaterialInstanceConstantFactoryNew.h"
 #include "IAssetTools.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialExpression.h"
+#include "Materials/MaterialExpressionParameter.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInterface.h"
 #include "MaterialEditingLibrary.h"
@@ -24,6 +26,7 @@
 #include "ScopedTransaction.h"
 #include "ShaderCompiler.h"
 #include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -1248,6 +1251,571 @@ FMCPResponse Tool_GetCompileErrors(const FMCPRequest& Request)
 	return MAT_MakeSuccessObj(Request, Out);
 }
 
+// ─── Wave G Surface 2: material graph node editing (4 tools, all Lane A, PIE-guarded) ─────────
+//
+// Analog of bp.add_node / bp.connect_pins / bp.set_node_property / (delete) for material graphs.
+// All 4 operate on UMaterial assets (NOT instances) — mutating a MIC's graph is meaningless;
+// instances inherit the parent graph and only override parameter values which the Day 12-13 MIC
+// tools cover. Wrong asset class → -32011 WrongClass (consistent with bp.* graph tools).
+//
+// Lookup contract: nodes are addressed by ``UMaterialExpression::MaterialExpressionGuid`` (FGuid
+// populated by ``UpdateMaterialExpressionGuid``). FGuid strings round-trip through
+// EGuidFormats::Digits (32 hex chars, no hyphens) — same shape as bp.add_node's node_guid.
+//
+// Mutation contract: every tool wraps mutations in ``Material->PreEditChange(nullptr)`` BEFORE and
+// ``Material->PostEditChange()`` AFTER. PostEditChange triggers UE's per-tick material update
+// cascade (RecompileMaterial → RebuildMaterialInstanceEditors → shader compile submission). Plus
+// FScopedTransaction (editor Undo) + MarkPackageDirty.
+
+namespace
+{
+	/**
+	 * Resolve ``args.material_path`` to a UMaterial* (NOT any UMaterialInterface subclass).
+	 * Graph editing only makes sense on base UMaterial — instance assets inherit their parent
+	 * graph and only override parameter values. Mirrors the MIC-only gate in MAT_PreWriteResolve,
+	 * but inverted (requires base UMaterial).
+	 *
+	 * Returns true + populates OutMaterial + OutPath; on failure populates OutError.
+	 *
+	 * Errors raised:
+	 *   -32027 PIEActive (no asset mutations during PIE)
+	 *   -32602 InvalidParams (missing/empty material_path)
+	 *   -32010 InvalidPath  / -32004 ObjectNotFound (FMCPMaterialUtils delegate)
+	 *   -32011 WrongClass   (asset resolved but isn't a base UMaterial — caller likely passed a MIC)
+	 */
+	bool MAT_PreWriteResolveBaseMaterial(
+		const FMCPRequest& Request,
+		UMaterial*& OutMaterial,
+		FString& OutPath,
+		FMCPResponse& OutError)
+	{
+		if (MAT_IsPIEActive())
+		{
+			OutError = MAT_MakePIEError(Request);
+			return false;
+		}
+		if (!MAT_RequireMaterialPath(Request, OutPath, OutError)) { return false; }
+
+		int32 ErrCode = 0;
+		FString ErrMsg;
+		UMaterialInterface* AsInterface = FMCPMaterialUtils::LoadMaterialInterfaceByPath(
+			OutPath, ErrCode, ErrMsg);
+		if (!AsInterface)
+		{
+			OutError = MAT_MakeError(Request, ErrCode, ErrMsg);
+			return false;
+		}
+		UMaterial* AsBase = Cast<UMaterial>(AsInterface);
+		if (!AsBase || !FMCPMaterialUtils::IsBaseMaterial(AsInterface))
+		{
+			OutError = MAT_MakeError(Request, kMCPErrorWrongClass,
+				FString::Printf(
+					TEXT("material_path '%s' is class '%s'; graph-node editing requires a base UMaterial ")
+					TEXT("(instances inherit their parent's graph — use material.set_*_param for MIC overrides)"),
+					*OutPath, *AsInterface->GetClass()->GetPathName()));
+			return false;
+		}
+		OutMaterial = AsBase;
+		return true;
+	}
+
+	/** Find a UMaterialExpression inside Material's expression collection by FGuid string. */
+	UMaterialExpression* MAT_FindExpressionByGuid(UMaterial* Material, const FString& GuidString)
+	{
+		check(Material);
+		FGuid Guid;
+		if (!FGuid::Parse(GuidString, Guid)) { return nullptr; }
+		for (UMaterialExpression* Expr : Material->GetExpressions())
+		{
+			if (Expr && Expr->GetMaterialExpressionId() == Guid) { return Expr; }
+		}
+		return nullptr;
+	}
+
+	/** Parse args.expression_guid; return error JSON if missing or unparseable to FGuid form. */
+	bool MAT_RequireExpressionGuid(
+		const FMCPRequest& Request,
+		const TCHAR* FieldName,
+		FString& OutGuidString,
+		FMCPResponse& OutError)
+	{
+		if (!Request.Args.IsValid())
+		{
+			OutError = MAT_MakeError(Request, kMATErrorInvalidParams, TEXT("missing args object"));
+			return false;
+		}
+		if (!Request.Args->TryGetStringField(FieldName, OutGuidString) || OutGuidString.IsEmpty())
+		{
+			OutError = MAT_MakeError(Request, kMATErrorInvalidParams,
+				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
+			return false;
+		}
+		// Format validity check — we don't surface a separate error code (treat as invalid params).
+		FGuid Probe;
+		if (!FGuid::Parse(OutGuidString, Probe))
+		{
+			OutError = MAT_MakeError(Request, kMATErrorInvalidParams,
+				FString::Printf(
+					TEXT("field '%s' value '%s' is not a valid FGuid (expected 32-hex EGuidFormats::Digits)"),
+					FieldName, *OutGuidString));
+			return false;
+		}
+		return true;
+	}
+
+	/** Stringify an expression's GUID into the bp.add_node canonical EGuidFormats::Digits form. */
+	FString MAT_FormatExpressionGuid(const UMaterialExpression* Expression)
+	{
+		check(Expression);
+		// GetMaterialExpressionId() is declared non-const (returns FGuid&) on UMaterialExpression;
+		// the underlying ``MaterialExpressionGuid`` UPROPERTY is a public field we can read directly.
+		return Expression->MaterialExpressionGuid.ToString(EGuidFormats::Digits);
+	}
+} // namespace
+
+// ─── mat.add_expression ────────────────────────────────────────────────────────────────────────
+//
+// Args:    { material_path: string,
+//            expression_class: string  (e.g. "/Script/Engine.MaterialExpressionScalarParameter"),
+//            position?:        [x, y]  (default [0, 0]),
+//            parameter_name?:  string  (only meaningful for parameter expressions — silently
+//                                       ignored when the class doesn't carry a ParameterName) }
+// Result:  { expression_guid, expression_class, position: [x, y] }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32602 InvalidParams (missing material_path / expression_class)
+//   -32010 / -32004     (resolve material)
+//   -32011 WrongClass   (material is an instance OR expression_class is not UMaterialExpression)
+//   -32020 ClassNotFound (expression_class fails LoadClass)
+//   -32021 ClassAbstract (expression_class is abstract)
+FMCPResponse Tool_AddExpression(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	UMaterial* Material = nullptr;
+	FString Path;
+	FMCPResponse Err;
+	if (!MAT_PreWriteResolveBaseMaterial(Request, Material, Path, Err)) { return Err; }
+
+	FString ExprClassPath;
+	if (!Request.Args->TryGetStringField(TEXT("expression_class"), ExprClassPath) || ExprClassPath.IsEmpty())
+	{
+		return MAT_MakeError(Request, kMATErrorInvalidParams,
+			TEXT("missing required string field 'expression_class' (e.g. '/Script/Engine.MaterialExpressionScalarParameter')"));
+	}
+
+	int32 PosX = 0, PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("position"), PositionArr) && PositionArr && PositionArr->Num() == 2)
+	{
+		PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+	}
+
+	UClass* ExprClass = LoadObject<UClass>(nullptr, *ExprClassPath);
+	if (!ExprClass)
+	{
+		return MAT_MakeError(Request, kMCPErrorClassNotFound,
+			FString::Printf(
+				TEXT("expression_class '%s' could not be loaded (expected form '/Script/Engine.MaterialExpressionX')"),
+				*ExprClassPath));
+	}
+	if (!ExprClass->IsChildOf(UMaterialExpression::StaticClass()))
+	{
+		return MAT_MakeError(Request, kMCPErrorWrongClass,
+			FString::Printf(
+				TEXT("expression_class '%s' is not a UMaterialExpression subclass (super='%s')"),
+				*ExprClassPath, *ExprClass->GetSuperClass()->GetPathName()));
+	}
+	if (ExprClass->HasAnyClassFlags(CLASS_Abstract))
+	{
+		return MAT_MakeError(Request, kMCPErrorClassAbstract,
+			FString::Printf(TEXT("expression_class '%s' is abstract — cannot instantiate"),
+				*ExprClassPath));
+	}
+
+	FString ParamName;
+	Request.Args->TryGetStringField(TEXT("parameter_name"), ParamName);
+
+	UMaterialExpression* NewExpr = nullptr;
+	{
+		FScopedTransaction Transaction(LOCTEXT("MCPAddExpression", "MCP: add material expression"));
+		Material->Modify();
+		Material->PreEditChange(nullptr);
+
+		// UMaterialEditingLibrary::CreateMaterialExpression handles the cascade we need:
+		//   NewObject<UMaterialExpression>(Material, ExprClass, NAME_None, RF_Transactional)
+		//   → ExpressionCollection.AddExpression
+		//   → NewExpression->Material = Material
+		//   → MaterialExpressionEditorX/Y = NodePosX/NodePosY
+		//   → UpdateMaterialExpressionGuid(bForceGeneration=true, bAllowMarkingPackageDirty=true)
+		NewExpr = UMaterialEditingLibrary::CreateMaterialExpression(
+			Material, ExprClass, PosX, PosY);
+
+		// Optional parameter-name binding. ``HasAParameterName`` covers ScalarParameter /
+		// VectorParameter / TextureParameter / StaticSwitchParameter / StaticBoolParameter /
+		// DynamicParameter / various LandscapeLayerXxxParameter — anything with a per-parameter
+		// override identity. For non-parameter expressions (Multiply, Constant3Vector, etc.) we
+		// silently ignore the field — the bp.add_node tool follows the same forgiving convention.
+		if (NewExpr && NewExpr->HasAParameterName() && !ParamName.IsEmpty())
+		{
+			NewExpr->SetParameterName(FName(*ParamName));
+		}
+
+		Material->PostEditChange();
+	}
+
+	if (!NewExpr)
+	{
+		return MAT_MakeError(Request, kMATErrorInternal,
+			FString::Printf(
+				TEXT("UMaterialEditingLibrary::CreateMaterialExpression returned null for '%s' on '%s'"),
+				*ExprClassPath, *Path));
+	}
+
+	Material->GetOutermost()->MarkPackageDirty();
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("expression_guid"), MAT_FormatExpressionGuid(NewExpr));
+	Out->SetStringField(TEXT("expression_class"), ExprClass->GetPathName());
+	TArray<TSharedPtr<FJsonValue>> PositionResp;
+	PositionResp.Add(MakeShared<FJsonValueNumber>(NewExpr->MaterialExpressionEditorX));
+	PositionResp.Add(MakeShared<FJsonValueNumber>(NewExpr->MaterialExpressionEditorY));
+	Out->SetArrayField(TEXT("position"), PositionResp);
+	if (NewExpr->HasAParameterName())
+	{
+		Out->SetStringField(TEXT("parameter_name"), NewExpr->GetParameterName().ToString());
+	}
+	return MAT_MakeSuccessObj(Request, Out);
+}
+
+// ─── mat.connect_expressions ───────────────────────────────────────────────────────────────────
+//
+// Args:    { material_path: string,
+//            from_expression_guid: string,
+//            from_output_index?:   int     (default 0 — first output of from-expression),
+//            to_expression_guid:   string,
+//            to_input_name:        string  (FName of the FExpressionInput on the to-expression) }
+// Result:  { connected: bool, from_guid, to_input }
+//
+// We delegate the actual wiring to ``UMaterialEditingLibrary::ConnectMaterialExpressions``, which
+// resolves both pin names via internal ``GetExpressionInputByName`` / ``GetExpressionOutputNameByIndex``
+// helpers. The ``from_output_index`` parameter routes through the library by resolving the index back
+// to a name (via expr->GetOutputs()) — this is the public API contract.
+//
+// Errors:
+//   -32027 PIEActive
+//   -32602 InvalidParams
+//   -32010 / -32004 / -32011 (resolve material)
+//   -32004 ObjectNotFound (either guid not found in material's expressions)
+//   -32052 PinNotFound (to_input_name doesn't match any input on the to-expression OR
+//                       from_output_index is out of range)
+//   -32053 PinConnectionRefused (library refused — usually impossible since material schema is
+//                       very permissive, but kept for symmetry with bp.connect_pins)
+FMCPResponse Tool_ConnectExpressions(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	UMaterial* Material = nullptr;
+	FString Path;
+	FMCPResponse Err;
+	if (!MAT_PreWriteResolveBaseMaterial(Request, Material, Path, Err)) { return Err; }
+
+	FString FromGuidStr, ToGuidStr;
+	if (!MAT_RequireExpressionGuid(Request, TEXT("from_expression_guid"), FromGuidStr, Err)) { return Err; }
+	if (!MAT_RequireExpressionGuid(Request, TEXT("to_expression_guid"),   ToGuidStr,   Err)) { return Err; }
+
+	FString ToInputName;
+	if (!Request.Args->TryGetStringField(TEXT("to_input_name"), ToInputName) || ToInputName.IsEmpty())
+	{
+		return MAT_MakeError(Request, kMATErrorInvalidParams,
+			TEXT("missing required string field 'to_input_name' (FExpressionInput name on the to-expression)"));
+	}
+
+	int32 FromOutputIndex = 0;
+	{
+		double Tmp = 0.0;
+		if (Request.Args->TryGetNumberField(TEXT("from_output_index"), Tmp))
+		{
+			FromOutputIndex = static_cast<int32>(Tmp);
+		}
+	}
+
+	UMaterialExpression* FromExpr = MAT_FindExpressionByGuid(Material, FromGuidStr);
+	if (!FromExpr)
+	{
+		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("from_expression_guid '%s' not found in material '%s'"),
+				*FromGuidStr, *Path));
+	}
+	UMaterialExpression* ToExpr = MAT_FindExpressionByGuid(Material, ToGuidStr);
+	if (!ToExpr)
+	{
+		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("to_expression_guid '%s' not found in material '%s'"),
+				*ToGuidStr, *Path));
+	}
+
+	// Validate from_output_index against the expression's output list before delegating, so we can
+	// surface -32052 PinNotFound for an out-of-range index. The library accepts an FString output
+	// NAME (not an index), so we convert here.
+	const TArray<FExpressionOutput>& Outputs = FromExpr->GetOutputs();
+	if (FromOutputIndex < 0 || FromOutputIndex >= Outputs.Num())
+	{
+		return MAT_MakeError(Request, kMCPErrorPinNotFound,
+			FString::Printf(
+				TEXT("from_output_index %d is out of range for expression '%s' (output count=%d)"),
+				FromOutputIndex, *FromExpr->GetClass()->GetName(), Outputs.Num()));
+	}
+	const FString FromOutputName = Outputs[FromOutputIndex].OutputName.ToString();
+
+	bool bConnected = false;
+	{
+		FScopedTransaction Transaction(LOCTEXT("MCPConnectExpressions", "MCP: connect material expressions"));
+		Material->Modify();
+		ToExpr->Modify();
+		Material->PreEditChange(nullptr);
+
+		bConnected = UMaterialEditingLibrary::ConnectMaterialExpressions(
+			FromExpr, FromOutputName, ToExpr, ToInputName);
+
+		Material->PostEditChange();
+	}
+
+	if (!bConnected)
+	{
+		// Library returns false when the input name doesn't match or output-index lookup fails.
+		// Output-index already validated above → narrowing to PinNotFound on the to-side.
+		return MAT_MakeError(Request, kMCPErrorPinNotFound,
+			FString::Printf(
+				TEXT("to_input_name '%s' not found on expression '%s' (UMaterialEditingLibrary::ConnectMaterialExpressions refused)"),
+				*ToInputName, *ToExpr->GetClass()->GetName()));
+	}
+
+	Material->GetOutermost()->MarkPackageDirty();
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("connected"), true);
+	Out->SetStringField(TEXT("from_guid"),    FromGuidStr);
+	Out->SetStringField(TEXT("from_output"),  FromOutputName);
+	Out->SetNumberField(TEXT("from_output_index"), FromOutputIndex);
+	Out->SetStringField(TEXT("to_guid"),      ToGuidStr);
+	Out->SetStringField(TEXT("to_input"),     ToInputName);
+	return MAT_MakeSuccessObj(Request, Out);
+}
+
+// ─── mat.set_expression_parameter ──────────────────────────────────────────────────────────────
+//
+// Args:    { material_path: string,
+//            expression_guid: string,
+//            property_name:   string  (UPROPERTY name on the expression's UClass — e.g.
+//                                       "Constant" on Constant3Vector, "DefaultValue" on
+//                                       ScalarParameter, "ParameterName" on any parameter),
+//            value:           <typed JSON> }
+// Result:  { prior_value: <JSON>, new_value: <JSON>, property_name }
+//
+// Reuses FMCPReflection::WritePropertyValueAt — same JSON shape contract as bp.set_node_property /
+// marshall.write_property: numbers as numbers, FLinearColor as {r,g,b,a}, etc.
+//
+// Errors:
+//   -32027 PIEActive
+//   -32602 InvalidParams
+//   -32010 / -32004 / -32011 (resolve material)
+//   -32004 ObjectNotFound (expression_guid not in material)
+//   -32005 PropertyNotFound (property_name not on expression's UClass)
+//   -32006 PropertyTypeMismatch (JSON value doesn't fit property type)
+//   -32007 PropertyAccessDenied (edit-const gate blocked the write)
+FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	UMaterial* Material = nullptr;
+	FString Path;
+	FMCPResponse Err;
+	if (!MAT_PreWriteResolveBaseMaterial(Request, Material, Path, Err)) { return Err; }
+
+	FString ExprGuidStr;
+	if (!MAT_RequireExpressionGuid(Request, TEXT("expression_guid"), ExprGuidStr, Err)) { return Err; }
+
+	FString PropertyName;
+	if (!Request.Args->TryGetStringField(TEXT("property_name"), PropertyName) || PropertyName.IsEmpty())
+	{
+		return MAT_MakeError(Request, kMATErrorInvalidParams,
+			TEXT("missing required string field 'property_name'"));
+	}
+
+	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
+	if (!ValueField.IsValid())
+	{
+		return MAT_MakeError(Request, kMATErrorInvalidParams,
+			TEXT("missing required field 'value' (any JSON value matching the property type)"));
+	}
+
+	UMaterialExpression* Expression = MAT_FindExpressionByGuid(Material, ExprGuidStr);
+	if (!Expression)
+	{
+		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("expression_guid '%s' not found in material '%s'"),
+				*ExprGuidStr, *Path));
+	}
+
+	FProperty* Prop = Expression->GetClass()->FindPropertyByName(FName(*PropertyName));
+	if (!Prop)
+	{
+		return MAT_MakeError(Request, kMCPErrorPropertyNotFound,
+			FString::Printf(TEXT("property '%s' not found on expression class '%s'"),
+				*PropertyName, *Expression->GetClass()->GetPathName()));
+	}
+
+	// Edit-const gate. Material expressions seldom flag their UPROPERTIES with these flags but the
+	// gate matches the bp.set_node_property contract for consistency. bypass_readonly opt-out
+	// mirrors the MIC writes.
+	bool bBypassReadonly = false;
+	Request.Args->TryGetBoolField(TEXT("bypass_readonly"), bBypassReadonly);
+	if (!MAT_PassEditConstGate(Prop, bBypassReadonly))
+	{
+		return MAT_MakeError(Request, kMCPErrorPropertyAccessDenied,
+			FString::Printf(
+				TEXT("property '%s.%s' blocked by CPF_EditConst/BlueprintReadOnly/DisableEditOnInstance; ")
+				TEXT("pass args.bypass_readonly=true to override"),
+				*Expression->GetClass()->GetName(), *PropertyName));
+	}
+
+	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Expression);
+	TSharedPtr<FJsonValue> PriorValue = FMCPReflection::ReadPropertyValueAt(Prop, ValuePtr);
+
+	FString WriteError;
+	bool bWriteOk = false;
+	{
+		// Transaction + Pre/PostEditChange go around the whole material recompile cascade, not just
+		// the expression write. The FMCPWritePropertyScope handles the per-property Pre/Post on the
+		// expression itself; the outer block handles the material's Pre/PostEditChange.
+		FScopedTransaction Transaction(LOCTEXT("MCPSetExpressionParameter", "MCP: set material expression property"));
+		Material->Modify();
+		Material->PreEditChange(nullptr);
+
+		{
+			FMCPWritePropertyScope Scope(Expression, Prop,
+				LOCTEXT("MCPSetExprPropInner", "MCP: set expression property (inner)"));
+			bWriteOk = FMCPReflection::WritePropertyValueAt(Prop, ValuePtr, ValueField, Expression, WriteError);
+		}
+
+		Material->PostEditChange();
+	}
+
+	if (!bWriteOk)
+	{
+		return MAT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+			FString::Printf(TEXT("write rejected on '%s.%s': %s"),
+				*Expression->GetClass()->GetName(), *PropertyName, *WriteError));
+	}
+
+	TSharedPtr<FJsonValue> NewValue = FMCPReflection::ReadPropertyValueAt(Prop, ValuePtr);
+	Material->GetOutermost()->MarkPackageDirty();
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("expression_guid"), ExprGuidStr);
+	Out->SetStringField(TEXT("expression_class"), Expression->GetClass()->GetPathName());
+	Out->SetStringField(TEXT("property_name"), PropertyName);
+	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
+	Out->SetField(TEXT("new_value"),   NewValue.IsValid()   ? NewValue   : MakeShared<FJsonValueNull>());
+	return MAT_MakeSuccessObj(Request, Out);
+}
+
+// ─── mat.delete_expression ─────────────────────────────────────────────────────────────────────
+//
+// Args:    { material_path: string, expression_guid: string }
+// Result:  { deleted: bool, cleared_connections_count: int }
+//
+// Walks every OTHER expression in the material's ExpressionCollection, plus the material's own
+// EMaterialProperty inputs (BaseColor, Metallic, etc.), and counts/clears any FExpressionInput
+// whose Expression pointer is the doomed expression. Then removes the expression from the
+// collection via UMaterialEditingLibrary::DeleteMaterialExpression which:
+//   - calls BreakLinksToExpression (covers ALL inputs of all other expressions exhaustively)
+//   - walks material property inputs (BaseColor, Metallic, Roughness, etc.)
+//   - calls RemoveExpressionParameter (cleans up EditorParameters cache)
+//   - removes from ExpressionCollection
+//   - marks expression as garbage
+//   - MarkPackageDirty
+//
+// We still pre-count the connections we'd break so we can surface ``cleared_connections_count``
+// to the caller (the library's BreakLinksToExpression doesn't return a count).
+//
+// Errors:
+//   -32027 PIEActive
+//   -32602 InvalidParams
+//   -32010 / -32004 / -32011 (resolve material)
+//   -32004 ObjectNotFound (expression_guid not in material)
+FMCPResponse Tool_DeleteExpression(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	UMaterial* Material = nullptr;
+	FString Path;
+	FMCPResponse Err;
+	if (!MAT_PreWriteResolveBaseMaterial(Request, Material, Path, Err)) { return Err; }
+
+	FString ExprGuidStr;
+	if (!MAT_RequireExpressionGuid(Request, TEXT("expression_guid"), ExprGuidStr, Err)) { return Err; }
+
+	UMaterialExpression* TargetExpr = MAT_FindExpressionByGuid(Material, ExprGuidStr);
+	if (!TargetExpr)
+	{
+		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("expression_guid '%s' not found in material '%s'"),
+				*ExprGuidStr, *Path));
+	}
+
+	// Pre-count connections we'll clear. Walks every OTHER expression's inputs + the material's
+	// EMaterialProperty inputs. Mirrors the library's BreakLinksToExpression scope so the count
+	// reflects what's actually cleared. We use FExpressionInputIterator on each other-expression
+	// (the canonical UE 5.7 traversal — GetInputsView is deprecated).
+	int32 ClearedConnections = 0;
+	for (UMaterialExpression* Other : Material->GetExpressions())
+	{
+		if (!Other || Other == TargetExpr) { continue; }
+		for (FExpressionInputIterator It{ Other }; It; ++It)
+		{
+			if (It.Input && It.Input->Expression == TargetExpr)
+			{
+				++ClearedConnections;
+			}
+		}
+	}
+	// Material-property inputs (BaseColor, Metallic, etc.).
+	for (int32 PropertyIdx = 0; PropertyIdx < MP_MAX; ++PropertyIdx)
+	{
+		FExpressionInput* PropInput = Material->GetExpressionInputForProperty(
+			static_cast<EMaterialProperty>(PropertyIdx));
+		if (PropInput && PropInput->Expression == TargetExpr)
+		{
+			++ClearedConnections;
+		}
+	}
+
+	{
+		FScopedTransaction Transaction(LOCTEXT("MCPDeleteExpression", "MCP: delete material expression"));
+		Material->Modify();
+		Material->PreEditChange(nullptr);
+
+		// Library handles: BreakLinksToExpression + MP_* input clear + RemoveExpressionParameter +
+		// ExpressionCollection.RemoveExpression + MarkAsGarbage + MarkPackageDirty.
+		UMaterialEditingLibrary::DeleteMaterialExpression(Material, TargetExpr);
+
+		Material->PostEditChange();
+	}
+
+	// MarkPackageDirty is also called inside DeleteMaterialExpression — redundant here is fine.
+	Material->GetOutermost()->MarkPackageDirty();
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("deleted"), true);
+	Out->SetNumberField(TEXT("cleared_connections_count"), static_cast<double>(ClearedConnections));
+	Out->SetStringField(TEXT("expression_guid"), ExprGuidStr);
+	return MAT_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -1274,8 +1842,17 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("material.create_instance"),    &Tool_CreateInstance,    /*Lane A*/ false);
 	RegisterTool(TEXT("material.get_compile_errors"), &Tool_GetCompileErrors,  /*Lane A*/ false);
 
+	// Wave G Surface 2: material graph node editing (4 tools, all Lane A, PIE-guarded).
+	// All 4 require a base UMaterial (NOT an instance) — instance graphs aren't mutable. Wrong
+	// asset class surfaces -32011 WrongClass. Reuses existing Phase 2/3/4 error codes.
+	RegisterTool(TEXT("mat.add_expression"),            &Tool_AddExpression,           /*Lane A*/ false);
+	RegisterTool(TEXT("mat.connect_expressions"),       &Tool_ConnectExpressions,      /*Lane A*/ false);
+	RegisterTool(TEXT("mat.set_expression_parameter"),  &Tool_SetExpressionParameter,  /*Lane A*/ false);
+	RegisterTool(TEXT("mat.delete_expression"),         &Tool_DeleteExpression,        /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 4 Days 11-14: registered 9 material.* handlers (2 reads + 4 MIC writes + 1 create + 2 diagnostic, all Lane A)"));
+		TEXT("Phase 4 Days 11-14 + Wave G S2: registered 13 material/mat.* handlers ")
+		TEXT("(2 reads + 4 MIC writes + 1 create + 2 diagnostic + 4 graph-node editors, all Lane A)"));
 }
 
 } // namespace FMaterialTools
