@@ -27,6 +27,7 @@
 #include "Tools/FolderTools.h"
 #include "Tools/GameplayTagTools.h"
 #include "Tools/LevelCompositeTools.h"
+#include "Tools/LevelStreamingTools.h"
 #include "Tools/LevelTools.h"
 #include "Tools/LiveCodingTools.h"
 #include "Tools/LogTools.h"
@@ -340,6 +341,28 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Reads bypass PIE guard; mutators refuse PIE with -32027. New error code -32056
 	// FolderNotFound for folder.delete on a non-existent path.
 	FFolderTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave D Surface 5 2026-05: Level streaming sub-level management surface (4 tools, all
+	// Lane A).
+	//   level_streaming.list         - enumerate ULevelStreaming entries of a persistent world
+	//                                   (defaults to current editor world when no path supplied);
+	//                                   per-entry: sublevel_path, level_class, package_name,
+	//                                   is_loaded, is_visible, should_be_loaded, should_be_visible.
+	//   level_streaming.add          - UEditorLevelUtils::AddLevelToWorld(World, PackageName,
+	//                                   ULevelStreamingDynamic, FTransform). PIE-guarded.
+	//                                   Refuses with -32014 PathInUse when the sublevel is already
+	//                                   in the streaming list (deterministic no-op detection).
+	//   level_streaming.remove       - UEditorLevelUtils::RemoveLevelFromWorld (or
+	//                                   RemoveInvalidLevelFromWorld when ULevel isn't loaded).
+	//                                   PIE-guarded.
+	//   level_streaming.set_loaded   - mutate bShouldBeLoaded + bShouldBeVisible on a
+	//                                   ULevelStreaming instance. PIE-safe (no guard); PIE-first/
+	//                                   editor-fallback world resolution. FlushLevelStreaming
+	//                                   only when NOT in PIE (runtime tick drains during PIE).
+	// Reuses existing error codes — no new codes introduced. Distinct from Phase 3's
+	// level.set_streaming_state (which is editor-world only + PIE-guarded) — both call the
+	// same SetShouldBe* under the hood but differ in gate semantics.
+	FLevelStreamingTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
