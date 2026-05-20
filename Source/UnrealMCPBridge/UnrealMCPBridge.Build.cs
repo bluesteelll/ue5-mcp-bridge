@@ -117,6 +117,10 @@ public class UnrealMCPBridge : ModuleRules
 				// plugins and are loaded by their own modules — we never reference them directly
 				// (we go through the abstract ISourceControlProvider interface).
 				"SourceControl",
+				// Wave D Surface 1 2026-05 — GameplayTag surface.
+				// UGameplayTagsManager + FGameplayTag + FGameplayTagContainer + IGameplayTagAssetInterface
+				// live in the Runtime/GameplayTags module.
+				"GameplayTags",
 			}
 		);
 

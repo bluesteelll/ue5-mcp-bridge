@@ -23,6 +23,7 @@
 #include "Tools/ConfigTools.h"
 #include "Tools/ContentBrowserTools.h"
 #include "Tools/EditorTools.h"
+#include "Tools/GameplayTagTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
 #include "Tools/LiveCodingTools.h"
@@ -299,6 +300,13 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Scope-reduced from original spec (wp.list_cells / wp.load_cell / wp.set_runtime_grid) —
 	// per-actor runtime-grid edits are the most-needed write op and don't need streaming runtime.
 	FWorldPartitionTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave D Surface 1 2026-05: GameplayTag surface (4 tools, all Lane A).
+	//   gameplaytag.list                  — UGameplayTagsManager registered tag enumeration
+	//   gameplaytag.query_actor           — IGameplayTagAssetInterface OR property-reflection
+	//   gameplaytag.add_to_container      — append tag to named FGameplayTagContainer UPROPERTY
+	//   gameplaytag.remove_from_container — remove tag from same
+	FGameplayTagTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
