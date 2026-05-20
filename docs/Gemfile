@@ -1,0 +1,12 @@
+# Gemfile for GitHub Pages with Just the Docs theme
+source "https://rubygems.org"
+
+gem "jekyll", "~> 4.3"
+gem "just-the-docs", "~> 0.10"
+gem "jekyll-remote-theme"
+gem "jekyll-seo-tag"
+gem "jekyll-sitemap"
+
+group :jekyll_plugins do
+  gem "jekyll-feed"
+end

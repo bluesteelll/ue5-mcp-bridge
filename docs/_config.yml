@@ -1,0 +1,29 @@
+title: UE5 MCP Bridge
+description: Model Context Protocol bridge plugin for Unreal Engine 5.7 — 274+ editor tools for scripted UE workflow via TCP
+remote_theme: just-the-docs/just-the-docs
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+
+# Just-the-Docs settings
+color_scheme: dark
+search_enabled: true
+search:
+  heading_level: 3
+  previews: 3
+heading_anchors: true
+aux_links:
+  "GitHub":
+    - "//github.com/bluesteelll/ue5-mcp-bridge"
+nav_external_links:
+  - title: Source on GitHub
+    url: https://github.com/bluesteelll/ue5-mcp-bridge
+    hide_icon: false
+
+# Navigation
+nav_sort: case_insensitive
+back_to_top: true
+back_to_top_text: "Back to top"
+
+# Footer
+footer_content: "© 2026 ue5-mcp-bridge contributors. Documentation built with <a href='https://github.com/just-the-docs/just-the-docs'>Just the Docs</a>."
