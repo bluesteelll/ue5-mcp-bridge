@@ -45,6 +45,7 @@
 #include "Tools/TransformTools.h"
 #include "Tools/UFunctionTools.h"
 #include "Tools/UMGTools.h"
+#include "Tools/ViewportTools.h"
 #include "Tools/WorldPartitionTools.h"
 
 #include "Dom/JsonObject.h"
@@ -477,6 +478,21 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Combined with the 3 Phase 1 log.* tools (log.tail / log.search / log.subscribe) this brings
 	// the log.* surface to 6 user-visible tools total. New error code: -32049 LogCategoryUnknown.
 	FLogTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave E Surface 1 2026-05: Viewport surface (4 tools, all Lane A).
+	//   viewport.list             - enumerate FLevelEditorViewportClient entries with index +
+	//                                type + active-flag + per-viewport camera state.
+	//   viewport.get_camera       - read one viewport's camera by index (default 0).
+	//   viewport.set_camera       - teleport one viewport's camera; at least one of
+	//                                location/rotation/fov required; returns prior+new diff.
+	//   viewport.focus_on_actor   - FLevelEditorViewportClient::FocusViewportOnBox(Bounds,
+	//                                bInstant=true) framing by actor_path; padding expands box.
+	// Reuses existing error codes: -32004 (no viewports / actor missing for focus),
+	// -32026 (viewport_index out of range), -32602 (no fields supplied to set_camera /
+	// malformed vector|rotator). No PIE guard (editor viewport remains accessible during PIE);
+	// no FScopedTransaction (viewport state isn't on undo stack); no MarkPackageDirty (no
+	// asset state touched).
+	FViewportTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 6 Chunk E: Live Coding surface (1 async composite — livecoding.recompile, Python
 	// wrapper in phase6_composites.py). Backing internal handler livecoding._recompile_internal
