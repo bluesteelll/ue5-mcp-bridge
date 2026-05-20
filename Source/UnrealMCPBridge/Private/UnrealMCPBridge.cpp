@@ -24,6 +24,7 @@
 #include "Tools/ComponentTools.h"
 #include "Tools/ConfigTools.h"
 #include "Tools/ContentBrowserTools.h"
+#include "Tools/DataTableTools.h"
 #include "Tools/DebugTools.h"
 #include "Tools/EditorTools.h"
 #include "Tools/EngineTools.h"
@@ -678,6 +679,25 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// effort patched_modules / failed_modules extraction from LogLiveCoding entries. New error
 	// code: -32048 LiveCodingDisabled. Build.cs adds LiveCoding private dep (Win64-only).
 	FLiveCodingTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave H Surface 1 2026-05: UDataTable tabular game data surface (4 tools, all Lane A).
+	//   data_table.list        - paginated UDataTable enumeration via IAssetRegistry::GetAssets,
+	//                             path_prefix-filtered. Per-entry { asset_path, name,
+	//                             row_struct_path, row_count }. Read-only, no PIE guard.
+	//   data_table.get_rows    - enumerate rows with FProperty field marshalling via FMCPReflection.
+	//                             Optional row_name_filter (substring); simple string-keyed
+	//                             pagination on row name. Read-only, no PIE guard.
+	//   data_table.set_row     - update existing row OR create when create_if_missing=true. Uses
+	//                             UDataTable::AddRow(FName, uint8*, UScriptStruct*) for creation
+	//                             (works with any UScriptStruct — does NOT require FTableRowBase
+	//                             derivation). PIE-guarded, FScopedTransaction + HandleDataTableChanged
+	//                             + MarkPackageDirty. Unknown field names silently skipped (counts
+	//                             into fields_skipped for caller diagnostic).
+	//   data_table.delete_row  - UDataTable::RemoveRow. PIE-guarded, transacted, marks dirty.
+	//                             No-op response (deleted=false) when row already absent.
+	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32011 / -32015 /
+	// -32027 / -32602 / -32603. No new Build.cs deps - UDataTable is in Engine (already linked).
+	FDataTableTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
