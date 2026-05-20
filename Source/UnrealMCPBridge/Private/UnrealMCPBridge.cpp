@@ -24,6 +24,7 @@
 #include "Tools/ComponentTools.h"
 #include "Tools/ConfigTools.h"
 #include "Tools/ContentBrowserTools.h"
+#include "Tools/CurveTools.h"
 #include "Tools/DataTableTools.h"
 #include "Tools/DebugTools.h"
 #include "Tools/EditorTools.h"
@@ -698,6 +699,29 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32011 / -32015 /
 	// -32027 / -32602 / -32603. No new Build.cs deps - UDataTable is in Engine (already linked).
 	FDataTableTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave H Surface 2 2026-05: Curve inspection / mutation surface (4 tools, all Lane A).
+	//   curve.list      - paginated UCurveBase + UCurveTable enumeration via IAssetRegistry::GetAssets.
+	//                      Optional ``types`` filter narrows to {UCurveFloat, UCurveLinearColor,
+	//                      UCurveVector, UCurveTable}. Per-entry { asset_path, curve_class }.
+	//                      Standard FMCPPageCursor over ObjectPath, filter hash includes types[].
+	//                      Read-only, no PIE guard.
+	//   curve.get_data  - read keyframe data. UCurveFloat → single-channel keys[]; LinearColor →
+	//                      4 channels (R/G/B/A) with channel field per key; Vector → 3 channels
+	//                      (X/Y/Z); CurveTable + ``key`` (row name) → row's float curve keys.
+	//                      Supports both RichCurves and SimpleCurves table modes. Read-only.
+	//   curve.set_data  - replace entire key set (Reset + AddKey loop). Multi-channel curves
+	//                      bucket keys by ``channel`` field before mutation; missing channel for
+	//                      multi-channel curve raises -32602. UCurveTable requires ``key``
+	//                      (row name); SimpleCurves mode rejected with -32602 for mutators.
+	//                      PIE-guarded, FScopedTransaction, MarkPackageDirty.
+	//   curve.add_key   - append or update-in-place single key (FRichCurve::UpdateOrAddKey,
+	//                      UE_KINDA_SMALL_NUMBER time tolerance). Default interp_mode = "Cubic".
+	//                      PIE-guarded, transacted, dirty. Returns { added, was_replaced,
+	//                      new_key_count }.
+	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32011 / -32015 /
+	// -32027 / -32602 / -32603. No new Build.cs deps - all curve headers in Engine (already linked).
+	FCurveTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
