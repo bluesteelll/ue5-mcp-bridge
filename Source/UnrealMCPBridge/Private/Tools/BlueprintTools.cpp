@@ -2749,6 +2749,317 @@ FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
 	return BP_MakeSuccessObj(Request, Out);
 }
 
+// ─── Wave F Surface 4 — Blueprint interface implementation surface (3 tools) ─────────────────
+//
+// These tools wrap FBlueprintEditorUtils's interface APIs:
+//   add    → ImplementNewInterface(UBlueprint*, FTopLevelAssetPath)  (UE 5.7 signature; the
+//            FName overload is deprecated since 5.1)
+//   remove → RemoveInterface(UBlueprint*, FTopLevelAssetPath, bPreserveFunctions=false)
+//            We pass bPreserveFunctions=false: the brief says "remove" — promoting interface
+//            graphs to standalone functions is a separate user intent. If callers ever need
+//            preserve-promote semantics, a follow-up surface can expose it.
+//
+// "Generated event count" on add: ImplementNewInterface populates FBPInterfaceDescription.Graphs
+// with one UEdGraph per interface UFUNCTION that has a non-void return signature — these become
+// the auto-generated function override stubs. Pure events (void return, no outputs) are wired
+// via the EventGraph as CustomEvent nodes and don't appear in Graphs[]. We report the Graphs[]
+// count as a usable proxy for "what UE materialised for you"; a fully accurate event-vs-function
+// breakdown would require walking the interface UClass's UFUNCTIONs manually, which we skip per
+// brief scope.
+
+namespace
+{
+	/**
+	 * Resolve an interface UClass from the ``interface_class_path`` arg.
+	 *
+	 * Steps:
+	 *   1. Read the string arg → -32602 InvalidParams on missing/empty.
+	 *   2. BP_ResolveClassOrError handles path-syntax + LoadObject failure ( -32023 / -32020 ).
+	 *   3. Confirm the resolved UClass has CLASS_Interface → -32011 WrongClass otherwise.
+	 *
+	 * Returns nullptr + populates OutError on any failure.
+	 */
+	UClass* BP_ResolveInterfaceClassOrError(
+		const FMCPRequest& Request,
+		FString& OutInterfaceClassPath,
+		FMCPResponse& OutError)
+	{
+		if (!Request.Args.IsValid())
+		{
+			OutError = BP_MakeError(Request, kBPErrorInvalidParams, TEXT("missing args object"));
+			return nullptr;
+		}
+		if (!Request.Args->TryGetStringField(TEXT("interface_class_path"), OutInterfaceClassPath)
+			|| OutInterfaceClassPath.IsEmpty())
+		{
+			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+				TEXT("missing required string field 'interface_class_path'"));
+			return nullptr;
+		}
+
+		UClass* InterfaceClass = BP_ResolveClassOrError(Request, OutInterfaceClassPath, OutError);
+		if (!InterfaceClass) { return nullptr; }
+
+		if (!InterfaceClass->HasAnyClassFlags(CLASS_Interface))
+		{
+			OutError = BP_MakeError(Request, kMCPErrorWrongClass,
+				FString::Printf(
+					TEXT("interface_class_path '%s' resolves to UClass '%s' but it is not a UInterface "
+						 "(CLASS_Interface flag absent); pass a path to an interface class such as "
+						 "'/Script/Engine.ActorSoundParameterInterface' or a /Game/.../UIM_*_C BP interface"),
+					*OutInterfaceClassPath, *InterfaceClass->GetName()));
+			return nullptr;
+		}
+		return InterfaceClass;
+	}
+}
+
+// ─── bp.add_interface (Lane A, PIE-guarded) ──────────────────────────────────────────────────
+//
+// Implements a UInterface on the blueprint via FBlueprintEditorUtils::ImplementNewInterface.
+// UE 5.7 signature takes an FTopLevelAssetPath (FName overload is deprecated since 5.1).
+//
+// Behaviour:
+//   - Pre-check duplicate via Blueprint->ImplementedInterfaces scan → -32014 PathInUse rather
+//     than silent no-op (matches the explicit-rejection precedent of bp.add_function_parameter).
+//   - FScopedTransaction so the editor's Undo/Redo can reverse the implement.
+//   - MarkBlueprintAsStructurallyModified retriggers skeleton compile so the new interface UClass
+//     surfaces on the generated UFunction list.
+//   - Report Graphs.Num() from the new FBPInterfaceDescription as ``generated_event_count``
+//     (proxy for "how many auto-generated function override stubs UE materialised" — see surface
+//     comment above for accuracy caveat).
+//
+// Args:    { blueprint_path: string, interface_class_path: string }
+// Result:  { added: bool, interface_class: "/Script/.../IFoo", generated_event_count: int }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (blueprint resolve)
+//   -32602 InvalidParams           — missing interface_class_path
+//   -32023 InvalidClassPath        — interface path malformed
+//   -32020 ClassNotFound           — interface path doesn't load
+//   -32011 WrongClass              — resolved class is not a UInterface
+//   -32014 PathInUse               — interface already implemented
+//   -32603 Internal                — ImplementNewInterface returned false
+FMCPResponse Tool_AddInterface(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, PathErr);
+	if (!Blueprint) { return PathErr; }
+
+	FString InterfaceClassPath;
+	FMCPResponse InterfaceErr;
+	UClass* InterfaceClass = BP_ResolveInterfaceClassOrError(Request, InterfaceClassPath, InterfaceErr);
+	if (!InterfaceClass) { return InterfaceErr; }
+
+	// Duplicate check: refuse rather than silently no-op. ImplementNewInterface itself returns
+	// false on duplicate but we want the explicit -32014 so AI callers can decide between
+	// "already done — proceed" or "log + skip".
+	for (const FBPInterfaceDescription& Desc : Blueprint->ImplementedInterfaces)
+	{
+		if (Desc.Interface == InterfaceClass)
+		{
+			return BP_MakeError(Request, kMCPErrorPathInUse,
+				FString::Printf(
+					TEXT("interface '%s' is already implemented on blueprint '%s'"),
+					*InterfaceClassPath, *Path));
+		}
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("BPAddInterface", "MCP: add blueprint interface"));
+
+	const FTopLevelAssetPath InterfacePath = InterfaceClass->GetClassPathName();
+	const bool bImplemented = FBlueprintEditorUtils::ImplementNewInterface(Blueprint, InterfacePath);
+	if (!bImplemented)
+	{
+		return BP_MakeError(Request, kBPErrorInternal,
+			FString::Printf(
+				TEXT("FBlueprintEditorUtils::ImplementNewInterface returned false for '%s' on '%s' "
+					 "(interface may carry CannotImplementInterfaceInBlueprint meta, OR the BP's parent "
+					 "class already implements it natively)"),
+				*InterfaceClassPath, *Path));
+	}
+
+	// StructurallyModified triggers RegenerateSkeletonOnly so the new UFunction shape surfaces on
+	// the generated UFunction list. ImplementNewInterface internally calls Modify() on the BP +
+	// MarkBlueprintAsModified, but the structural variant is needed for the skeleton-class
+	// regeneration that adds the interface's UFunctions to GeneratedClass.
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	// Count auto-generated function-override graphs UE materialised for this interface. Pure events
+	// (void return, no outputs) get wired via the EventGraph as CustomEvent nodes and don't appear
+	// in Graphs[] — so this count is "function stubs generated", NOT "total interface events".
+	int32 GeneratedEventCount = 0;
+	for (const FBPInterfaceDescription& Desc : Blueprint->ImplementedInterfaces)
+	{
+		if (Desc.Interface == InterfaceClass)
+		{
+			GeneratedEventCount = Desc.Graphs.Num();
+			break;
+		}
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("added"), true);
+	Out->SetStringField(TEXT("interface_class"), InterfacePath.ToString());
+	Out->SetNumberField(TEXT("generated_event_count"), GeneratedEventCount);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.remove_interface (Lane A, PIE-guarded) ───────────────────────────────────────────────
+//
+// Removes a UInterface implementation from the blueprint via FBlueprintEditorUtils::RemoveInterface.
+// UE 5.7 signature takes an FTopLevelAssetPath (FName overload deprecated since 5.1).
+//
+// We pass bPreserveFunctions=false per brief: any auto-generated function graphs are discarded
+// alongside the interface entry. A future surface could expose bPreserveFunctions=true (promotes
+// the graphs to standalone functions) if a caller actually needs that path.
+//
+// Pre-check: -32004 ObjectNotFound if the interface isn't currently implemented on this BP.
+// (RemoveInterface returns void, so a missing-interface case would silently no-op without this
+// gate.)
+//
+// Args:    { blueprint_path: string, interface_class_path: string }
+// Result:  { removed: bool }
+//
+// Errors:
+//   -32027 PIEActive
+//   -32010 / -32004 / -32031 (blueprint resolve)
+//   -32602 InvalidParams           — missing interface_class_path
+//   -32023 InvalidClassPath        — interface path malformed
+//   -32020 ClassNotFound           — interface path doesn't load
+//   -32011 WrongClass              — resolved class is not a UInterface
+//   -32004 ObjectNotFound          — interface not currently implemented on the blueprint
+FMCPResponse Tool_RemoveInterface(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, PathErr);
+	if (!Blueprint) { return PathErr; }
+
+	FString InterfaceClassPath;
+	FMCPResponse InterfaceErr;
+	UClass* InterfaceClass = BP_ResolveInterfaceClassOrError(Request, InterfaceClassPath, InterfaceErr);
+	if (!InterfaceClass) { return InterfaceErr; }
+
+	bool bWasImplemented = false;
+	for (const FBPInterfaceDescription& Desc : Blueprint->ImplementedInterfaces)
+	{
+		if (Desc.Interface == InterfaceClass)
+		{
+			bWasImplemented = true;
+			break;
+		}
+	}
+	if (!bWasImplemented)
+	{
+		return BP_MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(
+				TEXT("interface '%s' is not implemented on blueprint '%s'; nothing to remove"),
+				*InterfaceClassPath, *Path));
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("BPRemoveInterface", "MCP: remove blueprint interface"));
+
+	const FTopLevelAssetPath InterfacePath = InterfaceClass->GetClassPathName();
+	FBlueprintEditorUtils::RemoveInterface(Blueprint, InterfacePath, /*bPreserveFunctions*/ false);
+
+	// StructurallyModified retriggers skeleton compile so the removed UFunctions drop out of the
+	// generated class. Mirrors the add path.
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetBoolField(TEXT("removed"), true);
+	Out->SetStringField(TEXT("interface_class"), InterfacePath.ToString());
+	return BP_MakeSuccessObj(Request, Out);
+}
+
+// ─── bp.list_interfaces (Lane A, read — no PIE guard) ────────────────────────────────────────
+//
+// Enumerates interfaces implemented on the blueprint. By default also walks the parent UClass's
+// FImplementedInterface array so the caller sees the FULL set the generated class will expose,
+// including native interfaces inherited from ParentClass.
+//
+// source="blueprint" entries come from UBlueprint::ImplementedInterfaces (added by this BP);
+// source="parent" entries come from ParentClass->Interfaces (inherited from a native or BP base).
+// Deduplication: a parent-implemented interface that the BP also re-implements appears ONCE with
+// source="blueprint" — the BP's explicit choice takes precedence in the display order.
+//
+// Args:    { blueprint_path: string, include_parent_interfaces?: bool (default true) }
+// Result:  { implemented_interfaces: [{ interface_class: "/Script/...", source: "blueprint"|"parent" }] }
+//
+// Errors:
+//   -32010 / -32004 / -32031 (blueprint resolve)
+FMCPResponse Tool_ListInterfaces(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FString Path;
+	FMCPResponse PathErr;
+	if (!BP_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+
+	UBlueprint* Blueprint = BP_ResolveBlueprintOrError(Request, Path, PathErr);
+	if (!Blueprint) { return PathErr; }
+
+	bool bIncludeParent = true;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetBoolField(TEXT("include_parent_interfaces"), bIncludeParent);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Items;
+	Items.Reserve(Blueprint->ImplementedInterfaces.Num() + (bIncludeParent ? 4 : 0));
+
+	// Track which UClass*s we've already emitted so parent-class dups don't double-list.
+	TSet<UClass*> Seen;
+	Seen.Reserve(Blueprint->ImplementedInterfaces.Num());
+
+	for (const FBPInterfaceDescription& Desc : Blueprint->ImplementedInterfaces)
+	{
+		UClass* IfaceClass = Desc.Interface.Get();
+		if (!IfaceClass) { continue; }   // dangling reference (e.g. interface asset deleted)
+		Seen.Add(IfaceClass);
+
+		TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("interface_class"), IfaceClass->GetClassPathName().ToString());
+		Entry->SetStringField(TEXT("source"), TEXT("blueprint"));
+		Items.Add(MakeShared<FJsonValueObject>(Entry));
+	}
+
+	if (bIncludeParent && Blueprint->ParentClass)
+	{
+		for (const FImplementedInterface& II : Blueprint->ParentClass->Interfaces)
+		{
+			UClass* IfaceClass = II.Class;
+			if (!IfaceClass) { continue; }
+			if (Seen.Contains(IfaceClass)) { continue; }   // BP already declared it — keep "blueprint" source
+			Seen.Add(IfaceClass);
+
+			TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("interface_class"), IfaceClass->GetClassPathName().ToString());
+			Entry->SetStringField(TEXT("source"), TEXT("parent"));
+			Items.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+	}
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetArrayField(TEXT("implemented_interfaces"), Items);
+	return BP_MakeSuccessObj(Request, Out);
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -2803,9 +3114,15 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("bp.list_function_parameters"),  &Tool_ListFunctionParameters,  /*Lane A*/ false);
 	RegisterTool(TEXT("bp.set_function_metadata"),     &Tool_SetFunctionMetadata,     /*Lane A*/ false);
 
+	// Wave F Surface 4 — interface-implementation surface (3 tools, all Lane A — UBlueprint
+	// mutation requires the game thread). add/remove are PIE-guarded; list is a pure read.
+	RegisterTool(TEXT("bp.add_interface"),    &Tool_AddInterface,    /*Lane A*/ false);
+	RegisterTool(TEXT("bp.remove_interface"), &Tool_RemoveInterface, /*Lane A*/ false);
+	RegisterTool(TEXT("bp.list_interfaces"),  &Tool_ListInterfaces,  /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 4 Days 1-10 + bp.create_blueprint + Wave F2: registered 18 bp.* handlers "
-			 "(6 reads + 6 writes + 1 compile + 1 creator + 4 function-signature, all Lane A); ")
+		TEXT("Phase 4 Days 1-10 + bp.create_blueprint + Wave F2 + Wave F4: registered 21 bp.* handlers "
+			 "(6 reads + 6 writes + 1 compile + 1 creator + 4 function-signature + 3 interface, all Lane A); ")
 		TEXT("bp.compile_all_dirty registered separately via FBlueprintCompositeTools"));
 }
 

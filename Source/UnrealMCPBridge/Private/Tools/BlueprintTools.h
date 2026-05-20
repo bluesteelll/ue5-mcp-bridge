@@ -121,4 +121,15 @@ namespace FBlueprintTools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_ListFunctionParameters(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request);
+
+	// ─── Wave F Surface 4 — Blueprint interface implementation surface (3 tools) ─────────────────
+	//
+	// Adds/removes/lists UInterface entries on UBlueprint::ImplementedInterfaces via
+	// FBlueprintEditorUtils::{ImplementNewInterface,RemoveInterface}. add/remove are PIE-guarded
+	// writes (FScopedTransaction-wrapped + MarkBlueprintAsStructurallyModified); list is a pure
+	// read with no PIE guard. All Lane A — UBlueprint mutation requires the game thread (deferred
+	// compile + CDO touches under GC lock).
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddInterface(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_RemoveInterface(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ListInterfaces(const FMCPRequest& Request);
 }

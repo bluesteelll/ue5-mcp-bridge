@@ -26,60 +26,60 @@
 
 namespace
 {
-	// BPC_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess collide with
+	// BPSCS_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess collide with
 	// UE's global ValueOrError templates AND with the per-translation-unit BP_/CMP_/BGT_ helpers
 	// already living under the same LOCTEXT namespace).
-	constexpr int32 kBPCErrorInvalidParams = -32602;
-	constexpr int32 kBPCErrorInternal      = -32603;
+	constexpr int32 kBPSCSErrorInvalidParams = -32602;
+	constexpr int32 kBPSCSErrorInternal      = -32603;
 
-	void BPC_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
+	void BPSCS_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
 	{
 		Response.RequestId = Request.RequestId;
 		Response.OriginalIdString = Request.OriginalIdString;
 	}
 
-	FMCPResponse BPC_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
+	FMCPResponse BPSCS_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
 	{
 		FMCPResponse R;
-		BPC_StampIds(Request, R);
+		BPSCS_StampIds(Request, R);
 		R.bIsError = true;
 		R.ErrorCode = Code;
 		R.ErrorMessage = Message;
 		return R;
 	}
 
-	FMCPResponse BPC_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
+	FMCPResponse BPSCS_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
 	{
 		FMCPResponse R;
-		BPC_StampIds(Request, R);
+		BPSCS_StampIds(Request, R);
 		R.bIsError = false;
 		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
 		return R;
 	}
 
 	/** Frozen PIE-mutator refusal — every BP-SCS write surfaces this exact pair. */
-	FMCPResponse BPC_MakePIEError(const FMCPRequest& Request)
+	FMCPResponse BPSCS_MakePIEError(const FMCPRequest& Request)
 	{
-		return BPC_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return BPSCS_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	/** True if PIE is running. */
-	bool BPC_IsPIEActive()
+	bool BPSCS_IsPIEActive()
 	{
 		return FMCPWorldContext::IsPIEActive();
 	}
 
 	/** Read ``args.blueprint_path`` field; emit -32602 InvalidParams on missing/empty. */
-	bool BPC_RequireBlueprintPath(const FMCPRequest& Request, FString& OutPath, FMCPResponse& OutError)
+	bool BPSCS_RequireBlueprintPath(const FMCPRequest& Request, FString& OutPath, FMCPResponse& OutError)
 	{
 		if (!Request.Args.IsValid())
 		{
-			OutError = BPC_MakeError(Request, kBPCErrorInvalidParams, TEXT("missing args object"));
+			OutError = BPSCS_MakeError(Request, kBPSCSErrorInvalidParams, TEXT("missing args object"));
 			return false;
 		}
 		if (!Request.Args->TryGetStringField(TEXT("blueprint_path"), OutPath) || OutPath.IsEmpty())
 		{
-			OutError = BPC_MakeError(Request, kBPCErrorInvalidParams,
+			OutError = BPSCS_MakeError(Request, kBPSCSErrorInvalidParams,
 				TEXT("missing required string field 'blueprint_path'"));
 			return false;
 		}
@@ -87,14 +87,14 @@ namespace
 	}
 
 	/** Resolve a blueprint by path with type validation. Returns nullptr + populates OutError on failure. */
-	UBlueprint* BPC_ResolveBlueprintOrError(const FMCPRequest& Request, const FString& Path, FMCPResponse& OutError)
+	UBlueprint* BPSCS_ResolveBlueprintOrError(const FMCPRequest& Request, const FString& Path, FMCPResponse& OutError)
 	{
 		int32 ErrCode = 0;
 		FString ErrMsg;
 		UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(Path, ErrCode, ErrMsg);
 		if (!Blueprint)
 		{
-			OutError = BPC_MakeError(Request, ErrCode, ErrMsg);
+			OutError = BPSCS_MakeError(Request, ErrCode, ErrMsg);
 			return nullptr;
 		}
 		return Blueprint;
@@ -109,12 +109,12 @@ namespace
 	 *   -32021 ClassAbstract     — class has CLASS_Abstract
 	 *   -32011 WrongClass        — not a UActorComponent subclass (e.g. AActor path passed)
 	 */
-	UClass* BPC_ResolveComponentClass(const FMCPRequest& Request, const FString& ClassPath,
+	UClass* BPSCS_ResolveComponentClass(const FMCPRequest& Request, const FString& ClassPath,
 		FMCPResponse& OutError)
 	{
 		if (ClassPath.IsEmpty() || ClassPath[0] != TEXT('/'))
 		{
-			OutError = BPC_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = BPSCS_MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(
 					TEXT("component_class_path '%s' invalid — must start with '/' (e.g. '/Script/Engine.StaticMeshComponent')"),
 					*ClassPath));
@@ -122,7 +122,7 @@ namespace
 		}
 		if (ClassPath.Contains(TEXT("\\")))
 		{
-			OutError = BPC_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = BPSCS_MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(TEXT("component_class_path '%s' contains backslash"), *ClassPath));
 			return nullptr;
 		}
@@ -136,7 +136,7 @@ namespace
 		}
 		if (!Class)
 		{
-			OutError = BPC_MakeError(Request, kMCPErrorClassNotFound,
+			OutError = BPSCS_MakeError(Request, kMCPErrorClassNotFound,
 				FString::Printf(
 					TEXT("component_class_path '%s' could not be resolved to a UClass (LoadObject returned null); ")
 					TEXT("for Blueprint component classes try with trailing '_C'"),
@@ -148,7 +148,7 @@ namespace
 			// Wave F3 brief specifies -32011 WrongClass for this case (rather than the broader
 			// -32022 WrongClassFamily used by the component.add surface). Both communicate the
 			// same intent but the brief's choice keeps BP-SCS errors in a tighter numeric range.
-			OutError = BPC_MakeError(Request, kMCPErrorWrongClass,
+			OutError = BPSCS_MakeError(Request, kMCPErrorWrongClass,
 				FString::Printf(
 					TEXT("component_class_path '%s' is not a UActorComponent subclass (got base '%s')"),
 					*Class->GetPathName(),
@@ -157,7 +157,7 @@ namespace
 		}
 		if (Class->HasAnyClassFlags(CLASS_Abstract))
 		{
-			OutError = BPC_MakeError(Request, kMCPErrorClassAbstract,
+			OutError = BPSCS_MakeError(Request, kMCPErrorClassAbstract,
 				FString::Printf(
 					TEXT("component_class_path '%s' is abstract — pick a concrete subclass"),
 					*Class->GetPathName()));
@@ -175,7 +175,7 @@ namespace
 	 * ``parent_variable_name`` is null for root SCS nodes; ``attach_socket`` is null when
 	 * ``AttachToName`` is NAME_None.
 	 */
-	TSharedRef<FJsonObject> BPC_BuildSCSNodeSummary(const USCS_Node* Node, const USCS_Node* ParentNode)
+	TSharedRef<FJsonObject> BPSCS_BuildSCSNodeSummary(const USCS_Node* Node, const USCS_Node* ParentNode)
 	{
 		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		if (!Node)
@@ -230,23 +230,23 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BPC_IsPIEActive()) { return BPC_MakePIEError(Request); }
+	if (BPSCS_IsPIEActive()) { return BPSCS_MakePIEError(Request); }
 
 	FString Path;
 	FMCPResponse PathErr;
-	if (!BPC_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+	if (!BPSCS_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
 
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("component_class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return BPSCS_MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'component_class_path'"));
 	}
 
 	FString VariableNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VariableNameStr) || VariableNameStr.IsEmpty())
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return BPSCS_MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
@@ -257,20 +257,20 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 		Request.Args->TryGetStringField(TEXT("parent_component"), ParentVarStr) && !ParentVarStr.IsEmpty();
 
 	FMCPResponse ResolveErr;
-	UBlueprint* Blueprint = BPC_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	UBlueprint* Blueprint = BPSCS_ResolveBlueprintOrError(Request, Path, ResolveErr);
 	if (!Blueprint) { return ResolveErr; }
 
 	USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
 	if (!SCS)
 	{
-		return BPC_MakeError(Request, kBPCErrorInternal,
+		return BPSCS_MakeError(Request, kBPSCSErrorInternal,
 			FString::Printf(TEXT("blueprint '%s' has no SimpleConstructionScript (non-AActor parent? %s)"),
 				*Path,
 				Blueprint->ParentClass ? *Blueprint->ParentClass->GetPathName() : TEXT("null")));
 	}
 
 	FMCPResponse ClassErr;
-	UClass* CompClass = BPC_ResolveComponentClass(Request, ClassPath, ClassErr);
+	UClass* CompClass = BPSCS_ResolveComponentClass(Request, ClassPath, ClassErr);
 	if (!CompClass) { return ClassErr; }
 
 	const FName VariableName(*VariableNameStr);
@@ -279,7 +279,7 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 	// scans the AllNodes map so we cover both root + deeply-nested children in one lookup.
 	if (SCS->FindSCSNode(VariableName) != nullptr)
 	{
-		return BPC_MakeError(Request, kMCPErrorPathInUse,
+		return BPSCS_MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(
 				TEXT("variable_name '%s' already in use on blueprint '%s' SCS — pick a unique name or call bp.remove_component first"),
 				*VariableNameStr, *Path));
@@ -306,7 +306,7 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 			}
 			if (!ParentNode)
 			{
-				return BPC_MakeError(Request, kMCPErrorObjectNotFound,
+				return BPSCS_MakeError(Request, kMCPErrorObjectNotFound,
 					FString::Printf(
 						TEXT("parent_component '%s' not found in SCS of blueprint '%s'"),
 						*ParentVarStr, *Path));
@@ -322,7 +322,7 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 	USCS_Node* NewNode = SCS->CreateNode(CompClass, VariableName);
 	if (!NewNode)
 	{
-		return BPC_MakeError(Request, kBPCErrorInternal,
+		return BPSCS_MakeError(Request, kBPSCSErrorInternal,
 			FString::Printf(
 				TEXT("USimpleConstructionScript::CreateNode returned null for class '%s' var '%s' on '%s'"),
 				*CompClass->GetPathName(), *VariableNameStr, *Path));
@@ -378,7 +378,7 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("parent"), MakeShared<FJsonValueNull>());
 	}
-	return BPC_MakeSuccessObj(Request, Out);
+	return BPSCS_MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.remove_component (Lane A, PIE-guarded) ───────────────────────────────────────────────
@@ -397,27 +397,27 @@ FMCPResponse Tool_RemoveComponent(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BPC_IsPIEActive()) { return BPC_MakePIEError(Request); }
+	if (BPSCS_IsPIEActive()) { return BPSCS_MakePIEError(Request); }
 
 	FString Path;
 	FMCPResponse PathErr;
-	if (!BPC_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+	if (!BPSCS_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
 
 	FString VariableNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VariableNameStr) || VariableNameStr.IsEmpty())
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return BPSCS_MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
 	FMCPResponse ResolveErr;
-	UBlueprint* Blueprint = BPC_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	UBlueprint* Blueprint = BPSCS_ResolveBlueprintOrError(Request, Path, ResolveErr);
 	if (!Blueprint) { return ResolveErr; }
 
 	USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
 	if (!SCS)
 	{
-		return BPC_MakeError(Request, kBPCErrorInternal,
+		return BPSCS_MakeError(Request, kBPSCSErrorInternal,
 			FString::Printf(TEXT("blueprint '%s' has no SimpleConstructionScript"), *Path));
 	}
 
@@ -425,7 +425,7 @@ FMCPResponse Tool_RemoveComponent(const FMCPRequest& Request)
 	USCS_Node* TargetNode = SCS->FindSCSNode(VariableName);
 	if (!TargetNode)
 	{
-		return BPC_MakeError(Request, kMCPErrorObjectNotFound,
+		return BPSCS_MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("variable_name '%s' not found in SCS of blueprint '%s'"),
 				*VariableNameStr, *Path));
@@ -479,7 +479,7 @@ FMCPResponse Tool_RemoveComponent(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("removed"), true);
 	Out->SetNumberField(TEXT("reparented_children_count"), static_cast<double>(ReparentedCount));
-	return BPC_MakeSuccessObj(Request, Out);
+	return BPSCS_MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.list_components (Lane A, NO PIE guard — read) ────────────────────────────────────────
@@ -504,19 +504,19 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 
 	FString Path;
 	FMCPResponse PathErr;
-	if (!BPC_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+	if (!BPSCS_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
 
 	bool bRecursive = true;
 	Request.Args->TryGetBoolField(TEXT("recursive"), bRecursive);
 
 	FMCPResponse ResolveErr;
-	UBlueprint* Blueprint = BPC_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	UBlueprint* Blueprint = BPSCS_ResolveBlueprintOrError(Request, Path, ResolveErr);
 	if (!Blueprint) { return ResolveErr; }
 
 	USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
 	if (!SCS)
 	{
-		return BPC_MakeError(Request, kBPCErrorInternal,
+		return BPSCS_MakeError(Request, kBPSCSErrorInternal,
 			FString::Printf(TEXT("blueprint '%s' has no SimpleConstructionScript"), *Path));
 	}
 
@@ -533,7 +533,7 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 		{
 			if (!Node) { continue; }
 			USCS_Node* Parent = SCS->FindParentNode(Node);
-			Entries.Add(MakeShared<FJsonValueObject>(BPC_BuildSCSNodeSummary(Node, Parent)));
+			Entries.Add(MakeShared<FJsonValueObject>(BPSCS_BuildSCSNodeSummary(Node, Parent)));
 		}
 	}
 	else
@@ -543,7 +543,7 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 		for (USCS_Node* Node : Roots)
 		{
 			if (!Node) { continue; }
-			Entries.Add(MakeShared<FJsonValueObject>(BPC_BuildSCSNodeSummary(Node, /*ParentNode*/ nullptr)));
+			Entries.Add(MakeShared<FJsonValueObject>(BPSCS_BuildSCSNodeSummary(Node, /*ParentNode*/ nullptr)));
 		}
 	}
 
@@ -562,7 +562,7 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("components"), Entries);
 	Out->SetNumberField(TEXT("total"), static_cast<double>(Entries.Num()));
 	Out->SetBoolField(TEXT("recursive"), bRecursive);
-	return BPC_MakeSuccessObj(Request, Out);
+	return BPSCS_MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.set_component_default (Lane A, PIE-guarded) ──────────────────────────────────────────
@@ -588,41 +588,41 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BPC_IsPIEActive()) { return BPC_MakePIEError(Request); }
+	if (BPSCS_IsPIEActive()) { return BPSCS_MakePIEError(Request); }
 
 	FString Path;
 	FMCPResponse PathErr;
-	if (!BPC_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
+	if (!BPSCS_RequireBlueprintPath(Request, Path, PathErr)) { return PathErr; }
 
 	FString VariableNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VariableNameStr) || VariableNameStr.IsEmpty())
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return BPSCS_MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
 	FString PropertyName;
 	if (!Request.Args->TryGetStringField(TEXT("property_name"), PropertyName) || PropertyName.IsEmpty())
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return BPSCS_MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required string field 'property_name'"));
 	}
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return BPSCS_MakeError(Request, kBPSCSErrorInvalidParams,
 			TEXT("missing required field 'value' (any JSON value)"));
 	}
 
 	FMCPResponse ResolveErr;
-	UBlueprint* Blueprint = BPC_ResolveBlueprintOrError(Request, Path, ResolveErr);
+	UBlueprint* Blueprint = BPSCS_ResolveBlueprintOrError(Request, Path, ResolveErr);
 	if (!Blueprint) { return ResolveErr; }
 
 	USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
 	if (!SCS)
 	{
-		return BPC_MakeError(Request, kBPCErrorInternal,
+		return BPSCS_MakeError(Request, kBPSCSErrorInternal,
 			FString::Printf(TEXT("blueprint '%s' has no SimpleConstructionScript"), *Path));
 	}
 
@@ -630,7 +630,7 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 	USCS_Node* TargetNode = SCS->FindSCSNode(VariableName);
 	if (!TargetNode)
 	{
-		return BPC_MakeError(Request, kMCPErrorObjectNotFound,
+		return BPSCS_MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("variable_name '%s' not found in SCS of blueprint '%s'"),
 				*VariableNameStr, *Path));
@@ -639,7 +639,7 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 	UActorComponent* Template = TargetNode->ComponentTemplate;
 	if (!Template)
 	{
-		return BPC_MakeError(Request, kBPCErrorInternal,
+		return BPSCS_MakeError(Request, kBPSCSErrorInternal,
 			FString::Printf(
 				TEXT("SCS_Node '%s' on blueprint '%s' has no ComponentTemplate (corrupt SCS?)"),
 				*VariableNameStr, *Path));
@@ -648,7 +648,7 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 	FProperty* Prop = Template->GetClass()->FindPropertyByName(FName(*PropertyName));
 	if (!Prop)
 	{
-		return BPC_MakeError(Request, kMCPErrorPropertyNotFound,
+		return BPSCS_MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(
 				TEXT("property '%s' not found on component class '%s' (template for SCS_Node '%s')"),
 				*PropertyName, *Template->GetClass()->GetPathName(), *VariableNameStr));
@@ -676,7 +676,7 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 
 	if (!bWriteOk)
 	{
-		return BPC_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return BPSCS_MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("write rejected on '%s.%s': %s"),
 				*Template->GetClass()->GetName(), *PropertyName, *WriteError));
 	}
@@ -695,7 +695,7 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("property_name"), PropertyName);
 	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
 	Out->SetField(TEXT("new_value"),   NewValue.IsValid()   ? NewValue   : MakeShared<FJsonValueNull>());
-	return BPC_MakeSuccessObj(Request, Out);
+	return BPSCS_MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
