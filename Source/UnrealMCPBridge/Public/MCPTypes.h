@@ -345,6 +345,18 @@ inline constexpr int32 kMCPErrorSkeletonMismatch                 = -32054;
 inline constexpr int32 kMCPErrorNotifyTrackNotFound              = -32055;
 
 /**
+ * Wave D Surface 4 — Actor outliner folder surface (folder.*).
+ *
+ *   -32056 FolderNotFound       ``folder.delete`` — the supplied ``folder_path`` does not exist
+ *                               in the editor world (FActorFolders::ContainsFolder returned
+ *                               false). Caller's recovery: ``folder.list`` to enumerate existing
+ *                               folder paths and pick a valid one. NOT raised by
+ *                               ``folder.set_actor`` — that tool implicitly creates the folder
+ *                               on demand (matches the outliner drag-drop UX).
+ */
+inline constexpr int32 kMCPErrorFolderNotFound                   = -32056;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */

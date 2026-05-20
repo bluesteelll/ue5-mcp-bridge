@@ -24,6 +24,7 @@
 #include "Tools/ContentBrowserTools.h"
 #include "Tools/DebugTools.h"
 #include "Tools/EditorTools.h"
+#include "Tools/FolderTools.h"
 #include "Tools/GameplayTagTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelTools.h"
@@ -328,6 +329,17 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Reads bypass PIE guard; mutators refuse PIE with -32027. No new error codes — reuses
 	// -32004 / -32010 / -32011 / -32014 / -32026 / -32027 / -32602 / -32603.
 	FMeshTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave D Surface 4 2026-05: Actor outliner folder surface (4 tools, all Lane A).
+	//   folder.list      - enumerate folder paths (FActorFolders::ForEachFolder) + per-folder
+	//                       child_count (subfolders that begin with "<this>/")
+	//   folder.create    - FActorFolders::Get().CreateFolder (PIE-guarded, transacted)
+	//   folder.delete    - FActorFolders::Get().DeleteFolder + optional re-parent of children
+	//                       (walks FActorIterator, rewrites Actor->SetFolderPath). PIE-guarded.
+	//   folder.set_actor - AActor::SetFolderPath (PIE-guarded, transacted; empty = root)
+	// Reads bypass PIE guard; mutators refuse PIE with -32027. New error code -32056
+	// FolderNotFound for folder.delete on a non-existent path.
+	FFolderTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
