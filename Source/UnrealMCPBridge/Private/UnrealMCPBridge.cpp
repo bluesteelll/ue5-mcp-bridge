@@ -42,6 +42,7 @@
 #include "Tools/StatsTools.h"
 #include "Tools/TestCompositeTools.h"
 #include "Tools/TestTools.h"
+#include "Tools/TransformTools.h"
 #include "Tools/UFunctionTools.h"
 #include "Tools/UMGTools.h"
 #include "Tools/WorldPartitionTools.h"
@@ -363,6 +364,23 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// level.set_streaming_state (which is editor-world only + PIE-guarded) — both call the
 	// same SetShouldBe* under the hood but differ in gate semantics.
 	FLevelStreamingTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave D Surface 6 2026-05: Transform batch surface (3 tools, all Lane A, all PIE-guarded).
+	//   transform.batch_set      - apply location/rotation/scale to N actors atomically;
+	//                               relative=true adds to current, otherwise absolute set. At least
+	//                               one of the 3 fields required.
+	//   transform.snap_to_floor  - line-trace downward from each actor (configurable channel +
+	//                               max distance); on hit → SetActorLocation(Hit.Location). Misses
+	//                               leave actor untouched + report null hit_actor.
+	//   transform.align          - align actors along an axis. mode='set' writes supplied value;
+	//                               mode='min'/'max'/'average' compute from current values then
+	//                               apply. Other 2 axes preserved per actor.
+	// Each call wraps the WHOLE batch in ONE FScopedTransaction → Ctrl-Z reverts atomically.
+	// Per-actor failures (unresolved path / no root component) go into failures[]; 0 resolved →
+	// top-level -32004 (or -32602 for align min/max/average — can't aggregate empty set).
+	// External-package actors (WorldPartition one-file-per-actor) dirtied via GetExternalPackage()
+	// with GetOutermost() fallback. Reuses -32041 InvalidCollisionChannel from Phase 5 Chunk C.
+	FTransformTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
