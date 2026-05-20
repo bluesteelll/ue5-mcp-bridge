@@ -41,6 +41,7 @@
 #include "Tools/NiagaraTools.h"
 #include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
+#include "Tools/RenderTools.h"
 #include "Tools/SequencerTools.h"
 #include "Tools/SourceControlCompositeTools.h"
 #include "Tools/SourceControlTools.h"
@@ -457,6 +458,26 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// -32027 / -32031 / -32602 / -32603. Build.cs adds ``AnimGraph`` private dep (editor module —
 	// fine, the plugin is editor-only too).
 	FAnimBlueprintTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave G Surface 5 2026-05: Render / show-flag / post-process surface (4 tools, all Lane A).
+	//   render.list_show_flags                 - enumerate FEngineShowFlags entries on a viewport
+	//                                             (name + enabled bool). No PIE guard. Iterates via
+	//                                             FEngineShowFlags::IterateAllFlags with a sink that
+	//                                             pre-biases custom flags by SF_FirstCustom.
+	//   render.set_show_flag                   - SetSingleFlag on a viewport's EngineShowFlags +
+	//                                             Invalidate; returns prior+new diff. No PIE guard.
+	//   render.set_engine_stat                 - GEngine->SetEngineStat wrapper (stat fps / stat unit
+	//                                             / etc.). PIE-first/editor-fallback world; no PIE
+	//                                             guard.
+	//   render.set_post_process_volume_property - mutate a single FPostProcessSettings field on a
+	//                                             named APostProcessVolume actor + force the companion
+	//                                             bOverride_<X>=true so the override actually applies.
+	//                                             PIE-guarded, FScopedTransaction, MarkPackageDirty
+	//                                             (external package preferred for WorldPartition OFPA).
+	// Reuses existing error codes - no new codes introduced: -32004 / -32005 / -32011 / -32026 /
+	// -32027 / -32602 / -32603. No new Build.cs deps (FEngineShowFlags + UPostProcessVolume in
+	// Engine, FLevelEditorViewportClient in LevelEditor — both already linked).
+	FRenderTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Wave G Surface 3 2026-05: NavMesh query surface (4 tools, all Lane A).
 	//   navmesh.list                 - enumerate ARecastNavMesh actors + key config fields
