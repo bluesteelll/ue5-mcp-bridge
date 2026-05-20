@@ -22,6 +22,7 @@
 #include "Tools/ComponentTools.h"
 #include "Tools/ConfigTools.h"
 #include "Tools/ContentBrowserTools.h"
+#include "Tools/DebugTools.h"
 #include "Tools/EditorTools.h"
 #include "Tools/GameplayTagTools.h"
 #include "Tools/LevelCompositeTools.h"
@@ -307,6 +308,15 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	//   gameplaytag.add_to_container      — append tag to named FGameplayTagContainer UPROPERTY
 	//   gameplaytag.remove_from_container — remove tag from same
 	FGameplayTagTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave D Surface 2 2026-05: Debug visual overlay surface (6 tools, all Lane A).
+	//   debug.draw_line / draw_sphere / draw_box / draw_arrow / draw_text  — DrawDebugHelpers wrappers
+	//   debug.clear                                                         — FlushPersistentDebugLines + FlushDebugStrings
+	// NOT PIE-guarded: drawing works in both editor world and PIE world; tool picks the
+	// appropriate world via PIE-first / editor-fallback resolution (matches PhysicsTools'
+	// trace-world convention). No transactions, no package dirty marking — overlays are
+	// transient line-batcher state, not asset data.
+	FDebugTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 5 Chunk A: PIE surface (10 tools, all Lane A). Inverse PIE-guard: every pie.* tool
 	// except pie.start and pie.is_running requires PIE to BE running; refuses with -32038
