@@ -26,6 +26,7 @@
 #include "Tools/ContentBrowserTools.h"
 #include "Tools/DebugTools.h"
 #include "Tools/EditorTools.h"
+#include "Tools/EngineTools.h"
 #include "Tools/FolderTools.h"
 #include "Tools/GameplayTagTools.h"
 #include "Tools/HierarchyTools.h"
@@ -478,6 +479,24 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// -32027 / -32602 / -32603. No new Build.cs deps (FEngineShowFlags + UPostProcessVolume in
 	// Engine, FLevelEditorViewportClient in LevelEditor — both already linked).
 	FRenderTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave G Surface 6 2026-05: Engine introspection + GC control surface (3 tools, all Lane A,
+	// no PIE guard).
+	//   engine.get_info             - FEngineVersion::Current() + FApp::Get{BuildConfiguration,
+	//                                  BuildTargetType,ProjectName} + FPaths::{ProjectDir,EngineDir}
+	//                                  + FPlatformProperties::PlatformName + GIsEditor +
+	//                                  FApp::IsUnattended + IsRunningCommandlet + current world
+	//                                  summary (name/type/is_pie, PIE-preferred). Read-only.
+	//   engine.gc_collect           - CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS, bPurge) when
+	//                                  args.force=true (synchronous); GEngine->ForceGarbageCollection
+	//                                  when false (deferred). Reports allocator delta + wall-clock
+	//                                  duration via FPlatformMemory::GetStats + FPlatformTime.
+	//   engine.get_memory_snapshot  - FPlatformMemory::GetStats + GMalloc->GetDescriptiveName +
+	//                                  optional args.include_breakdown=true → platform-specific
+	//                                  allocator stats from FPlatformMemoryStats::GetPlatformSpecificStats.
+	// Reuses existing error codes - no new codes introduced: -32603 Internal (GEngine null).
+	// No new Build.cs deps - all APIs live in Core/CoreUObject/Engine/UnrealEd already linked.
+	FEngineTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Wave G Surface 3 2026-05: NavMesh query surface (4 tools, all Lane A).
 	//   navmesh.list                 - enumerate ARecastNavMesh actors + key config fields
