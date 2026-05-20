@@ -16,6 +16,7 @@
 #include "Tools/AssetCompositeTools.h"
 #include "Tools/AssetRegistryTools.h"
 #include "Tools/AudioTools.h"
+#include "Tools/BlueprintComponentTools.h"
 #include "Tools/BlueprintCompositeTools.h"
 #include "Tools/BlueprintGraphTools.h"
 #include "Tools/BlueprintTools.h"
@@ -257,6 +258,13 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// compile refuse PIE with -32027 + frozen kMCPMessagePIEActive text. bp.reparent (write 6)
 	// is experimental + requires args.confirm_dangerous=true. Days 11-15 add material.* surface.
 	FBlueprintTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave F Surface 3: Blueprint SCS component CRUD (4 tools, all Lane A). add/remove/
+	// set_component_default are PIE-guarded mutators with FScopedTransaction; list is read-only and
+	// PIE-safe. Kept in a separate file from BlueprintTools.cpp because the latter is already large
+	// (2.8k lines) and the SCS surface is logically distinct (operates on SCS_Node templates
+	// instead of UEdGraph / variable / function tables).
+	FBlueprintComponentTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 4 Day 10: 1 internal Lane-B composite handler backing the single Python composite
 	// bp.compile_all_dirty in blueprint_composites.py. Walks AR by scope_paths, loads each BP,
