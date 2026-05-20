@@ -42,6 +42,7 @@
 #include "Tools/SourceControlCompositeTools.h"
 #include "Tools/SourceControlTools.h"
 #include "Tools/StatsTools.h"
+#include "Tools/SubsystemTools.h"
 #include "Tools/TestCompositeTools.h"
 #include "Tools/TestTools.h"
 #include "Tools/TextureTools.h"
@@ -547,6 +548,22 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// -32602. Reads PIE-safe (no guard). Build.cs adds ``EnhancedInput`` private dep (runtime
 	// module from the EnhancedInput plugin, default-enabled in UE 5.7).
 	FInputTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave E Surface 6 2026-05: Generic UE subsystem reflection surface (3 tools, all Lane A).
+	//   subsystem.list           - enumerate instantiated subsystems across all 5 collections
+	//                               (Engine/Editor/World/GameInstance/LocalPlayer). Optional
+	//                               args.kind filters to one collection; "all" (default) returns
+	//                               the union. Each entry: { class_path, kind, owner_context }.
+	//   subsystem.get_property   - resolve subsystem instance by class path, read top-level
+	//                               UPROPERTY via FMCPReflection. PIE-safe (no guard).
+	//   subsystem.call_function  - resolve subsystem instance, invoke UFUNCTION by name with
+	//                               marshalled args. NO PIE guard — caller responsibility.
+	//                               Surfaces is_state_changing heuristic (!FUNC_Const &&
+	//                               !FUNC_BlueprintPure) so caller can post-hoc detect mutation.
+	//                               Reuses bp.call_function's allow_any safety gate.
+	// Reuses existing error codes - no new codes introduced: -32004 / -32005 / -32006 / -32007 /
+	// -32011 / -32020 / -32602. Reads PIE-safe (no guard).
+	FSubsystemTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	// Phase 6 Chunk E: Live Coding surface (1 async composite — livecoding.recompile, Python
 	// wrapper in phase6_composites.py). Backing internal handler livecoding._recompile_internal

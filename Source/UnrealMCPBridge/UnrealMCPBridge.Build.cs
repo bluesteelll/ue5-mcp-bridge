@@ -126,6 +126,12 @@ public class UnrealMCPBridge : ModuleRules
 				// UInputTrigger + UEnhancedInputLocalPlayerSubsystem all live in EnhancedInput
 				// (runtime module, plugin loaded by default in UE 5.7).
 				"EnhancedInput",
+				// Wave E Surface 6 2026-05 — Generic UE subsystem reflection surface.
+				// UEditorSubsystem lives in its own module (Editor/EditorSubsystem) and its header
+				// (EditorSubsystem.h) is required for the editor-collection enumeration in
+				// subsystem.list. UEngineSubsystem / UWorldSubsystem / UGameInstanceSubsystem /
+				// ULocalPlayerSubsystem all live in Engine (already a public dep).
+				"EditorSubsystem",
 			}
 		);
 
