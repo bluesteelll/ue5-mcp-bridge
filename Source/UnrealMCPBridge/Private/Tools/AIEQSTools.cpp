@@ -39,7 +39,9 @@ namespace
 	// FMCPAssetLoader::Load<UEnvQuery>. Only the surface-specific error constants stay (Phase 4
 	// sweep target).
 	constexpr int32 kAIEQSErrorInternal        = -32603;
-	constexpr int32 kAIEQSErrorOperationFailed = -32015; // Brief reuses the StaleCursor slot here.
+	// kAIEQSErrorOperationFailed retired in Phase 4 — was -32015 (DOUBLE-MEANING bug with
+	// canonical kMCPErrorStaleCursor pagination semantics). Migrated to canonical
+	// kMCPErrorOperationFailed (-32058) per MCPTypes.h Phase 4 disambiguation.
 } // namespace
 
 namespace FAIEQSTools
@@ -360,12 +362,12 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 	}
 
 	// Aborted / Failed / OwnerLost / MissingParam are query-level failures — surface as
-	// kAIEQSErrorOperationFailed with the status string in the message so the caller can
+	// kMCPErrorOperationFailed with the status string in the message so the caller can
 	// disambiguate. Processing should never appear from an instant query (it's a synchronous
 	// terminal call) but treat it as Failed-equivalent for defensiveness.
 	if (!Result->IsSuccessful())
 	{
-		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorOperationFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOperationFailed,
 			FString::Printf(TEXT("EQS query '%s' returned status '%s'"), *QueryPath, StatusStr));
 	}
 

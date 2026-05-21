@@ -64,17 +64,16 @@ class FMCPDispatchQueue;
  *   -32004 ObjectNotFound        Query / querier / EQS manager not loadable / missing
  *   -32010 InvalidPath           Malformed query_path / querier_actor_path
  *   -32011 WrongClass            Asset isn't UEnvQuery / actor path resolves to non-actor
- *   -32015 OperationFailed       Query returned Failed status (RawStatus == EEnvQueryStatus::Failed
- *                                or ::Aborted or ::OwnerLost or ::MissingParam — kept under one
- *                                wire code; status string in the message disambiguates)
+ *   -32015 StaleCursor           ``list_queries`` page_token's embedded filter_hash mismatches
+ *                                the current call's filter (path_prefix changed mid-pagination).
+ *                                Read pagination semantic, same as canonical.
+ *   -32058 OperationFailed       ``run_query`` — query returned Failed status (RawStatus ==
+ *                                EEnvQueryStatus::Failed / Aborted / OwnerLost / MissingParam,
+ *                                kept under one wire code; status string in message disambiguates).
+ *                                Phase 4 disambiguation: was incorrectly -32015 (DOUBLE-MEANING bug
+ *                                with StaleCursor); now uses canonical kMCPErrorOperationFailed.
  *   -32602 InvalidParams         Missing args / unknown mode string
  *   -32603 InternalError         UEnvQueryManager::GetCurrent returned null for the querier's world
- *
- * (-32015 is officially named ``StaleCursor`` in MCPTypes.h but the brief allocates it as
- * ``OperationFailed`` for this surface — that mapping mirrors PackageTools' reuse of -32603 for
- * "engine API said no" cases. The kMCPErrorStaleCursor constant is not used here because the
- * surface has no paginator cursor on run_query — only list_queries paginates, and that uses
- * the standard cursor flow which produces -32015 via the normal staleness check.)
  */
 namespace FAIEQSTools
 {

@@ -374,6 +374,32 @@ inline constexpr int32 kMCPErrorFolderNotFound                   = -32056;
 inline constexpr int32 kMCPErrorFunctionParameterDuplicate       = -32057;
 
 /**
+ * Refactor Phase 4 — Generic "operation failed" code for engine-API side surfaces.
+ *
+ * **Motivation**: Before Phase 4, AIEQSTools reused ``kMCPErrorStaleCursor`` (-32015) as its
+ * "EQS query returned Failed status" error, creating a numeric-code DOUBLE-MEANING:
+ *   -32015 was canonically pagination-cursor staleness (asset.list / asset.find_references /
+ *   asset.search_by_* etc.) but AIEQSTools repurposed it for "engine returned Failed".
+ *
+ * Phase 4 disambiguates: the canonical -32015 stays as ``kMCPErrorStaleCursor`` (pagination
+ * semantics), and **-32058 ``kMCPErrorOperationFailed``** is the new code for generic
+ * "engine-side operation refused or returned a failure status that has no more-specific code".
+ * Use this when:
+ *   - An engine API call returned a recognised failure indicator (status enum, false bool with
+ *     no diagnostic) that isn't covered by one of the surface-specific codes above.
+ *   - The caller cannot recover by adjusting input — the failure is intrinsic to engine state.
+ *
+ * Migrated surfaces (Phase 4):
+ *   - ``ai.eqs.run_query`` — was -32015 (Stale), now -32058 (OperationFailed). Message body
+ *     carries the EEnvQueryStatus string for caller-side diagnostic.
+ *
+ * Do NOT use ``kMCPErrorOperationFailed`` for input-validation failures (use -32602) or
+ * for "object not found" (use -32004). It is the catch-all for engine-side refusal AFTER input
+ * has already been validated.
+ */
+inline constexpr int32 kMCPErrorOperationFailed                  = -32058;
+
+/**
  * Frozen wire message returned by every Phase 3+ editor-world mutator when PIE is active.
  * **Do NOT edit this string** — smoke tests assert both substrings ``"Phase 5"`` AND ``"pie."``.
  */
