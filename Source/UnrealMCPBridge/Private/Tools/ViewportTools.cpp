@@ -3,6 +3,7 @@
 #include "ViewportTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 
@@ -20,33 +21,7 @@
 namespace
 {
 	// VPT_ prefix per the unity-build symbol-collision convention.
-	constexpr int32 kVPTErrorInvalidParams = -32602;
-	constexpr int32 kVPTErrorInternal      = -32603;
-
-	void VPT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse VPT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		VPT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse VPT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		VPT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	constexpr int32 kVPTErrorInternal = -32603;
 
 	/** Convert FVector to JSON [x, y, z] array. */
 	TArray<TSharedPtr<FJsonValue>> VPT_VectorToArray(const FVector& V)
@@ -177,7 +152,7 @@ namespace
 		}
 		if (OutIndex < 0 || OutIndex >= ViewportCount)
 		{
-			OutErr = VPT_MakeError(Request, kMCPErrorPropertyIndexOOB,
+			OutErr = FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyIndexOOB,
 				FString::Printf(
 					TEXT("viewport_index %d out of range [0, %d)"),
 					OutIndex, ViewportCount));
@@ -197,14 +172,14 @@ namespace
 
 		if (!GEditor)
 		{
-			OutErr = VPT_MakeError(Request, kVPTErrorInternal,
+			OutErr = FMCPToolHelpers::MakeError(Request, kVPTErrorInternal,
 				TEXT("GEditor unavailable (commandlet?)"));
 			return nullptr;
 		}
 		const TArray<FLevelEditorViewportClient*>& Clients = GEditor->GetLevelViewportClients();
 		if (Clients.Num() == 0)
 		{
-			OutErr = VPT_MakeError(Request, kMCPErrorObjectNotFound,
+			OutErr = FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				TEXT("no level viewports available (open a level editor tab first)"));
 			return nullptr;
 		}
@@ -218,7 +193,7 @@ namespace
 		FLevelEditorViewportClient* VC = Clients[Index];
 		if (!VC)
 		{
-			OutErr = VPT_MakeError(Request, kVPTErrorInternal,
+			OutErr = FMCPToolHelpers::MakeError(Request, kVPTErrorInternal,
 				FString::Printf(TEXT("level viewport client at index %d is null"), Index));
 			return nullptr;
 		}
@@ -261,14 +236,14 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return VPT_MakeError(Request, kVPTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kVPTErrorInternal,
 			TEXT("GEditor unavailable (commandlet?)"));
 	}
 
 	const TArray<FLevelEditorViewportClient*>& Clients = GEditor->GetLevelViewportClients();
 	if (Clients.Num() == 0)
 	{
-		return VPT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			TEXT("no level viewports available (open a level editor tab first)"));
 	}
 
@@ -284,7 +259,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("viewports"), Arr);
 	Out->SetNumberField(TEXT("count"), Arr.Num());
-	return VPT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── viewport.get_camera ───────────────────────────────────────────────────────────────────────
@@ -302,7 +277,7 @@ FMCPResponse Tool_GetCamera(const FMCPRequest& Request)
 
 	const int32 Index = VPT_FindViewportIndex(VC);
 	TSharedRef<FJsonObject> Out = VPT_BuildViewportEntry(Index, VC);
-	return VPT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── viewport.set_camera ───────────────────────────────────────────────────────────────────────
@@ -328,7 +303,7 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return VPT_MakeError(Request, kVPTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// Parse optional fields up-front to fail-fast on malformed input BEFORE we resolve the
@@ -342,7 +317,7 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 
 	if (!bHasLocation && !bHasRotation && !bHasFov)
 	{
-		return VPT_MakeError(Request, kVPTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("viewport.set_camera requires at least one of: location, rotation, fov"));
 	}
 
@@ -350,7 +325,7 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 	FString Err;
 	if (bHasLocation && !VPT_ReadVectorArray(Request.Args, TEXT("location"), NewLocation, Err))
 	{
-		return VPT_MakeError(Request, kVPTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err);
 	}
 
 	FRotator NewRotation = FRotator::ZeroRotator;
@@ -359,14 +334,14 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 		FVector RotVec = FVector::ZeroVector;
 		if (!VPT_ReadVectorArray(Request.Args, TEXT("rotation"), RotVec, Err))
 		{
-			return VPT_MakeError(Request, kVPTErrorInvalidParams, Err);
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err);
 		}
 		NewRotation = FRotator(RotVec.X, RotVec.Y, RotVec.Z); // pitch, yaw, roll
 	}
 
 	if (bHasFov && (FovRaw < 1.0 || FovRaw > 175.0))
 	{
-		return VPT_MakeError(Request, kVPTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("fov %g out of range (1.0, 175.0)"), FovRaw));
 	}
 
@@ -390,7 +365,7 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("viewport_index"), VPT_FindViewportIndex(VC));
 	Out->SetObjectField(TEXT("prior"), PriorObj);
 	Out->SetObjectField(TEXT("new"),   NewObj);
-	return VPT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── viewport.focus_on_actor ───────────────────────────────────────────────────────────────────
@@ -417,13 +392,13 @@ FMCPResponse Tool_FocusOnActor(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return VPT_MakeError(Request, kVPTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ActorPath;
 	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
 	{
-		return VPT_MakeError(Request, kVPTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'actor_path'"));
 	}
 
@@ -440,7 +415,7 @@ FMCPResponse Tool_FocusOnActor(const FMCPRequest& Request)
 		const FString Msg = bAmbiguous
 			? FString::Printf(TEXT("actor '%s' ambiguous: %s"), *ActorPath, *AmbiguityHint)
 			: FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErrMsg);
-		return VPT_MakeError(Request, kMCPErrorObjectNotFound, Msg);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, Msg);
 	}
 
 	FMCPResponse ResolveErr;
@@ -452,7 +427,7 @@ FMCPResponse Tool_FocusOnActor(const FMCPRequest& Request)
 	FBox Bounds = Actor->GetComponentsBoundingBox(/*bNonColliding*/ true);
 	if (!Bounds.IsValid)
 	{
-		return VPT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("actor '%s' has no valid bounding box (no registered components with bounds)"),
 				*ActorPath));
@@ -474,7 +449,7 @@ FMCPResponse Tool_FocusOnActor(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("viewport_index"), VPT_FindViewportIndex(VC));
 	Out->SetArrayField(TEXT("new_camera_location"), VPT_VectorToArray(VC->GetViewLocation()));
 	Out->SetArrayField(TEXT("new_camera_rotation"), VPT_RotatorToArray(VC->GetViewRotation()));
-	return VPT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

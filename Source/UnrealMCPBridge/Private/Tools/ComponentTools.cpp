@@ -3,6 +3,8 @@
 #include "ComponentTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPComponentPathUtils.h"
@@ -15,7 +17,6 @@
 #include "GameFramework/Actor.h"
 #include "Math/Rotator.h"
 #include "Math/Vector.h"
-#include "ScopedTransaction.h"
 #include "UObject/Class.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UnrealType.h"
@@ -27,40 +28,17 @@
 
 namespace
 {
-	// CMP_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kCMPErrorInvalidParams = -32602;
-	constexpr int32 kCMPErrorInternal      = -32603;
-
-	void CMP_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse CMP_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		CMP_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse CMP_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		CMP_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	// CMP_ prefix per the unity-build symbol-collision pattern. StampIds / MakeError / MakeSuccessObj
+	// migrated to FMCPToolHelpers in Phase 3 (Group G3); only the surface-local error-code aliases
+	// and the CMP_MakePIEError shim (still used by Tool_SetProperty which owns its own transaction
+	// via FMCPWritePropertyScope and can't share FMCPMutatorScope's RAII) live here.
+	constexpr int32 kCMPErrorInvalidParams = kMCPErrorInvalidParams; // -32602
+	constexpr int32 kCMPErrorInternal      = kMCPErrorInternal;      // -32603
 
 	/** Frozen PIE-mutator refusal (per D10 — smoke asserts both "Phase 5" and "pie." substrings). */
 	FMCPResponse CMP_MakePIEError(const FMCPRequest& Request)
 	{
-		return CMP_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	// ─── arg parsing helpers ─────────────────────────────────────────────────────────────────────
@@ -97,12 +75,12 @@ namespace
 	{
 		if (!Request.Args.IsValid())
 		{
-			OutError = CMP_MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
+			OutError = FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
 			return false;
 		}
 		if (!Request.Args->TryGetStringField(FieldName, OutPath) || OutPath.IsEmpty())
 		{
-			OutError = CMP_MakeError(Request, kCMPErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
 			return false;
 		}
@@ -115,12 +93,12 @@ namespace
 	{
 		if (!Request.Args.IsValid())
 		{
-			OutError = CMP_MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
+			OutError = FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
 			return false;
 		}
 		if (!Request.Args->TryGetStringField(FieldName, OutPath) || OutPath.IsEmpty())
 		{
-			OutError = CMP_MakeError(Request, kCMPErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
 			return false;
 		}
@@ -153,11 +131,11 @@ namespace
 		{
 			if (bAmbig)
 			{
-				OutError = CMP_MakeError(Request, kMCPErrorAmbiguousComponent, ResolveErr);
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorAmbiguousComponent, ResolveErr);
 			}
 			else
 			{
-				OutError = CMP_MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
 			}
 			return nullptr;
 		}
@@ -167,7 +145,7 @@ namespace
 			const ULevel* Level = Owner ? Owner->GetLevel() : nullptr;
 			if (Level && !Level->bIsVisible)
 			{
-				OutError = CMP_MakeError(Request, kMCPErrorLevelNotFound,
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 					FString::Printf(
 						TEXT("component '%s' owning sublevel '%s' is loaded but not visible/loaded; cannot mutate"),
 						*Comp->GetName(),
@@ -303,7 +281,7 @@ namespace
 	{
 		if (ClassPath.IsEmpty() || ClassPath[0] != TEXT('/'))
 		{
-			OutError = CMP_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(
 					TEXT("component_class '%s' invalid — must start with '/' (e.g. '/Script/Engine.PointLightComponent')"),
 					*ClassPath));
@@ -311,7 +289,7 @@ namespace
 		}
 		if (ClassPath.Contains(TEXT("\\")))
 		{
-			OutError = CMP_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(TEXT("component_class '%s' contains backslash"), *ClassPath));
 			return nullptr;
 		}
@@ -325,7 +303,7 @@ namespace
 		}
 		if (!Class)
 		{
-			OutError = CMP_MakeError(Request, kMCPErrorClassNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 				FString::Printf(
 					TEXT("component_class '%s' could not be resolved to a UClass (LoadObject returned null); ")
 					TEXT("for Blueprint component classes try with trailing '_C'"),
@@ -334,7 +312,7 @@ namespace
 		}
 		if (Class->HasAnyClassFlags(CLASS_Abstract))
 		{
-			OutError = CMP_MakeError(Request, kMCPErrorClassAbstract,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorClassAbstract,
 				FString::Printf(
 					TEXT("component_class '%s' is abstract — pick a concrete subclass"),
 					*Class->GetPathName()));
@@ -342,7 +320,7 @@ namespace
 		}
 		if (!Class->IsChildOf(UActorComponent::StaticClass()))
 		{
-			OutError = CMP_MakeError(Request, kMCPErrorWrongClassFamily,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 				FString::Printf(
 					TEXT("component_class '%s' is not a UActorComponent subclass (got base '%s')"),
 					*Class->GetPathName(),
@@ -395,14 +373,12 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return CMP_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ComponentAdd", "MCP: add component"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ActorPath;
@@ -412,7 +388,7 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("component_class"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("missing required string field 'component_class'"));
 	}
 
@@ -424,13 +400,13 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 		ActorPath, /*bRejectPIE*/ true, bActorAmbig, ActorAmbigHint, ActorErr);
 	if (!Actor)
 	{
-		return CMP_MakeError(Request, kMCPErrorObjectNotFound, ActorErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, ActorErr);
 	}
 	if (const ULevel* L = Actor->GetLevel())
 	{
 		if (!L->bIsVisible)
 		{
-			return CMP_MakeError(Request, kMCPErrorLevelNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				FString::Printf(
 					TEXT("actor '%s' owning sublevel '%s' is loaded but not visible/loaded; cannot mutate"),
 					*Actor->GetName(),
@@ -465,7 +441,7 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 	// Validate attach_to early — non-scene component cannot have an attach parent.
 	if (bAttachToProvided && !bIsScene)
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			FString::Printf(
 				TEXT("attach_to provided ('%s') but component_class '%s' is not a USceneComponent subclass"),
 				*AttachToStr, *CompClass->GetPathName()));
@@ -488,21 +464,20 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 		}
 		if (!AttachParent)
 		{
-			return CMP_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(
 					TEXT("attach_to component '%s' not found on actor '%s'"),
 					*AttachToStr, *Actor->GetName()));
 		}
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("ComponentAdd", "MCP: add component"));
 	Actor->Modify();
 
 	// Create the component. Owner is ``Actor`` so it lives in the actor's outer chain.
 	UActorComponent* NewComp = NewObject<UActorComponent>(Actor, CompClass, DesiredName, RF_Transactional);
 	if (!NewComp)
 	{
-		return CMP_MakeError(Request, kCMPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInternal,
 			FString::Printf(TEXT("NewObject<%s> returned null"), *CompClass->GetName()));
 	}
 
@@ -569,7 +544,7 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 		Out->SetField(TEXT("parent_component_name"), MakeShared<FJsonValueNull>());
 		Out->SetBoolField(TEXT("is_root_component"), false);
 	}
-	return CMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── component.remove (mutator — PIE-guarded) ────────────────────────────────────────────────
@@ -584,10 +559,8 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return CMP_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ComponentRemove", "MCP: remove component"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -601,7 +574,7 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 	AActor* Owner = Comp->GetOwner();
 	if (!Owner)
 	{
-		return CMP_MakeError(Request, kCMPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInternal,
 			FString::Printf(TEXT("component '%s' has no owning actor"), *Comp->GetName()));
 	}
 
@@ -610,7 +583,7 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 	{
 		if (Owner->GetRootComponent() == Scene)
 		{
-			return CMP_MakeError(Request, kMCPErrorInvalidPath,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(
 					TEXT("refusing to remove root component '%s' of actor '%s' — re-parent children first or destroy the actor"),
 					*Comp->GetName(), *Owner->GetName()));
@@ -621,7 +594,6 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 	const FString OwnerPath     = FMCPActorPathUtils::BuildActorPath(Owner);
 	const FString RemovedName   = Comp->GetFName().ToString();
 
-	const FScopedTransaction Transaction(LOCTEXT("ComponentRemove", "MCP: remove component"));
 	Owner->Modify();
 	Comp->Modify();
 
@@ -638,7 +610,7 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("component_path"),   CanonicalPath);
 	Out->SetStringField(TEXT("removed_name"),     RemovedName);
 	Out->SetStringField(TEXT("owner_actor_path"), OwnerPath);
-	return CMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── component.get (read-only — works in PIE) ────────────────────────────────────────────────
@@ -660,7 +632,7 @@ FMCPResponse Tool_Get(const FMCPRequest& Request)
 		Request, Path, /*bRejectPIE*/ false, /*bCheckSublevelVisible*/ false, ResolveErr);
 	if (!Comp) { return ResolveErr; }
 
-	return CMP_MakeSuccessObj(Request, CMP_BuildComponentSnapshot(Comp));
+	return FMCPToolHelpers::MakeSuccessObj(Request, CMP_BuildComponentSnapshot(Comp));
 }
 
 // ─── component.get_property (read-only — works in PIE) ───────────────────────────────────────
@@ -681,7 +653,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	FString PropertyPath;
 	if (!Request.Args->TryGetStringField(TEXT("property_path"), PropertyPath) || PropertyPath.IsEmpty())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("missing required string field 'property_path'"));
 	}
 
@@ -698,7 +670,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	if (!FMCPReflection::ResolvePropertyPath(Comp, PropertyPath, Container, LeafValuePtr, LeafProp,
 		ErrCode, ErrMsg))
 	{
-		return CMP_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	TSharedPtr<FJsonValue> Value = FMCPReflection::ReadPropertyValueAt(LeafProp, LeafValuePtr);
@@ -708,7 +680,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("property_path"),  PropertyPath);
 	Out->SetStringField(TEXT("type"),           FMCPReflection::DescribePropertyType(LeafProp));
 	Out->SetField(TEXT("value"), Value);
-	return CMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── component.set_property (mutator — PIE-guarded) ──────────────────────────────────────────
@@ -735,13 +707,13 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	FString PropertyPath;
 	if (!Request.Args->TryGetStringField(TEXT("property_path"), PropertyPath) || PropertyPath.IsEmpty())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("missing required string field 'property_path'"));
 	}
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("missing required field 'value'"));
 	}
 
@@ -758,7 +730,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	if (!FMCPReflection::ResolvePropertyPath(Comp, PropertyPath, Container, LeafValuePtr, LeafProp,
 		ErrCode, ErrMsg))
 	{
-		return CMP_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	// Step 1: edit-const gate FIRST (early return, no transaction). 2-flag set (CPF_EditConst |
@@ -772,7 +744,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	const uint64 Flags = LeafProp->PropertyFlags;
 	if (!bBypassReadOnly && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{
-		return CMP_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
 				TEXT("property '%s' is read-only (CPF flags=%llu); pass args.bypass_readonly=true to override"),
 				*LeafProp->GetName(), static_cast<unsigned long long>(Flags)));
@@ -788,7 +760,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	}
 	if (!bWriteOk)
 	{
-		return CMP_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("write rejected: %s"), *WriteErr));
 	}
 
@@ -800,7 +772,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Comp));
 	Out->SetStringField(TEXT("property_path"),  PropertyPath);
 	Out->SetField(TEXT("value"), EchoValue);
-	return CMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── component.set_transform (mutator — PIE-guarded, USceneComponent only) ───────────────────
@@ -815,10 +787,11 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return CMP_MakePIEError(Request);
-	}
+	// Per-field transaction: each call wraps its own scope so undo is per-field (matches
+	// actor.set_location / set_rotation / set_scale grouping convention from Days 5-8). We do
+	// this in ONE Modify pass with one transaction to keep the outliner history clean.
+	FMCPMutatorScope Scope(Request, LOCTEXT("ComponentSetTransform", "MCP: set component transform"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -832,7 +805,7 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 	USceneComponent* Scene = Cast<USceneComponent>(Comp);
 	if (!Scene)
 	{
-		return CMP_MakeError(Request, kMCPErrorWrongClassFamily,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 			FString::Printf(
 				TEXT("component '%s' is not a USceneComponent — set_transform requires scene component (class '%s')"),
 				*Comp->GetName(), *Comp->GetClass()->GetPathName()));
@@ -844,7 +817,7 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 	{
 		if (!SpaceStr.Equals(TEXT("Relative"), ESearchCase::IgnoreCase))
 		{
-			return CMP_MakeError(Request, kCMPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 				FString::Printf(TEXT("space '%s' unsupported — only 'Relative' is accepted in Phase 3"),
 					*SpaceStr));
 		}
@@ -852,10 +825,6 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 
 	bool bAnyField = false;
 
-	// Per-field transaction: each call wraps its own scope so undo is per-field (matches
-	// actor.set_location / set_rotation / set_scale grouping convention from Days 5-8). We do
-	// this in ONE Modify pass with one transaction to keep the outliner history clean.
-	const FScopedTransaction Transaction(LOCTEXT("ComponentSetTransform", "MCP: set component transform"));
 	Scene->Modify();
 
 	const TSharedPtr<FJsonObject>* LocObj = nullptr;
@@ -891,7 +860,7 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 
 	if (!bAnyField)
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("component.set_transform: at least one of location / rotation / scale must be provided"));
 	}
 
@@ -901,7 +870,7 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 	Out->SetObjectField(TEXT("relative_location"), CMP_VectorToJson(Scene->GetRelativeLocation()));
 	Out->SetObjectField(TEXT("relative_rotation"), CMP_RotatorToJson(Scene->GetRelativeRotation()));
 	Out->SetObjectField(TEXT("relative_scale"),    CMP_VectorToJson(Scene->GetRelativeScale3D()));
-	return CMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── component.move_in_hierarchy (mutator — PIE-guarded, USceneComponent only) ───────────────
@@ -919,10 +888,9 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return CMP_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ComponentMoveInHierarchy",
+		"MCP: move component in hierarchy"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ChildPath;
 	FMCPResponse PathErr;
@@ -932,7 +900,7 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	if (!Request.Args->TryGetStringField(TEXT("new_parent_component_path"), NewParentPath)
 		|| NewParentPath.IsEmpty())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("missing required string field 'new_parent_component_path'"));
 	}
 
@@ -952,7 +920,7 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	USceneComponent* ChildScene = Cast<USceneComponent>(ChildComp);
 	if (!ChildScene)
 	{
-		return CMP_MakeError(Request, kMCPErrorWrongClassFamily,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 			FString::Printf(
 				TEXT("child component '%s' is not a USceneComponent (class '%s')"),
 				*ChildComp->GetName(), *ChildComp->GetClass()->GetPathName()));
@@ -960,7 +928,7 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	USceneComponent* ParentScene = Cast<USceneComponent>(ParentComp);
 	if (!ParentScene)
 	{
-		return CMP_MakeError(Request, kMCPErrorWrongClassFamily,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 			FString::Printf(
 				TEXT("new parent component '%s' is not a USceneComponent (class '%s')"),
 				*ParentComp->GetName(), *ParentComp->GetClass()->GetPathName()));
@@ -968,7 +936,7 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 
 	if (ChildScene == ParentScene)
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("child and new_parent are the same component"));
 	}
 
@@ -977,7 +945,7 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	AActor* ParentOwner = ParentScene->GetOwner();
 	if (!ChildOwner || ChildOwner != ParentOwner)
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			FString::Printf(
 				TEXT("child owner '%s' differs from parent owner '%s' — move_in_hierarchy is intra-actor only"),
 				ChildOwner ? *ChildOwner->GetName() : TEXT("(null)"),
@@ -987,7 +955,7 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	// Cannot re-parent the root component.
 	if (ChildOwner->GetRootComponent() == ChildScene)
 	{
-		return CMP_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(
 				TEXT("refusing to re-parent root component '%s' of actor '%s' — would orphan the actor's transform anchor"),
 				*ChildScene->GetName(), *ChildOwner->GetName()));
@@ -998,7 +966,7 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	// ACT_AttachWouldCycle path in ActorTools.cpp — both surfaces share the JSON-RPC error family).
 	if (CMP_ParentWouldCycle(ParentScene, ChildScene))
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			FString::Printf(
 				TEXT("move_in_hierarchy would create a cycle — '%s' (or its ancestor) is already a descendant of '%s'"),
 				*ParentScene->GetName(), *ChildScene->GetName()));
@@ -1007,8 +975,6 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	const USceneComponent* PrevParent = ChildScene->GetAttachParent();
 	const FString PrevParentName = PrevParent ? PrevParent->GetFName().ToString() : FString();
 
-	const FScopedTransaction Transaction(LOCTEXT("ComponentMoveInHierarchy",
-		"MCP: move component in hierarchy"));
 	ChildScene->Modify();
 	ParentScene->Modify();
 	ChildOwner->Modify();
@@ -1029,10 +995,10 @@ FMCPResponse Tool_MoveInHierarchy(const FMCPRequest& Request)
 	}
 	if (!bOk)
 	{
-		return CMP_MakeError(Request, kCMPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInternal,
 			TEXT("AttachToComponent returned false (component lifecycle issue?)"));
 	}
-	return CMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── component.list_class_default_subcomponents (read-only — no actor needed) ────────────────
@@ -1049,20 +1015,20 @@ FMCPResponse Tool_ListClassDefaultSubcomponents(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return CMP_MakeError(Request, kCMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 
 	// Resolve class — accept any AActor subclass (concrete OR abstract — we only need the CDO).
 	if (ClassPath[0] != TEXT('/'))
 	{
-		return CMP_MakeError(Request, kMCPErrorInvalidClassPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 			FString::Printf(TEXT("class_path '%s' invalid — must start with '/'"), *ClassPath));
 	}
 	UClass* Class = LoadObject<UClass>(nullptr, *ClassPath);
@@ -1073,13 +1039,13 @@ FMCPResponse Tool_ListClassDefaultSubcomponents(const FMCPRequest& Request)
 	}
 	if (!Class)
 	{
-		return CMP_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("class_path '%s' could not be resolved (LoadObject returned null)"),
 				*ClassPath));
 	}
 	if (!Class->IsChildOf(AActor::StaticClass()))
 	{
-		return CMP_MakeError(Request, kMCPErrorWrongClassFamily,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 			FString::Printf(
 				TEXT("class '%s' is not an AActor subclass — CDO subcomponent inspection only applies to actor classes"),
 				*Class->GetPathName()));
@@ -1089,7 +1055,7 @@ FMCPResponse Tool_ListClassDefaultSubcomponents(const FMCPRequest& Request)
 	AActor* CDOActor = Cast<AActor>(CDO);
 	if (!CDOActor)
 	{
-		return CMP_MakeError(Request, kCMPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCMPErrorInternal,
 			FString::Printf(
 				TEXT("class '%s' GetDefaultObject returned non-AActor (got '%s')"),
 				*Class->GetPathName(), CDO ? *CDO->GetClass()->GetName() : TEXT("(null)")));
@@ -1135,7 +1101,7 @@ FMCPResponse Tool_ListClassDefaultSubcomponents(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("class_path"), Class->GetPathName());
 	Out->SetArrayField(TEXT("subobjects"), Subobjects);
 	Out->SetNumberField(TEXT("total"), static_cast<double>(Subobjects.Num()));
-	return CMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

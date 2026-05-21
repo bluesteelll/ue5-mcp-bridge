@@ -3,6 +3,7 @@
 #include "UFunctionTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
 #include "Utils/MCPReflection.h"
@@ -20,29 +21,12 @@
 
 namespace
 {
+	// UFN_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx from
+	// MCPToolHelpers.h. NO PIE-guard / FScopedTransaction by design (bp.call_function legitimately
+	// invokes UFUNCTIONs in PIE; bp.list_class_functions is read-only).
 	constexpr int32 kUFNErrorInvalidParams = -32602;
 	constexpr int32 kUFNErrorInternal     = -32603;
-
-	FMCPResponse UFN_MakeError(const FMCPRequest& Req, int32 Code, const FString& Message)
-	{
-		FMCPResponse Resp;
-		Resp.RequestId = Req.RequestId;
-		Resp.OriginalIdString = Req.OriginalIdString;
-		Resp.bIsError = true;
-		Resp.ErrorCode = Code;
-		Resp.ErrorMessage = Message;
-		return Resp;
-	}
-
-	FMCPResponse UFN_MakeSuccessObj(const FMCPRequest& Req, TSharedPtr<FJsonObject> Obj)
-	{
-		FMCPResponse Resp;
-		Resp.RequestId = Req.RequestId;
-		Resp.OriginalIdString = Req.OriginalIdString;
-		Resp.bIsError = false;
-		Resp.Result = MakeShared<FJsonValueObject>(MoveTemp(Obj));
-		return Resp;
-	}
 
 	/**
 	 * Resolve target_path into (UClass, UObject) tuple.
@@ -195,7 +179,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return UFN_MakeError(Request, kUFNErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 			TEXT("bp.call_function requires args.target_path + args.function_name"));
 	}
 
@@ -203,12 +187,12 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	FString FunctionName;
 	if (!Request.Args->TryGetStringField(TEXT("target_path"), TargetPath) || TargetPath.IsEmpty())
 	{
-		return UFN_MakeError(Request, kUFNErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 			TEXT("missing required string field 'target_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("function_name"), FunctionName) || FunctionName.IsEmpty())
 	{
-		return UFN_MakeError(Request, kUFNErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
 
@@ -219,14 +203,14 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	FString ResolveErrMsg;
 	if (!UFN_ResolveTarget(TargetPath, TargetClass, TargetObject, ResolveErrCode, ResolveErrMsg))
 	{
-		return UFN_MakeError(Request, ResolveErrCode, ResolveErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErrMsg);
 	}
 
 	// Find function by name (walks parent classes via UClass::FindFunctionByName).
 	UFunction* Func = TargetClass->FindFunctionByName(FName(*FunctionName));
 	if (!Func)
 	{
-		return UFN_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(TEXT("function '%s' not found on class '%s' (or its parents); "
 				"use bp.list_class_functions to discover available functions"),
 				*FunctionName, *TargetClass->GetPathName()));
@@ -239,7 +223,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	if (!bAllowAny &&
 		!(FuncFlags & (FUNC_BlueprintCallable | FUNC_BlueprintPure | FUNC_Exec)))
 	{
-		return UFN_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(TEXT("function '%s' is not BlueprintCallable/BlueprintPure/Exec "
 				"(FUNC flags=%u); pass args.allow_any=true to override"),
 				*FunctionName, FuncFlags));
@@ -278,7 +262,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 		FString WriteErr;
 		if (!FMCPReflection::WritePropertyValueAt(Prop, ParamPtr, ArgValue, TargetObject, WriteErr))
 		{
-			return UFN_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 				FString::Printf(TEXT("param '%s' (%s): %s"),
 					*ParamName, *Prop->GetCPPType(), *WriteErr));
 		}
@@ -322,7 +306,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	Result->SetStringField(TEXT("function_signature"), UFN_BuildSignature(Func));
 	Result->SetStringField(TEXT("target_class"), TargetClass->GetPathName());
 	Result->SetStringField(TEXT("target_object"), TargetObject->GetPathName());
-	return UFN_MakeSuccessObj(Request, Result);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Result);
 }
 
 // ─── bp.list_class_functions ────────────────────────────────────────────────────────────────
@@ -349,14 +333,14 @@ FMCPResponse Tool_ListClassFunctions(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return UFN_MakeError(Request, kUFNErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 			TEXT("bp.list_class_functions requires args.class_path"));
 	}
 
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return UFN_MakeError(Request, kUFNErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 
@@ -368,7 +352,7 @@ FMCPResponse Tool_ListClassFunctions(const FMCPRequest& Request)
 	}
 	if (!TargetClass)
 	{
-		return UFN_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath));
 	}
 
@@ -407,7 +391,7 @@ FMCPResponse Tool_ListClassFunctions(const FMCPRequest& Request)
 				UFN_PARSE(FUNC_EditorOnly);
 				UFN_PARSE(FUNC_Const);
 				#undef UFN_PARSE
-				return UFN_MakeError(Request, kUFNErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 					FString::Printf(TEXT("unknown flag '%s' in flags_filter; see UFunction::FunctionFlags FUNC_* constants"),
 						*FlagName));
 			}
@@ -439,12 +423,12 @@ FMCPResponse Tool_ListClassFunctions(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageTokenWire, Cursor, DecodeErr))
 		{
-			return UFN_MakeError(Request, kUFNErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kUFNErrorInvalidParams,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 		}
 		if (Cursor.FilterHash != FilterHash)
 		{
-			return UFN_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token's filter_hash doesn't match current call's filter"));
 		}
 	}
@@ -539,7 +523,7 @@ FMCPResponse Tool_ListClassFunctions(const FMCPRequest& Request)
 	{
 		Result->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return UFN_MakeSuccessObj(Request, Result);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Result);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

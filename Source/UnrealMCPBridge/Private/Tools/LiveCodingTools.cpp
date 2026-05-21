@@ -5,6 +5,7 @@
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "FMCPLogStream.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPWorldContext.h"
 
@@ -23,7 +24,9 @@
 
 namespace
 {
-	// LIV_ prefix per the unity-build symbol-collision pattern.
+	// LIV_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx
+	// from MCPToolHelpers.h.
 	constexpr int32 kLIVErrorInvalidParams = -32602;
 	constexpr int32 kLIVErrorInternal      = -32603;
 
@@ -37,31 +40,6 @@ namespace
 	// Poll cadence inside the worker body. 100 ms is a balance between responsiveness (cancel
 	// detection latency) and CPU overhead (FPlatformProcess::Sleep is a hard yield).
 	constexpr double kLIVPollIntervalSecs = 0.1;
-
-	void LIV_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse LIV_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		LIV_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse LIV_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		LIV_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 #if PLATFORM_WINDOWS
 	/**
@@ -144,7 +122,7 @@ FMCPResponse Tool_RecompileInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return LIV_MakeError(Request, kLIVErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLIVErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// ─── Validate modules array ───────────────────────────────────────────────────────────────
@@ -152,7 +130,7 @@ FMCPResponse Tool_RecompileInternal(const FMCPRequest& Request)
 	if (!Request.Args->TryGetArrayField(TEXT("modules"), ModulesArr) || !ModulesArr ||
 		ModulesArr->Num() == 0)
 	{
-		return LIV_MakeError(Request, kLIVErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLIVErrorInvalidParams,
 			TEXT("missing or empty required array field 'modules' (UE module names, or [\"*\"] for all)"));
 	}
 
@@ -163,7 +141,7 @@ FMCPResponse Tool_RecompileInternal(const FMCPRequest& Request)
 		FString Name;
 		if (!(*ModulesArr)[i].IsValid() || !(*ModulesArr)[i]->TryGetString(Name) || Name.IsEmpty())
 		{
-			return LIV_MakeError(Request, kLIVErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kLIVErrorInvalidParams,
 				FString::Printf(TEXT("'modules'[%d] is not a non-empty string"), i));
 		}
 		ModuleNames.Add(MoveTemp(Name));
@@ -180,7 +158,7 @@ FMCPResponse Tool_RecompileInternal(const FMCPRequest& Request)
 		ILiveCodingModule* LC = LIV_GetModule();
 		if (!LC)
 		{
-			return LIV_MakeError(Request, kMCPErrorLiveCodingDisabled,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLiveCodingDisabled,
 				TEXT("Live Coding module is not loadable in this build configuration "
 					 "(LiveCoding module missing or platform unsupported); "
 					 "Live Coding is Windows-desktop-editor only"));
@@ -190,14 +168,14 @@ FMCPResponse Tool_RecompileInternal(const FMCPRequest& Request)
 		if (!LC->HasStarted() && !LC->CanEnableForSession())
 		{
 			const FText ErrText = LC->GetEnableErrorText();
-			return LIV_MakeError(Request, kMCPErrorLiveCodingDisabled,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLiveCodingDisabled,
 				FString::Printf(TEXT("Live Coding console is not started and cannot be enabled: %s; "
 					"enable via Editor Preferences → General → Live Coding"),
 					*ErrText.ToString()));
 		}
 	}
 #else
-	return LIV_MakeError(Request, kMCPErrorLiveCodingDisabled,
+	return FMCPToolHelpers::MakeError(Request, kMCPErrorLiveCodingDisabled,
 		TEXT("Live Coding is only available on Windows desktop editor builds (compile-time gated "
 			 "by PLATFORM_WINDOWS); this build was produced on a non-Windows platform"));
 #endif
@@ -396,13 +374,13 @@ FMCPResponse Tool_RecompileInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return LIV_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return LIV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

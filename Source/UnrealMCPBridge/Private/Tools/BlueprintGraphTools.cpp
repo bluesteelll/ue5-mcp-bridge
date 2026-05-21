@@ -3,6 +3,8 @@
 #include "BlueprintGraphTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPBlueprintUtils.h"
 #include "Utils/MCPPinTypeUtils.h"
@@ -37,51 +39,9 @@
 
 namespace
 {
-	// BGT_ prefix per the unity-build symbol-collision pattern.
-	constexpr int32 kBGTErrorInvalidParams = -32602;
-	constexpr int32 kBGTErrorInternal      = -32603;
-
-	void BGT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse BGT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		BGT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse BGT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		BGT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool BGT_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = BGT_MakeError(Request, kBGTErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = BGT_MakeError(Request, kBGTErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
+	// BGT_ prefix retained for any helper unique to this surface.
+	constexpr int32 kBGTErrorInvalidParams = kMCPErrorInvalidParams;
+	constexpr int32 kBGTErrorInternal      = kMCPErrorInternal;
 
 	/**
 	 * Find a graph by name across UbergraphPages + FunctionGraphs + MacroGraphs.
@@ -193,17 +153,15 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddBPNode", "Add Blueprint Node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
 
 	FString NodeClassPath;
-	if (!BGT_RequireStringField(Request, TEXT("node_class"), NodeClassPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_class"), NodeClassPath, Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -220,12 +178,12 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(
 				TEXT("graph '%s' not found on blueprint '%s' (searched UbergraphPages/FunctionGraphs/MacroGraphs)"),
 				*GraphName, *BlueprintPath));
@@ -235,26 +193,26 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 	UClass* NodeClass = LoadObject<UClass>(nullptr, *NodeClassPath);
 	if (!NodeClass)
 	{
-		return BGT_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("node_class '%s' could not be loaded — expected e.g. "
 				"'/Script/BlueprintGraph.K2Node_VariableGet'"), *NodeClassPath));
 	}
 	if (!NodeClass->IsChildOf(UK2Node::StaticClass()))
 	{
-		return BGT_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(TEXT("node_class '%s' is not a UK2Node subclass (class hierarchy: %s)"),
 				*NodeClassPath, *NodeClass->GetSuperClass()->GetPathName()));
 	}
 	if (NodeClass->HasAnyClassFlags(CLASS_Abstract))
 	{
-		return BGT_MakeError(Request, kMCPErrorClassAbstract,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassAbstract,
 			FString::Printf(TEXT("node_class '%s' is abstract — cannot instantiate"), *NodeClassPath));
 	}
 
 	// ─── Construct + configure + place ──────────────────────────────────────────────────────────
-	FScopedTransaction Transaction(LOCTEXT("MCP_AddBPNode", "Add Blueprint Node"));
 	Blueprint->Modify();
 	Graph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 
 	UK2Node* NewNode = NewObject<UK2Node>(Graph, NodeClass, NAME_None, RF_Transactional);
 
@@ -346,7 +304,7 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 	}
 	Out->SetArrayField(TEXT("pins"), PinArr);
 
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.connect_pins ───────────────────────────────────────────────────────────────────────────
@@ -359,18 +317,16 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_ConnectPins", "Connect Blueprint Pins"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath, FromNodeGuid, FromPinName, ToNodeGuid, ToPinName;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("from_node"),      FromNodeGuid,  Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("from_pin"),       FromPinName,   Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("to_node"),        ToNodeGuid,    Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("to_pin"),         ToPinName,     Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("from_node"),      FromNodeGuid,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("from_pin"),       FromPinName,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("to_node"),        ToNodeGuid,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("to_pin"),         ToPinName,     Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -378,39 +334,39 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
 	UEdGraphNode* FromNode = BGT_FindNodeByGuid(Graph, FromNodeGuid);
 	if (!FromNode)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("from_node '%s' not found in graph '%s'"), *FromNodeGuid, *GraphName));
 	}
 	UEdGraphNode* ToNode = BGT_FindNodeByGuid(Graph, ToNodeGuid);
 	if (!ToNode)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("to_node '%s' not found in graph '%s'"), *ToNodeGuid, *GraphName));
 	}
 
 	UEdGraphPin* FromPin = FromNode->FindPin(FName(*FromPinName));
 	if (!FromPin)
 	{
-		return BGT_MakeError(Request, kMCPErrorPinNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPinNotFound,
 			FString::Printf(TEXT("from_pin '%s' not found on node '%s'"),
 				*FromPinName, *FromNode->GetNodeTitle(ENodeTitleType::ListView).ToString()));
 	}
 	UEdGraphPin* ToPin = ToNode->FindPin(FName(*ToPinName));
 	if (!ToPin)
 	{
-		return BGT_MakeError(Request, kMCPErrorPinNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPinNotFound,
 			FString::Printf(TEXT("to_pin '%s' not found on node '%s'"),
 				*ToPinName, *ToNode->GetNodeTitle(ENodeTitleType::ListView).ToString()));
 	}
@@ -418,7 +374,7 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 	const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(Graph->GetSchema());
 	if (!Schema)
 	{
-		return BGT_MakeError(Request, kBGTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInternal,
 			FString::Printf(TEXT("graph '%s' schema is not UEdGraphSchema_K2 (class=%s)"),
 				*GraphName, *Graph->GetSchema()->GetClass()->GetPathName()));
 	}
@@ -428,18 +384,18 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 	const FPinConnectionResponse CanConnect = Schema->CanCreateConnection(FromPin, ToPin);
 	if (CanConnect.Response == CONNECT_RESPONSE_DISALLOW)
 	{
-		return BGT_MakeError(Request, kMCPErrorPinConnectionRefused,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPinConnectionRefused,
 			FString::Printf(TEXT("schema rejected connection '%s.%s' → '%s.%s': %s"),
 				*FromNode->GetNodeTitle(ENodeTitleType::ListView).ToString(), *FromPinName,
 				*ToNode->GetNodeTitle(ENodeTitleType::ListView).ToString(), *ToPinName,
 				*CanConnect.Message.ToString()));
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_ConnectPins", "Connect Blueprint Pins"));
 	Blueprint->Modify();
 	Graph->Modify();
 	FromNode->Modify();
 	ToNode->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 
 	// Count link counts BEFORE so we can report break-existing semantics from
 	// CONNECT_RESPONSE_BREAK_OTHERS_A/B/AB.
@@ -466,7 +422,7 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("connected"), bConnected);
 	Out->SetNumberField(TEXT("broke_existing_count"), static_cast<double>(BrokeTotal));
 	Out->SetStringField(TEXT("response"), CanConnect.Message.ToString());
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.set_node_property ──────────────────────────────────────────────────────────────────────
@@ -488,19 +444,19 @@ FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request)
 
 	if (FMCPWorldContext::IsPIEActive())
 	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	FString BlueprintPath, NodeGuidStr, PropertyName;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"),  BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("node_guid"),       NodeGuidStr,   Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("property_name"),   PropertyName,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"),  BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),       NodeGuidStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_name"),   PropertyName,  Err)) { return Err; }
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInvalidParams,
 			TEXT("missing required field 'value' (any JSON value)"));
 	}
 
@@ -510,26 +466,26 @@ FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
 	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
 	if (!Node)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
 	}
 
 	FProperty* Prop = Node->GetClass()->FindPropertyByName(FName(*PropertyName));
 	if (!Prop)
 	{
-		return BGT_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(TEXT("property '%s' not found on node class '%s'"),
 				*PropertyName, *Node->GetClass()->GetPathName()));
 	}
@@ -552,7 +508,7 @@ FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request)
 
 	if (!bWriteOk)
 	{
-		return BGT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("write rejected on '%s.%s': %s"),
 				*Node->GetClass()->GetName(), *PropertyName, *WriteError));
 	}
@@ -573,7 +529,7 @@ FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("property_name"), PropertyName);
 	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
 	Out->SetField(TEXT("new_value"),   NewValue.IsValid()   ? NewValue   : MakeShared<FJsonValueNull>());
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.set_pin_default ────────────────────────────────────────────────────────────────────────
@@ -597,21 +553,19 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_SetPinDefault", "MCP: bp.set_pin_default"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath, NodeGuidStr, PinName;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInvalidParams,
 			TEXT("missing required field 'value' (string / number / bool / null for default reset)"));
 	}
 
@@ -621,26 +575,26 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
 	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
 	if (!Node)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
 	}
 
 	UEdGraphPin* Pin = Node->FindPin(FName(*PinName));
 	if (!Pin)
 	{
-		return BGT_MakeError(Request, kMCPErrorPinNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPinNotFound,
 			FString::Printf(TEXT("pin '%s' not found on node '%s' (class %s)"),
 				*PinName, *Node->GetNodeTitle(ENodeTitleType::ListView).ToString(),
 				*Node->GetClass()->GetName()));
@@ -648,7 +602,7 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 
 	if (Pin->LinkedTo.Num() > 0)
 	{
-		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInvalidParams,
 			FString::Printf(TEXT("pin '%s' is connected to %d link(s); disconnect first via "
 				"bp.disconnect_pin or bp.connect_pins (break-others response)"),
 				*PinName, Pin->LinkedTo.Num()));
@@ -657,7 +611,7 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 	const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(Pin->GetSchema());
 	if (!Schema)
 	{
-		return BGT_MakeError(Request, kBGTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInternal,
 			FString::Printf(TEXT("pin '%s' schema is not UEdGraphSchema_K2 (class=%s)"),
 				*PinName, *Pin->GetSchema()->GetClass()->GetPathName()));
 	}
@@ -665,10 +619,10 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 	// Snapshot prior default for the response BEFORE schema modifies it.
 	TSharedRef<FJsonObject> PriorDefault = BGT_BuildPinDefaultSnapshot(Pin);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_SetPinDefault", "MCP: bp.set_pin_default"));
 	Blueprint->Modify();
 	Graph->Modify();
 	Node->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 
 	// Coerce JSON value to FString for the schema. Distinguish object-ref shape (PC_Object/PC_Class
 	// + string-shaped value) so we can use TrySetDefaultObject (LoadObject). Otherwise route through
@@ -698,7 +652,7 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 	}
 	else
 	{
-		return BGT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("unsupported JSON value type for pin '%s' default — "
 				"expected string/number/bool/null, got JSON type %d"), *PinName,
 				static_cast<int32>(ValueField->Type)));
@@ -712,7 +666,7 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 		UObject* TargetObject = LoadObject<UObject>(nullptr, *ValueAsString);
 		if (!TargetObject)
 		{
-			return BGT_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("could not resolve object path '%s' for pin '%s' (PC_Object/PC_Class default)"),
 					*ValueAsString, *PinName));
 		}
@@ -742,7 +696,7 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 			(bWroteAsObject ? PriorObjStr != ValueAsString : PriorValStr != ValueAsString);
 		if (bDesiredChange && !bDidChange)
 		{
-			return BGT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 				FString::Printf(TEXT("schema rejected default '%s' for pin '%s' (category=%s) — "
 					"value does not satisfy IsPinDefaultValid"),
 					*ValueAsString, *PinName, *Pin->PinType.PinCategory.ToString()));
@@ -756,7 +710,7 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("pin_name"),  PinName);
 	Out->SetObjectField(TEXT("prior_default"), PriorDefault);
 	Out->SetObjectField(TEXT("new_default"),   NewDefault);
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.delete_node ────────────────────────────────────────────────────────────────────────────
@@ -775,15 +729,13 @@ FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_DeleteBPNode", "MCP: bp.delete_node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath, NodeGuidStr;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -791,19 +743,19 @@ FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
 	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
 	if (!Node)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
 	}
 
@@ -818,7 +770,7 @@ FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
 		const TCHAR* WhichKind = bIsFunctionEntry  ? TEXT("FunctionEntry")
 			                   : bIsFunctionResult ? TEXT("FunctionResult")
 			                                       : TEXT("Event");
-		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInvalidParams,
 			FString::Printf(TEXT("cannot delete %s node '%s' (class=%s) — entry/result/builtin-event "
 				"nodes anchor the graph and are undeletable; remove the graph itself via bp.remove_function "
 				"or unbind via the editor"),
@@ -828,7 +780,7 @@ FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
 	// Defense-in-depth — catches K2Node_Tunnel / K2Node_Composite / future undeletables.
 	if (!Node->CanUserDeleteNode())
 	{
-		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInvalidParams,
 			FString::Printf(TEXT("node class '%s' reports CanUserDeleteNode=false; engine refuses deletion"),
 				*Node->GetClass()->GetName()));
 	}
@@ -843,10 +795,10 @@ FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
 	const FString NodeClassPath = Node->GetClass()->GetPathName();
 	const FString NodeTitle     = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_DeleteBPNode", "MCP: bp.delete_node"));
 	Blueprint->Modify();
 	Graph->Modify();
 	Node->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 
 	// RemoveNode internally calls Pin->BreakAllPinLinks() on every pin then drops the node from
 	// Graph->Nodes. Pass bBreakAllLinks=true (default) explicitly for clarity.
@@ -859,7 +811,7 @@ FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("node_class"),    NodeClassPath);
 	Out->SetStringField(TEXT("node_title"),    NodeTitle);
 	Out->SetNumberField(TEXT("links_broken"),  static_cast<double>(LinksToBreak));
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.disconnect_pin ─────────────────────────────────────────────────────────────────────────
@@ -876,16 +828,14 @@ FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_DisconnectPin", "MCP: bp.disconnect_pin"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath, NodeGuidStr, PinName;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("pin_name"),       PinName,       Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -893,26 +843,26 @@ FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
 	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
 	if (!Node)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
 	}
 
 	UEdGraphPin* Pin = Node->FindPin(FName(*PinName));
 	if (!Pin)
 	{
-		return BGT_MakeError(Request, kMCPErrorPinNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPinNotFound,
 			FString::Printf(TEXT("pin '%s' not found on node '%s'"),
 				*PinName, *Node->GetNodeTitle(ENodeTitleType::ListView).ToString()));
 	}
@@ -923,16 +873,17 @@ FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
 	{
 		// No-op succeeds — caller may be in an idempotent disconnect loop. Return links_broken=0
 		// rather than erroring so the caller's iteration completes cleanly.
+		Scope.Abort();
 		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		Out->SetStringField(TEXT("pin_name"), PinName);
 		Out->SetNumberField(TEXT("links_broken"), 0.0);
-		return BGT_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_DisconnectPin", "MCP: bp.disconnect_pin"));
 	Blueprint->Modify();
 	Graph->Modify();
 	Node->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 	// Also Modify() all linked-to nodes so the transaction captures their pin state too — needed
 	// for clean Undo.
 	for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
@@ -947,7 +898,7 @@ FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("pin_name"), PinName);
 	Out->SetNumberField(TEXT("links_broken"), static_cast<double>(PriorLinks));
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.move_node ──────────────────────────────────────────────────────────────────────────────
@@ -966,20 +917,18 @@ FMCPResponse Tool_MoveNode(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_MoveBPNode", "MCP: bp.move_node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath, NodeGuidStr;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
 
 	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("position"), PositionArr) || !PositionArr || PositionArr->Num() != 2)
 	{
-		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInvalidParams,
 			TEXT("missing/invalid 'position' field — expected [x, y] number array of length 2"));
 	}
 
@@ -989,19 +938,19 @@ FMCPResponse Tool_MoveNode(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
 	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
 	if (!Node)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
 	}
 
@@ -1010,15 +959,13 @@ FMCPResponse Tool_MoveNode(const FMCPRequest& Request)
 	const int32 NewX = static_cast<int32>((*PositionArr)[0]->AsNumber());
 	const int32 NewY = static_cast<int32>((*PositionArr)[1]->AsNumber());
 
-	{
-		FScopedTransaction Transaction(LOCTEXT("MCP_MoveBPNode", "MCP: bp.move_node"));
-		Blueprint->Modify();
-		Graph->Modify();
-		Node->Modify();
+	Blueprint->Modify();
+	Graph->Modify();
+	Node->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 
-		Node->NodePosX = NewX;
-		Node->NodePosY = NewY;
-	}
+	Node->NodePosX = NewX;
+	Node->NodePosY = NewY;
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
@@ -1034,7 +981,7 @@ FMCPResponse Tool_MoveNode(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString(EGuidFormats::Digits));
 	Out->SetArrayField(TEXT("prior_position"), PriorPosArr);
 	Out->SetArrayField(TEXT("new_position"),   NewPosArr);
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.add_comment ────────────────────────────────────────────────────────────────────────────
@@ -1058,15 +1005,13 @@ FMCPResponse Tool_AddComment(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddCommentNode", "MCP: bp.add_comment"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath, CommentText;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("text"),           CommentText,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("text"),           CommentText,   Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -1075,7 +1020,7 @@ FMCPResponse Tool_AddComment(const FMCPRequest& Request)
 	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("position"), PositionArr) || !PositionArr || PositionArr->Num() != 2)
 	{
-		return BGT_MakeError(Request, kBGTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBGTErrorInvalidParams,
 			TEXT("missing/invalid 'position' field — expected [x, y] number array of length 2"));
 	}
 	const int32 PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
@@ -1105,18 +1050,18 @@ FMCPResponse Tool_AddComment(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_AddCommentNode", "MCP: bp.add_comment"));
 	Blueprint->Modify();
 	Graph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 
 	UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(
 		Graph, NAME_None, RF_Transactional);
@@ -1152,7 +1097,7 @@ FMCPResponse Tool_AddComment(const FMCPRequest& Request)
 	SizeResp.Add(MakeShared<FJsonValueNumber>(SizeH));
 	Out->SetArrayField(TEXT("size"), SizeResp);
 
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.delete_comment ─────────────────────────────────────────────────────────────────────────
@@ -1170,15 +1115,13 @@ FMCPResponse Tool_DeleteComment(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return BGT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_DeleteCommentNode", "MCP: bp.delete_comment"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString BlueprintPath, NodeGuidStr;
 	FMCPResponse Err;
-	if (!BGT_RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
-	if (!BGT_RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
 
 	FString GraphName = TEXT("EventGraph");
 	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
@@ -1186,35 +1129,35 @@ FMCPResponse Tool_DeleteComment(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
-	if (!Blueprint) { return BGT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
 	if (!Graph)
 	{
-		return BGT_MakeError(Request, kMCPErrorGraphNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
 			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
 	}
 
 	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
 	if (!Node)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
 	}
 
 	UEdGraphNode_Comment* CommentNode = Cast<UEdGraphNode_Comment>(Node);
 	if (!CommentNode)
 	{
-		return BGT_MakeError(Request, kMCPErrorNodeNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
 			FString::Printf(
 				TEXT("node '%s' in graph '%s' is class '%s', not UEdGraphNode_Comment — use bp.delete_node for K2 nodes"),
 				*NodeGuidStr, *GraphName, *Node->GetClass()->GetName()));
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_DeleteCommentNode", "MCP: bp.delete_comment"));
 	Blueprint->Modify();
 	Graph->Modify();
 	CommentNode->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
 
 	Graph->RemoveNode(CommentNode);
 
@@ -1222,7 +1165,7 @@ FMCPResponse Tool_DeleteComment(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("deleted"), true);
-	return BGT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

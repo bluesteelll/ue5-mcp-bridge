@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 
@@ -22,34 +23,11 @@
 
 namespace
 {
-	// COMP_ prefix per the unity-build symbol-collision pattern.
+	// COMP_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx from
+	// MCPToolHelpers.h.
 	constexpr int32 kCOMPErrorInvalidParams = -32602;
 	constexpr int32 kCOMPErrorInternal      = -32603;
-
-	void COMP_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse COMP_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		COMP_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse COMP_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		COMP_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	/**
 	 * Parse the ``package_paths`` array argument: required, minItems=1, every entry normalised.
@@ -61,13 +39,13 @@ namespace
 	{
 		if (!Request.Args.IsValid())
 		{
-			OutError = COMP_MakeError(Request, kCOMPErrorInvalidParams, TEXT("missing args object"));
+			OutError = FMCPToolHelpers::MakeError(Request, kCOMPErrorInvalidParams, TEXT("missing args object"));
 			return false;
 		}
 		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
 		if (!Request.Args->TryGetArrayField(TEXT("package_paths"), Arr) || Arr == nullptr || Arr->Num() == 0)
 		{
-			OutError = COMP_MakeError(Request, kCOMPErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kCOMPErrorInvalidParams,
 				TEXT("missing or empty required array field 'package_paths'"));
 			return false;
 		}
@@ -77,14 +55,14 @@ namespace
 			FString S;
 			if (!V.IsValid() || !V->TryGetString(S))
 			{
-				OutError = COMP_MakeError(Request, kCOMPErrorInvalidParams,
+				OutError = FMCPToolHelpers::MakeError(Request, kCOMPErrorInvalidParams,
 					TEXT("package_paths: expected array of strings"));
 				return false;
 			}
 			const FString Norm = FMCPAssetPathUtils::Normalize(S);
 			if (Norm.IsEmpty())
 			{
-				OutError = COMP_MakeError(Request, kMCPErrorInvalidPath,
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 				return false;
 			}
@@ -232,13 +210,13 @@ FMCPResponse Tool_FindUnusedInternal(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return COMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset._size_report_internal (HOTFIX 2 — async job pattern; sync handler is Lane B) ─────
@@ -340,13 +318,13 @@ FMCPResponse Tool_SizeReportInternal(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return COMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset._batch_metadata_internal (Lane B — sync only validates strings + submits job) ───
@@ -354,13 +332,13 @@ FMCPResponse Tool_BatchMetadataInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return COMP_MakeError(Request, kCOMPErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCOMPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* PathsPtr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("paths"), PathsPtr) || PathsPtr == nullptr || PathsPtr->Num() == 0)
 	{
-		return COMP_MakeError(Request, kCOMPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCOMPErrorInvalidParams,
 			TEXT("missing or empty required array field 'paths'"));
 	}
 
@@ -372,13 +350,13 @@ FMCPResponse Tool_BatchMetadataInternal(const FMCPRequest& Request)
 		FString S;
 		if (!V.IsValid() || !V->TryGetString(S))
 		{
-			return COMP_MakeError(Request, kCOMPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCOMPErrorInvalidParams,
 				TEXT("paths: expected array of strings"));
 		}
 		const FString Norm = FMCPAssetPathUtils::Normalize(S);
 		if (Norm.IsEmpty())
 		{
-			return COMP_MakeError(Request, kMCPErrorInvalidPath,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(TEXT("paths entry '%s' is malformed"), *S));
 		}
 		NormalizedPaths.Add(Norm);
@@ -441,13 +419,13 @@ FMCPResponse Tool_BatchMetadataInternal(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return COMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset._find_broken_references_internal (Hotfix 3 — Lane B, async-job pattern) ───────────
@@ -555,13 +533,13 @@ FMCPResponse Tool_FindBrokenReferencesInternal(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return COMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset._find_duplicates_by_name_internal (Hotfix 3 — Lane B, async-job pattern) ──────────
@@ -693,13 +671,13 @@ FMCPResponse Tool_FindDuplicatesByNameInternal(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return COMP_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return COMP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

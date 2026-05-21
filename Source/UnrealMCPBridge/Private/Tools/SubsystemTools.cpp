@@ -3,6 +3,7 @@
 #include "SubsystemTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPReflection.h"
 #include "Utils/MCPWorldContext.h"
@@ -33,35 +34,6 @@
 
 namespace
 {
-	// SUB_ prefix per the surface brief + unity-build symbol-collision convention.
-	constexpr int32 kSUBErrorInvalidParams = -32602;
-	constexpr int32 kSUBErrorInternal      = -32603;
-
-	void SUB_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse SUB_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		SUB_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse SUB_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		SUB_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
 	/**
 	 * Resolve the "best" world for World/GameInstance/LocalPlayer subsystem enumeration.
 	 *
@@ -124,7 +96,7 @@ namespace
 
 		if (ClassPath.IsEmpty())
 		{
-			OutErrCode = kSUBErrorInvalidParams;
+			OutErrCode = kMCPErrorInvalidParams;
 			OutError = TEXT("class_path is empty");
 			return nullptr;
 		}
@@ -321,7 +293,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 
 	if (!bAll && !bEngine && !bEditor && !bWorld && !bGameInstance && !bLocalPlayer)
 	{
-		return SUB_MakeError(Request, kSUBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(
 				TEXT("unknown kind '%s'; expected one of: engine|editor|world|game_instance|local_player|all"),
 				*Kind));
@@ -411,7 +383,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("subsystems"), Items);
 	Out->SetNumberField(TEXT("total"), Items.Num());
 	Out->SetStringField(TEXT("kind_filter"), KindLower);
-	return SUB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── subsystem.get_property ───────────────────────────────────────────────────────────────────
@@ -435,7 +407,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SUB_MakeError(Request, kSUBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("subsystem.get_property requires args.class_path + args.property_name"));
 	}
 
@@ -443,12 +415,12 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	FString PropertyName;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return SUB_MakeError(Request, kSUBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("property_name"), PropertyName) || PropertyName.IsEmpty())
 	{
-		return SUB_MakeError(Request, kSUBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'property_name'"));
 	}
 
@@ -459,7 +431,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 		ClassPath, SubsystemClass, ResolveErrCode, ResolveErrMsg);
 	if (!Instance)
 	{
-		return SUB_MakeError(Request, ResolveErrCode, ResolveErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErrMsg);
 	}
 	check(SubsystemClass != nullptr);
 
@@ -468,7 +440,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	FProperty* Prop = SubsystemClass->FindPropertyByName(FName(*PropertyName));
 	if (!Prop)
 	{
-		return SUB_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(TEXT("property '%s' not found on subsystem class '%s' (or its parents); "
 				"use marshall.list_properties on the subsystem instance to enumerate available properties"),
 				*PropertyName, *SubsystemClass->GetPathName()));
@@ -485,7 +457,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("type"), FMCPReflection::DescribePropertyType(Prop));
 	Out->SetField(TEXT("value"), Value.IsValid() ? Value : MakeShared<FJsonValueNull>());
 	Out->SetStringField(TEXT("instance_path"), Instance->GetPathName());
-	return SUB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── subsystem.call_function ──────────────────────────────────────────────────────────────────
@@ -518,7 +490,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SUB_MakeError(Request, kSUBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("subsystem.call_function requires args.class_path + args.function_name"));
 	}
 
@@ -526,12 +498,12 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	FString FunctionName;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return SUB_MakeError(Request, kSUBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("function_name"), FunctionName) || FunctionName.IsEmpty())
 	{
-		return SUB_MakeError(Request, kSUBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
 
@@ -542,14 +514,14 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 		ClassPath, SubsystemClass, ResolveErrCode, ResolveErrMsg);
 	if (!Instance)
 	{
-		return SUB_MakeError(Request, ResolveErrCode, ResolveErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErrMsg);
 	}
 	check(SubsystemClass != nullptr);
 
 	UFunction* Func = SubsystemClass->FindFunctionByName(FName(*FunctionName));
 	if (!Func)
 	{
-		return SUB_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(TEXT("function '%s' not found on subsystem class '%s' (or its parents); "
 				"use bp.list_class_functions on the class path to enumerate available functions"),
 				*FunctionName, *SubsystemClass->GetPathName()));
@@ -562,7 +534,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	if (!bAllowAny &&
 		!(FuncFlags & (FUNC_BlueprintCallable | FUNC_BlueprintPure | FUNC_Exec)))
 	{
-		return SUB_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(TEXT("function '%s' is not BlueprintCallable/BlueprintPure/Exec "
 				"(FUNC flags=%u); pass args.allow_any=true to override"),
 				*FunctionName, FuncFlags));
@@ -602,7 +574,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 		FString WriteErr;
 		if (!FMCPReflection::WritePropertyValueAt(Prop, ParamPtr, ArgValue, Instance, WriteErr))
 		{
-			return SUB_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 				FString::Printf(TEXT("param '%s' (%s): %s"),
 					*ParamName, *Prop->GetCPPType(), *WriteErr));
 		}
@@ -672,7 +644,7 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	Result->SetObjectField(TEXT("out_params"), OutParamsObj);
 	Result->SetBoolField(TEXT("is_state_changing"), bIsStateChanging);
 	Result->SetStringField(TEXT("instance_path"), Instance->GetPathName());
-	return SUB_MakeSuccessObj(Request, Result);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Result);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

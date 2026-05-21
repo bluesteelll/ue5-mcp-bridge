@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPReflection.h"
@@ -33,39 +34,15 @@
 
 namespace
 {
-	// LCO_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kLCOErrorInvalidParams = -32602;
-	constexpr int32 kLCOErrorInternal      = -32603;
+	// LCO_ prefix per the unity-build symbol-collision pattern. StampIds / MakeError / MakeSuccessObj
+	// migrated to FMCPToolHelpers in Phase 3 (Group G3); only the surface-local error-code aliases
+	// and domain caps live here.
+	constexpr int32 kLCOErrorInvalidParams = kMCPErrorInvalidParams; // -32602
+	constexpr int32 kLCOErrorInternal      = kMCPErrorInternal;      // -32603
 
 	// Hard caps per plan v3 D3 / C4 / C5.
 	constexpr int32 kLCOMaxActorsPerDump = 5000;
 	constexpr int32 kLCOMaxBatchItems    = 1000;
-
-	void LCO_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse LCO_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		LCO_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse LCO_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		LCO_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	/**
 	 * Build the compact ~200B/actor summary for ``level._full_actor_dump_internal`` and
@@ -370,13 +347,13 @@ FMCPResponse Tool_FullActorDumpInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return LCO_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return LCO_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level._find_actors_with_class_internal (Lane B → SubmitJob → game-thread body) ──────────
@@ -405,12 +382,12 @@ FMCPResponse Tool_FindActorsWithClassInternal(const FMCPRequest& Request)
 	// (LoadObject is game-thread-only).
 	if (!Request.Args.IsValid())
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 	bool bRecursive = true;
@@ -574,13 +551,13 @@ FMCPResponse Tool_FindActorsWithClassInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return LCO_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return LCO_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor._batch_spawn_internal (Lane B → SubmitJob → game-thread body) ─────────────────────
@@ -606,17 +583,17 @@ FMCPResponse Tool_BatchSpawnInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
 	}
 	const TArray<TSharedPtr<FJsonValue>>* SpawnsArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("spawns"), SpawnsArr) || !SpawnsArr || SpawnsArr->Num() == 0)
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams,
 			TEXT("missing or empty required array field 'spawns'"));
 	}
 	if (SpawnsArr->Num() > kLCOMaxBatchItems)
 	{
-		return LCO_MakeError(Request, kMCPErrorInputTooLarge,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInputTooLarge,
 			FString::Printf(
 				TEXT("spawns.length=%d exceeds MAX_BATCH_ITEMS=%d — split into smaller batches"),
 				SpawnsArr->Num(), kLCOMaxBatchItems));
@@ -771,13 +748,13 @@ FMCPResponse Tool_BatchSpawnInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return LCO_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return LCO_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor._batch_destroy_internal (Lane B → SubmitJob → game-thread body) ───────────────────
@@ -798,17 +775,17 @@ FMCPResponse Tool_BatchDestroyInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
 	}
 	const TArray<TSharedPtr<FJsonValue>>* PathsArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("actor_paths"), PathsArr) || !PathsArr || PathsArr->Num() == 0)
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams,
 			TEXT("missing or empty required array field 'actor_paths'"));
 	}
 	if (PathsArr->Num() > kLCOMaxBatchItems)
 	{
-		return LCO_MakeError(Request, kMCPErrorInputTooLarge,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInputTooLarge,
 			FString::Printf(
 				TEXT("actor_paths.length=%d exceeds MAX_BATCH_ITEMS=%d — split into smaller batches"),
 				PathsArr->Num(), kLCOMaxBatchItems));
@@ -822,7 +799,7 @@ FMCPResponse Tool_BatchDestroyInternal(const FMCPRequest& Request)
 		FString S;
 		if (!V.IsValid() || !V->TryGetString(S))
 		{
-			return LCO_MakeError(Request, kLCOErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams,
 				TEXT("actor_paths: expected array of strings"));
 		}
 		Paths.Add(S);
@@ -922,13 +899,13 @@ FMCPResponse Tool_BatchDestroyInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return LCO_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return LCO_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor._batch_set_property_internal (Lane B → SubmitJob → game-thread body) ──────────────
@@ -952,17 +929,17 @@ FMCPResponse Tool_BatchSetPropertyInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams, TEXT("missing args object"));
 	}
 	const TArray<TSharedPtr<FJsonValue>>* MutArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("mutations"), MutArr) || !MutArr || MutArr->Num() == 0)
 	{
-		return LCO_MakeError(Request, kLCOErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLCOErrorInvalidParams,
 			TEXT("missing or empty required array field 'mutations'"));
 	}
 	if (MutArr->Num() > kLCOMaxBatchItems)
 	{
-		return LCO_MakeError(Request, kMCPErrorInputTooLarge,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInputTooLarge,
 			FString::Printf(
 				TEXT("mutations.length=%d exceeds MAX_BATCH_ITEMS=%d — split into smaller batches"),
 				MutArr->Num(), kLCOMaxBatchItems));
@@ -1131,13 +1108,13 @@ FMCPResponse Tool_BatchSetPropertyInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return LCO_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return LCO_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

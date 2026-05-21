@@ -3,6 +3,8 @@
 #include "AssetRegistryTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPARFilterParser.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -42,54 +44,19 @@
 
 namespace
 {
-	// AR_ prefix per the unity-build symbol-collision pattern documented in FMCPMarshalling.cpp /
-	// FMCPDay7Handlers.cpp — `MakeError` / `MakeSuccess` collide with UE global templates.
-	constexpr int32 kARErrorInvalidParams = -32602;
-
-	void AR_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AR_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AR_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AR_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AR_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	// AR_ prefix per the unity-build symbol-collision pattern. XX_StampIds / XX_MakeError /
+	// XX_MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx from MCPToolHelpers.h.
+	// kMCPErrorInvalidParams replaced by canonical kMCPErrorInvalidParams.
 
 	/** Resolve ``args.path`` → normalised string; emit INVALID_PATH (-32010) on failure. */
 	bool AR_RequirePath(const FMCPRequest& Request, FString& OutNormalized, FMCPResponse& OutError)
 	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
 		FString Raw;
-		if (!Request.Args->TryGetStringField(TEXT("path"), Raw) || Raw.IsEmpty())
-		{
-			OutError = AR_MakeError(Request, kARErrorInvalidParams,
-				TEXT("missing required string field 'path'"));
-			return false;
-		}
+		if (!FMCPToolHelpers::RequireStringField(Request, TEXT("path"), Raw, OutError)) { return false; }
 		const FString Normalized = FMCPAssetPathUtils::Normalize(Raw);
 		if (Normalized.IsEmpty())
 		{
-			OutError = AR_MakeError(Request, kMCPErrorInvalidPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(TEXT("invalid path '%s' — must be /Game/.../Engine/.../Plugin form, "
 					"no backslashes, no '..'"), *Raw));
 			return false;
@@ -257,7 +224,7 @@ namespace
 			Out->SetBoolField(TEXT("is_cold_cache"),
 				FAssetRegistryModule::GetRegistry().IsLoadingAssets());
 		}
-		return AR_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	/**
@@ -275,13 +242,13 @@ namespace
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageTokenWire, OutCursor, DecodeErr))
 		{
-			OutError = AR_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = AR_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated filter between pages; "
 					 "restart pagination with page_token=null"));
 			return false;
@@ -494,7 +461,7 @@ FMCPResponse Tool_AssetExists(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("exists"), Data.IsValid());
 	Out->SetStringField(TEXT("asset_path_canonical"), NormalizedPath);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.metadata ──────────────────────────────────────────────────────────────────────────
@@ -507,7 +474,7 @@ FMCPResponse Tool_AssetMetadata(const FMCPRequest& Request)
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -528,7 +495,7 @@ FMCPResponse Tool_AssetMetadata(const FMCPRequest& Request)
 	}
 
 	AR_AppendTags(Data, Out);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.get_outermost_package ─────────────────────────────────────────────────────────────
@@ -541,7 +508,7 @@ FMCPResponse Tool_AssetGetOutermostPackage(const FMCPRequest& Request)
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -556,7 +523,7 @@ FMCPResponse Tool_AssetGetOutermostPackage(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("package_path"), PackageNameStr);
 	Out->SetBoolField(TEXT("on_disk"), bOnDisk);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.is_dirty (Lane A — touches loaded-package map) ────────────────────────────────────
@@ -570,7 +537,7 @@ FMCPResponse Tool_AssetIsDirty(const FMCPRequest& Request)
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -588,7 +555,7 @@ FMCPResponse Tool_AssetIsDirty(const FMCPRequest& Request)
 		Out->SetBoolField(TEXT("dirty"), false);
 		Out->SetBoolField(TEXT("in_memory"), false);
 	}
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.list (paginated, FARFilter) ───────────────────────────────────────────────────────
@@ -596,7 +563,7 @@ FMCPResponse Tool_AssetList(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// Parse FARFilter from args.filter (object). Missing/empty → default FARFilter (matches all).
@@ -608,7 +575,7 @@ FMCPResponse Tool_AssetList(const FMCPRequest& Request)
 	FString ParseErr;
 	if (!FMCPARFilterParser::Parse(FilterObj, Filter, ParseErr))
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("filter parse error: %s"), *ParseErr));
 	}
 
@@ -617,7 +584,7 @@ FMCPResponse Tool_AssetList(const FMCPRequest& Request)
 	Request.Args->TryGetBoolField(TEXT("_unsafe_full_scan"), bUnsafeFullScan);
 	if (!bUnsafeFullScan && AR_IsOverlyBroad(Filter))
 	{
-		return AR_MakeError(Request, kMCPErrorOverlyBroadQuery,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOverlyBroadQuery,
 			TEXT("filter targets entire /Game recursively with no class narrowing. "
 				 "Add class_paths or set _unsafe_full_scan=true"));
 	}
@@ -660,7 +627,7 @@ namespace
 		FAssetData RootData;
 		if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, RootData))
 		{
-			return AR_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 		}
 
@@ -683,7 +650,7 @@ namespace
 		if (!AR_WalkDependencyGraph(IAR, RootData.PackageName, bReferencers, Category, Query,
 			bRecursive, /*MaxVisited*/ 10000, All, WalkErr))
 		{
-			return AR_MakeError(Request, kMCPErrorOverlyBroadQuery, WalkErr);
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorOverlyBroadQuery, WalkErr);
 		}
 
 		AR_SortDependenciesByPackageName(All);
@@ -741,7 +708,7 @@ namespace
 			NewCursor.TotalKnownSnapshot = All.Num();
 			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
 		}
-		return AR_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 }
 
@@ -759,13 +726,13 @@ FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 
@@ -783,7 +750,7 @@ FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 	FTopLevelAssetPath Top;
 	if (!Top.TrySetPath(ClassPathNormalized))
 	{
-		return AR_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(TEXT("class_path '%s' does not resolve to FTopLevelAssetPath"), *ClassPath));
 	}
 
@@ -799,13 +766,13 @@ FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 			FString S;
 			if (!V.IsValid() || !V->TryGetString(S))
 			{
-				return AR_MakeError(Request, kARErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					TEXT("package_paths: expected array of strings"));
 			}
 			const FString Norm = FMCPAssetPathUtils::Normalize(S);
 			if (Norm.IsEmpty())
 			{
-				return AR_MakeError(Request, kMCPErrorInvalidPath,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 			}
 			Filter.PackagePaths.Add(FName(*Norm));
@@ -832,7 +799,7 @@ FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 	Request.Args->TryGetBoolField(TEXT("_unsafe_full_scan"), bUnsafeFullScan);
 	if (!bUnsafeFullScan && AR_IsOverlyBroad(Filter))
 	{
-		return AR_MakeError(Request, kMCPErrorOverlyBroadQuery,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOverlyBroadQuery,
 			TEXT("search_by_class scope too broad — narrow package_paths"));
 	}
 
@@ -865,13 +832,13 @@ FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString TagName;
 	if (!Request.Args->TryGetStringField(TEXT("tag_name"), TagName) || TagName.IsEmpty())
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'tag_name'"));
 	}
 
@@ -889,13 +856,13 @@ FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 			FString S;
 			if (!V.IsValid() || !V->TryGetString(S))
 			{
-				return AR_MakeError(Request, kARErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					TEXT("package_paths: expected array of strings"));
 			}
 			const FString Norm = FMCPAssetPathUtils::Normalize(S);
 			if (Norm.IsEmpty())
 			{
-				return AR_MakeError(Request, kMCPErrorInvalidPath,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 			}
 			ScopePaths.Add(Norm);
@@ -989,7 +956,7 @@ FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 		NewCursor.TotalKnownSnapshot = Filtered.Num();
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
 	}
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.search_by_name ────────────────────────────────────────────────────────────────────
@@ -997,13 +964,13 @@ FMCPResponse Tool_AssetSearchByName(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString Pattern;
 	if (!Request.Args->TryGetStringField(TEXT("name_pattern"), Pattern) || Pattern.IsEmpty())
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'name_pattern'"));
 	}
 	bool bCaseSensitive = false;
@@ -1021,13 +988,13 @@ FMCPResponse Tool_AssetSearchByName(const FMCPRequest& Request)
 			FString S;
 			if (!V.IsValid() || !V->TryGetString(S))
 			{
-				return AR_MakeError(Request, kARErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					TEXT("package_paths: expected array of strings"));
 			}
 			const FString Norm = FMCPAssetPathUtils::Normalize(S);
 			if (Norm.IsEmpty())
 			{
-				return AR_MakeError(Request, kMCPErrorInvalidPath,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("package_paths entry '%s' is malformed"), *S));
 			}
 			Filter.PackagePaths.Add(FName(*Norm));
@@ -1176,7 +1143,7 @@ FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -1185,7 +1152,7 @@ FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 	if (Size < 16 || Size > 256)
 	{
 		// Cap is 256 per D6 — larger requests get the disk-tier tool.
-		return AR_MakeError(Request, kARErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("size %d outside [16, 256] — use asset.get_thumbnail_to_disk "
 				"for larger sizes (max 2048)"), Size));
 	}
@@ -1197,14 +1164,14 @@ FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 	if (!AR_RenderAssetThumbnail(NormalizedPath, Size, RGBA8, Width, Height, bIsClassGeneric, RenderErr))
 	{
 		// Hard failure per the spec — no asset-specific bitmap AND no class-generic fallback.
-		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("thumbnail render failed: %s"), *RenderErr));
 	}
 
 	TArray64<uint8> PNGBytes;
 	if (!AR_EncodePNG(RGBA8, Width, Height, PNGBytes))
 	{
-		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			TEXT("PNG encode failed (unexpected RGBA8 size mismatch)"));
 	}
 
@@ -1216,7 +1183,7 @@ FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("width"),  Width);
 	Out->SetNumberField(TEXT("height"), Height);
 	Out->SetBoolField(TEXT("is_class_generic"), bIsClassGeneric);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.get_thumbnail_to_disk (file output, sandboxed, max 2048) ─────────────────────────
@@ -1229,7 +1196,7 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -1237,7 +1204,7 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("size"), Size);
 	if (Size < 16 || Size > 2048)
 	{
-		return AR_MakeError(Request, kARErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("size %d outside [16, 2048]"), Size));
 	}
 
@@ -1267,7 +1234,7 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(OutputPathRaw, AbsPath, SandboxErr))
 	{
-		return AR_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 
 	TArray<uint8> RGBA8;
@@ -1276,7 +1243,7 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	FString RenderErr;
 	if (!AR_RenderAssetThumbnail(NormalizedPath, Size, RGBA8, Width, Height, bIsClassGeneric, RenderErr))
 	{
-		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("thumbnail render failed: %s"), *RenderErr));
 	}
 
@@ -1289,14 +1256,14 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 			reinterpret_cast<const FColor*>(RGBA8.GetData()), Width, Height, EGammaSpace::sRGB);
 		if (!FImageUtils::CompressImage(EncodedBytes, TEXT("jpg"), Src, /*Quality*/ 85))
 		{
-			return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed, TEXT("JPG encode failed"));
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed, TEXT("JPG encode failed"));
 		}
 	}
 	else
 	{
 		if (!AR_EncodePNG(RGBA8, Width, Height, EncodedBytes))
 		{
-			return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 				TEXT("PNG encode failed (unexpected RGBA8 size mismatch)"));
 		}
 	}
@@ -1309,14 +1276,14 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	// 2048x2048 is ~10 MiB — comfortably under 2 GiB).
 	if (EncodedBytes.Num() > INT32_MAX)
 	{
-		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			TEXT("encoded thumbnail exceeds 2 GiB — refusing to write"));
 	}
 	TArray<uint8> WriteBuf;
 	WriteBuf.Append(EncodedBytes.GetData(), static_cast<int32>(EncodedBytes.Num()));
 	if (!FFileHelper::SaveArrayToFile(WriteBuf, *AbsPath))
 	{
-		return AR_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("could not write thumbnail to '%s'"), *AbsPath));
 	}
 
@@ -1325,7 +1292,7 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("bytes"), static_cast<double>(WriteBuf.Num()));
 	Out->SetNumberField(TEXT("width"),  Width);
 	Out->SetNumberField(TEXT("height"), Height);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 // ─── asset.get_class_hierarchy ───────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
@@ -1337,7 +1304,7 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return AR_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -1363,7 +1330,7 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 		// AR entry exists but its class path is unknown — cannot build a hierarchy at all.
 		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 		Out->SetArrayField(TEXT("chain"), Chain);
-		return AR_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// Leaf entry (the asset's own class) is always included — even if GetAncestorClassNames
@@ -1380,7 +1347,7 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("chain"), Chain);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.create_data_asset — create a new UDataAsset of given class at given path ─────────
@@ -1414,12 +1381,12 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 
 	if (GEditor && GEditor->PlayWorld != nullptr)
 	{
-		return AR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	if (!Request.Args.IsValid())
 	{
-		return AR_MakeError(Request, -32602,
+		return FMCPToolHelpers::MakeError(Request,-32602,
 			TEXT("asset.create_data_asset requires args.class_path + args.dest_path"));
 	}
 
@@ -1427,11 +1394,11 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return AR_MakeError(Request, -32602, TEXT("missing required string field 'class_path'"));
+		return FMCPToolHelpers::MakeError(Request,-32602, TEXT("missing required string field 'class_path'"));
 	}
 	if (!ClassPath.StartsWith(TEXT("/")) || ClassPath.Contains(TEXT("\\")))
 	{
-		return AR_MakeError(Request, kMCPErrorInvalidClassPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 			FString::Printf(TEXT("class_path '%s' must start with '/' and use forward slashes only "
 				"(form: /Script/<Module>.<Class>  OR  /Game/.../BP.BP_C)"), *ClassPath));
 	}
@@ -1445,18 +1412,18 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 	}
 	if (!TargetClass)
 	{
-		return AR_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath));
 	}
 	if (TargetClass->HasAnyClassFlags(CLASS_Abstract))
 	{
-		return AR_MakeError(Request, kMCPErrorClassAbstract,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassAbstract,
 			FString::Printf(TEXT("class '%s' is abstract — cannot instantiate"),
 				*TargetClass->GetPathName()));
 	}
 	if (!TargetClass->IsChildOf(UDataAsset::StaticClass()))
 	{
-		return AR_MakeError(Request, kMCPErrorWrongClassFamily,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 			FString::Printf(TEXT("class '%s' is not a UDataAsset subclass (parent chain: %s ...)"),
 				*TargetClass->GetPathName(),
 				TargetClass->GetSuperClass() ? *TargetClass->GetSuperClass()->GetPathName() : TEXT("?")));
@@ -1466,18 +1433,18 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 	FString DestPathRaw;
 	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
 	{
-		return AR_MakeError(Request, -32602, TEXT("missing required string field 'dest_path'"));
+		return FMCPToolHelpers::MakeError(Request,-32602, TEXT("missing required string field 'dest_path'"));
 	}
 	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
 	if (DestPathNorm.IsEmpty())
 	{
-		return AR_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path "
 				"(expected /Game/... or /<Plugin>/...)"), *DestPathRaw));
 	}
 	if (FPackageName::DoesPackageExist(DestPathNorm))
 	{
-		return AR_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists on disk — use cb.delete first or pick a different name"),
 				*DestPathNorm));
 	}
@@ -1493,7 +1460,7 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, TargetClass, Factory);
 	if (!NewAsset)
 	{
-		return AR_MakeError(Request, -32603,
+		return FMCPToolHelpers::MakeError(Request,-32603,
 			FString::Printf(TEXT("IAssetTools::CreateAsset returned null for class=%s name=%s path=%s "
 				"(factory may have rejected; check editor log)"),
 				*TargetClass->GetPathName(), *AssetName, *PackagePath));
@@ -1518,7 +1485,7 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
 	Out->SetStringField(TEXT("class_path"), TargetClass->GetPathName());
 	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.create — generic creator for ANY UObject subclass (no source file) ───────────────
@@ -1553,12 +1520,12 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 
 	if (GEditor && GEditor->PlayWorld != nullptr)
 	{
-		return AR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	if (!Request.Args.IsValid())
 	{
-		return AR_MakeError(Request, -32602,
+		return FMCPToolHelpers::MakeError(Request,-32602,
 			TEXT("asset.create requires args.class_path + args.dest_path"));
 	}
 
@@ -1566,15 +1533,15 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 	FString DestPathRaw;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return AR_MakeError(Request, -32602, TEXT("missing required string field 'class_path'"));
+		return FMCPToolHelpers::MakeError(Request,-32602, TEXT("missing required string field 'class_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
 	{
-		return AR_MakeError(Request, -32602, TEXT("missing required string field 'dest_path'"));
+		return FMCPToolHelpers::MakeError(Request,-32602, TEXT("missing required string field 'dest_path'"));
 	}
 	if (!ClassPath.StartsWith(TEXT("/")) || ClassPath.Contains(TEXT("\\")))
 	{
-		return AR_MakeError(Request, kMCPErrorInvalidClassPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 			FString::Printf(TEXT("class_path '%s' must start with '/' (form: /Script/<Module>.<Class>  OR  /Game/.../BP.BP_C)"),
 				*ClassPath));
 	}
@@ -1588,12 +1555,12 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 	}
 	if (!TargetClass)
 	{
-		return AR_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath));
 	}
 	if (TargetClass->HasAnyClassFlags(CLASS_Abstract))
 	{
-		return AR_MakeError(Request, kMCPErrorClassAbstract,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassAbstract,
 			FString::Printf(TEXT("class '%s' is abstract — cannot instantiate"), *TargetClass->GetPathName()));
 	}
 
@@ -1601,12 +1568,12 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
 	if (DestPathNorm.IsEmpty())
 	{
-		return AR_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path"), *DestPathRaw));
 	}
 	if (FPackageName::DoesPackageExist(DestPathNorm))
 	{
-		return AR_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
 	}
 
@@ -1666,7 +1633,7 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 
 	if (!NewAsset)
 	{
-		return AR_MakeError(Request, -32603,
+		return FMCPToolHelpers::MakeError(Request,-32603,
 			FString::Printf(TEXT("could not create asset of class '%s' at '%s' "
 				"(no UFactoryNew matched%s)"),
 				*TargetClass->GetPathName(), *DestPathNorm,
@@ -1692,7 +1659,7 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("class_path"), TargetClass->GetPathName());
 	Out->SetStringField(TEXT("used_factory"), UsedFactory);
 	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return AR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── asset.list_data_asset_classes — discover UDataAsset subclasses available for create ────
@@ -1746,12 +1713,12 @@ FMCPResponse Tool_AssetListDataAssetClasses(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageTokenWire, Cursor, DecodeErr))
 		{
-			return AR_MakeError(Request, -32602,
+			return FMCPToolHelpers::MakeError(Request,-32602,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 		}
 		if (Cursor.FilterHash != FilterHash)
 		{
-			return AR_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token's filter_hash doesn't match current call's filter — "
 					 "caller changed prefix_filter or include_abstract mid-pagination"));
 		}
@@ -1851,7 +1818,7 @@ FMCPResponse Tool_AssetListDataAssetClasses(const FMCPRequest& Request)
 	{
 		ResultObj->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return AR_MakeSuccessObj(Request, ResultObj);
+	return FMCPToolHelpers::MakeSuccessObj(Request, ResultObj);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

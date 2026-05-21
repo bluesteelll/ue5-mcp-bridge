@@ -3,6 +3,8 @@
 #include "DataValidationTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 
@@ -27,55 +29,15 @@
 
 namespace
 {
-	// DV_ prefix per the unity-build symbol-collision convention.
+	// DV_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d).
 	constexpr int32 kDVErrorInvalidParams = -32602;
 	constexpr int32 kDVErrorInternal      = -32603;
 
 	// validate_path hard cap — keeps a single tool call bounded against accidental
 	// /Game-recursive sweeps (which can easily produce 100k+ assets on a real project).
 	constexpr int32 kDVMaxAssetsHardCap   = 10000;
-
-	void DV_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse DV_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		DV_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse DV_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		DV_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool DV_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = DV_MakeError(Request, kDVErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = DV_MakeError(Request, kDVErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
 
 	/**
 	 * Resolve the bridge's UEditorValidatorSubsystem instance. The subsystem is loaded by the
@@ -210,34 +172,18 @@ FMCPResponse Tool_ValidateAsset(const FMCPRequest& Request)
 
 	FString AssetPath;
 	FMCPResponse Err;
-	if (!DV_RequireStringField(Request, TEXT("asset_path"), AssetPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("asset_path"), AssetPath, Err)) { return Err; }
 
 	FString SubsysErr;
 	UEditorValidatorSubsystem* VS = DV_GetValidatorSubsystem(SubsysErr);
-	if (!VS) { return DV_MakeError(Request, kDVErrorInternal, SubsysErr); }
+	if (!VS) { return FMCPToolHelpers::MakeError(Request, kDVErrorInternal, SubsysErr); }
 
-	// Normalise + validate the path before LoadObject (the same shape every other tool uses).
-	const FString Normalised = FMCPAssetPathUtils::Normalize(AssetPath);
-	if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-	{
-		return DV_MakeError(Request, kMCPErrorInvalidPath,
-			FString::Printf(TEXT("path '%s' malformed or unknown mount"), *AssetPath));
-	}
-
-	UObject* Asset = LoadObject<UObject>(nullptr, *Normalised);
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UObject* Asset = FMCPAssetLoader::LoadRaw(AssetPath, LoadErrCode, LoadErrMsg);
 	if (!Asset)
 	{
-		// Try the explicit object-path form as a fallback (matches CurveTools / DataTableTools).
-		const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-		if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-		{
-			Asset = LoadObject<UObject>(nullptr, *ObjPath);
-		}
-	}
-	if (!Asset)
-	{
-		return DV_MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("'%s' not loadable"), *AssetPath));
+		return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> Errors;
@@ -251,7 +197,7 @@ FMCPResponse Tool_ValidateAsset(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("errors"), Errors);
 	Out->SetArrayField(TEXT("warnings"), Warnings);
 	Out->SetNumberField(TEXT("validators_run"), ValidatorsRun);
-	return DV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── data_validation.validate_path ────────────────────────────────────────────────────────────
@@ -276,7 +222,7 @@ FMCPResponse Tool_ValidatePath(const FMCPRequest& Request)
 
 	FString PathPrefix;
 	FMCPResponse Err;
-	if (!DV_RequireStringField(Request, TEXT("path_prefix"), PathPrefix, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("path_prefix"), PathPrefix, Err)) { return Err; }
 
 	bool bRecursive = true;
 	if (Request.Args.IsValid()) { Request.Args->TryGetBoolField(TEXT("recursive"), bRecursive); }
@@ -285,21 +231,21 @@ FMCPResponse Tool_ValidatePath(const FMCPRequest& Request)
 	if (Request.Args.IsValid()) { Request.Args->TryGetNumberField(TEXT("max_assets"), MaxAssets); }
 	if (MaxAssets < 1 || MaxAssets > kDVMaxAssetsHardCap)
 	{
-		return DV_MakeError(Request, kDVErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kDVErrorInvalidParams,
 			FString::Printf(TEXT("max_assets=%d out of range [1, %d]"),
 				MaxAssets, kDVMaxAssetsHardCap));
 	}
 
 	FString SubsysErr;
 	UEditorValidatorSubsystem* VS = DV_GetValidatorSubsystem(SubsysErr);
-	if (!VS) { return DV_MakeError(Request, kDVErrorInternal, SubsysErr); }
+	if (!VS) { return FMCPToolHelpers::MakeError(Request, kDVErrorInternal, SubsysErr); }
 
 	// Normalise + validate path_prefix as a content mount (so /Game/Foo is fine, /InvalidMount
 	// is rejected up-front instead of silently producing zero results).
 	const FString Normalised = FMCPAssetPathUtils::Normalize(PathPrefix);
 	if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
 	{
-		return DV_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("path_prefix '%s' malformed or unknown mount"), *PathPrefix));
 	}
 
@@ -313,7 +259,7 @@ FMCPResponse Tool_ValidatePath(const FMCPRequest& Request)
 
 	if (Assets.Num() == 0)
 	{
-		return DV_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no assets under '%s' (recursive=%s)"),
 				*PathPrefix, bRecursive ? TEXT("true") : TEXT("false")));
 	}
@@ -395,7 +341,7 @@ FMCPResponse Tool_ValidatePath(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("not_validated_count"), NotValidatedCount);
 	Out->SetNumberField(TEXT("validators_run"), ValidatorsRun);
 	Out->SetArrayField(TEXT("failures"), Failures);
-	return DV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── data_validation.list_validators ──────────────────────────────────────────────────────────
@@ -420,7 +366,7 @@ FMCPResponse Tool_ListValidators(const FMCPRequest& Request)
 	// in a state where listing validators makes sense.
 	FString SubsysErr;
 	UEditorValidatorSubsystem* VS = DV_GetValidatorSubsystem(SubsysErr);
-	if (!VS) { return DV_MakeError(Request, kDVErrorInternal, SubsysErr); }
+	if (!VS) { return FMCPToolHelpers::MakeError(Request, kDVErrorInternal, SubsysErr); }
 
 	TArray<TSharedPtr<FJsonValue>> ValidatorArr;
 
@@ -473,7 +419,7 @@ FMCPResponse Tool_ListValidators(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("validators"), ValidatorArr);
 	Out->SetNumberField(TEXT("total"), ValidatorArr.Num());
-	return DV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

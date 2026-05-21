@@ -3,6 +3,7 @@
 #include "ConfigTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
 
@@ -18,10 +19,13 @@
 
 namespace
 {
-	// CFG_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kCFGErrorInvalidParams = -32602;
-	constexpr int32 kCFGErrorInternal      = -32603;
+	// CFG_ prefix per the unity-build symbol-collision pattern. StampIds / MakeError / MakeSuccessObj
+	// migrated to FMCPToolHelpers in Phase 3 (Group G3); only the surface-local error-code aliases
+	// and pagination/truncation caps live here. cvar/ini mutations are engine-wide and intentionally
+	// NOT FMCPMutatorScope-guarded — cfg.set_cvar mirrors the console UX (works in PIE), cfg.write
+	// targets DefaultEngine.ini etc. which are session-spanning files orthogonal to PIE state.
+	constexpr int32 kCFGErrorInvalidParams = kMCPErrorInvalidParams; // -32602
+	constexpr int32 kCFGErrorInternal      = kMCPErrorInternal;      // -32603
 
 	// Default page size for ``cfg.list_cvars`` + ``cfg.list_sections``. Mirrors Phase 4/5/6
 	// pagination defaults.
@@ -34,31 +38,6 @@ namespace
 	// Hard-cap for ``value_summary`` in ``cfg.list_cvars`` per-entry — string-typed cvars may
 	// hold paths or comma-separated lists that grow unboundedly; truncate with " ..." suffix.
 	constexpr int32 kCFGValueSummaryMaxChars = 240;
-
-	void CFG_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse CFG_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		CFG_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse CFG_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		CFG_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	int32 CFG_ClampPageSize(const TSharedPtr<FJsonObject>& Args, const TCHAR* FieldName, int32 Default)
 	{
@@ -80,13 +59,13 @@ namespace
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(TokenWire, OutCursor, DecodeErr))
 		{
-			OutError = CFG_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = CFG_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated 'prefix_filter' or 'ini_file' "
 					 "between pages; restart pagination with page_token=null"));
 			return false;
@@ -335,12 +314,12 @@ FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString Name;
 	if (!Request.Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'name'"));
 	}
 
@@ -348,7 +327,7 @@ FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 	IConsoleObject* Obj = Mgr.FindConsoleObject(*Name);
 	if (!Obj)
 	{
-		return CFG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("console object '%s' not found (case-insensitive lookup; "
 				"see cfg.list_cvars for available names)"), *Name));
 	}
@@ -357,7 +336,7 @@ FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 	if (!Var)
 	{
 		// IConsoleCommand or some other non-variable IConsoleObject.
-		return CFG_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(TEXT("console object '%s' is a COMMAND, not a variable — use "
 				"pie.console_exec to execute commands; cfg.get_cvar/set_cvar are variable-only "
 				"per Phase 6 D5"), *Name));
@@ -376,7 +355,7 @@ FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("is_read_only"),     Var->TestFlags(ECVF_ReadOnly));
 	Out->SetBoolField(TEXT("is_cheat"),         Var->TestFlags(ECVF_Cheat));
 	Out->SetBoolField(TEXT("is_unregistered"),  Var->TestFlags(ECVF_Unregistered));
-	return CFG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cfg.set_cvar ─────────────────────────────────────────────────────────────────────────────
@@ -416,18 +395,18 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString Name;
 	if (!Request.Args->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'name'"));
 	}
 	TSharedPtr<FJsonValue> InValue = Request.Args->TryGetField(TEXT("value"));
 	if (!InValue.IsValid() || InValue->IsNull())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required field 'value' (must be bool, number, or string)"));
 	}
 
@@ -435,21 +414,21 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 	IConsoleObject* Obj = Mgr.FindConsoleObject(*Name);
 	if (!Obj)
 	{
-		return CFG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("console object '%s' not found (see cfg.list_cvars)"), *Name));
 	}
 
 	IConsoleVariable* Var = Obj->AsVariable();
 	if (!Var)
 	{
-		return CFG_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(TEXT("console object '%s' is a COMMAND, not a variable — use "
 				"pie.console_exec to execute commands (D5)"), *Name));
 	}
 
 	if (Var->TestFlags(ECVF_ReadOnly))
 	{
-		return CFG_MakeError(Request, kMCPErrorCVarReadOnly,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorCVarReadOnly,
 			FString::Printf(TEXT("cvar '%s' is read-only (ECVF_ReadOnly) — write the value into "
 				"<ProjectDir>/Config/DefaultEngine.ini's [ConsoleVariables] section via cfg.write "
 				"and restart the editor"), *Name));
@@ -467,7 +446,7 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 
 	auto CoerceFailureMismatch = [&](const FString& Detail)
 	{
-		return CFG_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("cvar '%s' is type '%s'; %s"), *Name, *TypeStr, *Detail));
 	};
 
@@ -586,7 +565,7 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 	else
 	{
 		// Shouldn't reach here — exhausted via IsVariable*() above. Defensive fallback.
-		return CFG_MakeError(Request, kCFGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInternal,
 			FString::Printf(TEXT("cvar '%s' has unrecognised type — neither bool/int/float/string"),
 				*Name));
 	}
@@ -604,7 +583,7 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 	Out->SetField(TEXT("new_value"),                CFG_GetCVarValueJson(*Var));
 	Out->SetStringField(TEXT("new_value_string"),   Var->GetString());
 	Out->SetStringField(TEXT("set_by"),             GetConsoleVariableSetByName(Var->GetFlags()));
-	return CFG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cfg.list_cvars ───────────────────────────────────────────────────────────────────────────
@@ -779,7 +758,7 @@ FMCPResponse Tool_ListCVars(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return CFG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cfg.read ─────────────────────────────────────────────────────────────────────────────────
@@ -807,30 +786,30 @@ FMCPResponse Tool_Read(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString IniBaseName, Section, Key;
 	if (!Request.Args->TryGetStringField(TEXT("ini_file"), IniBaseName) || IniBaseName.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'ini_file'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("section"), Section) || Section.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'section' (literal header without brackets, "
 				 "e.g. '/Script/Engine.Engine')"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("key"), Key) || Key.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'key'"));
 	}
 
 	FString IniPath, ResolveErr;
 	if (!CFG_ResolveIniPath(IniBaseName, IniPath, ResolveErr))
 	{
-		return CFG_MakeError(Request, kMCPErrorPathEscape, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, ResolveErr);
 	}
 
 	check(GConfig);
@@ -839,7 +818,7 @@ FMCPResponse Tool_Read(const FMCPRequest& Request)
 
 	if (!bFound)
 	{
-		return CFG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("key '%s' not found in section [%s] of '%s.ini' (or section absent)"),
 				*Key, *Section, *IniBaseName));
 	}
@@ -853,7 +832,7 @@ FMCPResponse Tool_Read(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("ini_file_echo"), IniBaseName);
 	Out->SetStringField(TEXT("section_echo"),  Section);
 	Out->SetStringField(TEXT("key_echo"),      Key);
-	return CFG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cfg.write ────────────────────────────────────────────────────────────────────────────────
@@ -885,35 +864,35 @@ FMCPResponse Tool_Write(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString IniBaseName, Section, Key;
 	if (!Request.Args->TryGetStringField(TEXT("ini_file"), IniBaseName) || IniBaseName.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'ini_file'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("section"), Section) || Section.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'section'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("key"), Key) || Key.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'key'"));
 	}
 	TSharedPtr<FJsonValue> InValue = Request.Args->TryGetField(TEXT("value"));
 	if (!InValue.IsValid() || InValue->IsNull())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required field 'value' (must be bool, number, or string)"));
 	}
 
 	FString IniPath, ResolveErr;
 	if (!CFG_ResolveIniPath(IniBaseName, IniPath, ResolveErr))
 	{
-		return CFG_MakeError(Request, kMCPErrorPathEscape, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, ResolveErr);
 	}
 
 	// Stringify the value. Same coercion table as cfg.set_cvar's string-cvar path (mirrors).
@@ -930,7 +909,7 @@ FMCPResponse Tool_Write(const FMCPRequest& Request)
 			WriteValue = InValue->AsString();
 			break;
 		default:
-			return CFG_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 				TEXT("'value' must be JSON bool / number / string (got object/array/null)"));
 	}
 
@@ -951,7 +930,7 @@ FMCPResponse Tool_Write(const FMCPRequest& Request)
 	const bool bPostFound = GConfig->GetString(*Section, *Key, PostValue, IniPath);
 	if (!bPostFound)
 	{
-		return CFG_MakeError(Request, kCFGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInternal,
 			FString::Printf(TEXT("post-write read failed: SetString succeeded but GetString could "
 				"not retrieve '%s' from [%s] of '%s.ini' — cache corruption?"),
 				*Key, *Section, *IniBaseName));
@@ -971,7 +950,7 @@ FMCPResponse Tool_Write(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("section_echo"),    Section);
 	Out->SetStringField(TEXT("key_echo"),        Key);
 	Out->SetBoolField(TEXT("flushed"),           bFileOnDisk);
-	return CFG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cfg.list_sections ────────────────────────────────────────────────────────────────────────
@@ -994,19 +973,19 @@ FMCPResponse Tool_ListSections(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString IniBaseName;
 	if (!Request.Args->TryGetStringField(TEXT("ini_file"), IniBaseName) || IniBaseName.IsEmpty())
 	{
-		return CFG_MakeError(Request, kCFGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCFGErrorInvalidParams,
 			TEXT("missing required string field 'ini_file'"));
 	}
 
 	FString IniPath, ResolveErr;
 	if (!CFG_ResolveIniPath(IniBaseName, IniPath, ResolveErr))
 	{
-		return CFG_MakeError(Request, kMCPErrorPathEscape, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, ResolveErr);
 	}
 
 	const uint64 FilterHash = CFG_HashIniFile(IniBaseName);
@@ -1027,7 +1006,7 @@ FMCPResponse Tool_ListSections(const FMCPRequest& Request)
 	TArray<FString> SectionNames;
 	if (!GConfig->GetSectionNames(IniPath, SectionNames))
 	{
-		return CFG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("GConfig has no record of '%s.ini' (path: %s) — file may not "
 				"exist on disk or was never loaded into the config cache"),
 				*IniBaseName, *IniPath));
@@ -1079,7 +1058,7 @@ FMCPResponse Tool_ListSections(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return CFG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

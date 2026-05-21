@@ -3,6 +3,7 @@
 #include "EditorTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPPathSandbox.h"
@@ -38,9 +39,14 @@
 
 namespace
 {
-	// EDT_ prefix per the unity-build symbol-collision pattern.
-	constexpr int32 kEDTErrorInvalidParams = -32602;
-	constexpr int32 kEDTErrorInternal      = -32603;
+	// EDT_ prefix per the unity-build symbol-collision pattern. StampIds / MakeError / MakeSuccessObj
+	// migrated to FMCPToolHelpers in Phase 3 (Group G3); only the surface-local error-code aliases,
+	// screenshot dimension caps, and the EDT_MakePIENotActiveError shim (still used by pie.* path)
+	// live here. editor.* tools are read-mostly + transient editor-state mutators (camera, selection,
+	// notifications) — no FScopedTransaction / package-dirty footprint, so FMCPMutatorScope migration
+	// is intentionally skipped.
+	constexpr int32 kEDTErrorInvalidParams = kMCPErrorInvalidParams; // -32602
+	constexpr int32 kEDTErrorInternal      = kMCPErrorInternal;      // -32603
 
 	/** Match Phase 2 asset.batch_metadata's batch cap — large selections also stress Details panel. */
 	constexpr int32 kEDTMaxSelectionSize = 200;
@@ -56,34 +62,9 @@ namespace
 	constexpr int32 kEDTDiskScreenshotMin      = 32;
 	constexpr int32 kEDTDiskScreenshotMax      = 8192;
 
-	void EDT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse EDT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		EDT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse EDT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		EDT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
 	FMCPResponse EDT_MakePIENotActiveError(const FMCPRequest& Request)
 	{
-		return EDT_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 
 	// ─── Active viewport resolution ─────────────────────────────────────────────────────────────
@@ -300,12 +281,12 @@ FMCPResponse Tool_ViewportScreenshot(const FMCPRequest& Request)
 	if (!EDT_ReadClampedInt(Request.Args, TEXT("width"), kEDTMemScreenshotDefault,
 		kEDTMemScreenshotMin, kEDTMemScreenshotMax, Width, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 	if (!EDT_ReadClampedInt(Request.Args, TEXT("height"), kEDTMemScreenshotDefault,
 		kEDTMemScreenshotMin, kEDTMemScreenshotMax, Height, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 
 	// Parse format.
@@ -317,14 +298,14 @@ FMCPResponse Tool_ViewportScreenshot(const FMCPRequest& Request)
 	FMCPScreenshotUtils::EImageFormat Format = FMCPScreenshotUtils::EImageFormat::PNG;
 	if (!FMCPScreenshotUtils::ParseFormat(FormatRaw, Format, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 
 	// Resolve active viewport.
 	FViewport* Viewport = EDT_FindActiveLevelViewport();
 	if (!Viewport)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			TEXT("no active level viewport (NO_VIEWPORT) — open a level editor tab"));
 	}
 
@@ -334,7 +315,7 @@ FMCPResponse Tool_ViewportScreenshot(const FMCPRequest& Request)
 	FString CaptureErr;
 	if (!FMCPScreenshotUtils::CaptureViewport(Viewport, Width, Height, Pixels, OutW, OutH, CaptureErr))
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			FString::Printf(TEXT("viewport capture failed: %s"), *CaptureErr));
 	}
 
@@ -344,27 +325,27 @@ FMCPResponse Tool_ViewportScreenshot(const FMCPRequest& Request)
 	if (!FMCPScreenshotUtils::EncodeImage(Pixels, OutW, OutH, Format, /*JpegQuality*/ 85,
 		Encoded, EncodeErr))
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			FString::Printf(TEXT("image encode failed: %s"), *EncodeErr));
 	}
 
 	// Base64 wrap. UE's FBase64::Encode takes int32; PNG of 2048x2048 fits well under that limit.
 	if (Encoded.Num() > INT32_MAX)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			FString::Printf(TEXT("encoded image %lld bytes exceeds 2 GiB — use editor.viewport_screenshot_to_disk"),
 				Encoded.Num()));
 	}
 	const FString Base64 = FBase64::Encode(
 		reinterpret_cast<const uint8*>(Encoded.GetData()), static_cast<int32>(Encoded.Num()));
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("base64"), Base64);
 	Out->SetStringField(TEXT("mime"),
 		Format == FMCPScreenshotUtils::EImageFormat::JPG ? TEXT("image/jpeg") : TEXT("image/png"));
 	Out->SetNumberField(TEXT("width"), OutW);
 	Out->SetNumberField(TEXT("height"), OutH);
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.viewport_screenshot_to_disk ────────────────────────────────────────────────────────
@@ -393,12 +374,12 @@ FMCPResponse Tool_ViewportScreenshotToDisk(const FMCPRequest& Request)
 	if (!EDT_ReadClampedInt(Request.Args, TEXT("width"), kEDTDiskScreenshotDefaultW,
 		kEDTDiskScreenshotMin, kEDTDiskScreenshotMax, Width, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 	if (!EDT_ReadClampedInt(Request.Args, TEXT("height"), kEDTDiskScreenshotDefaultH,
 		kEDTDiskScreenshotMin, kEDTDiskScreenshotMax, Height, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 
 	// Parse format.
@@ -410,14 +391,14 @@ FMCPResponse Tool_ViewportScreenshotToDisk(const FMCPRequest& Request)
 	FMCPScreenshotUtils::EImageFormat Format = FMCPScreenshotUtils::EImageFormat::PNG;
 	if (!FMCPScreenshotUtils::ParseFormat(FormatRaw, Format, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 
 	// Parse quality (JPG only — silently accepted for PNG but ignored).
 	int32 Quality = 85;
 	if (!EDT_ReadClampedInt(Request.Args, TEXT("quality"), 85, 0, 100, Quality, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 
 	// Resolve path — default if missing.
@@ -441,14 +422,14 @@ FMCPResponse Tool_ViewportScreenshotToDisk(const FMCPRequest& Request)
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(PathRaw, AbsPath, SandboxErr))
 	{
-		return EDT_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 
 	// Resolve active viewport.
 	FViewport* Viewport = EDT_FindActiveLevelViewport();
 	if (!Viewport)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			TEXT("no active level viewport (NO_VIEWPORT) — open a level editor tab"));
 	}
 
@@ -458,7 +439,7 @@ FMCPResponse Tool_ViewportScreenshotToDisk(const FMCPRequest& Request)
 	FString CaptureErr;
 	if (!FMCPScreenshotUtils::CaptureViewport(Viewport, Width, Height, Pixels, OutW, OutH, CaptureErr))
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			FString::Printf(TEXT("viewport capture failed: %s"), *CaptureErr));
 	}
 
@@ -468,16 +449,16 @@ FMCPResponse Tool_ViewportScreenshotToDisk(const FMCPRequest& Request)
 	if (!FMCPScreenshotUtils::EncodeAndSaveToDisk(Pixels, OutW, OutH, Format, Quality,
 		AbsPath, BytesWritten, SaveErr))
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("path"), AbsPath);
 	Out->SetNumberField(TEXT("bytes"), static_cast<double>(BytesWritten));
 	Out->SetNumberField(TEXT("width"), OutW);
 	Out->SetNumberField(TEXT("height"), OutH);
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.screenshot_to_disk ────────────────────────────────────────────────────────────────────
@@ -512,12 +493,12 @@ FMCPResponse Tool_PIEScreenshotToDisk(const FMCPRequest& Request)
 	if (!EDT_ReadClampedInt(Request.Args, TEXT("width"), kEDTDiskScreenshotDefaultW,
 		kEDTDiskScreenshotMin, kEDTDiskScreenshotMax, Width, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 	if (!EDT_ReadClampedInt(Request.Args, TEXT("height"), kEDTDiskScreenshotDefaultH,
 		kEDTDiskScreenshotMin, kEDTDiskScreenshotMax, Height, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 
 	// Default path: include "pie_" prefix to differentiate from editor screenshots.
@@ -539,7 +520,7 @@ FMCPResponse Tool_PIEScreenshotToDisk(const FMCPRequest& Request)
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(PathRaw, AbsPath, SandboxErr))
 	{
-		return EDT_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 
 	// Resolve PIE viewport + capture the world path BEFORE the capture (so we report exactly which
@@ -547,7 +528,7 @@ FMCPResponse Tool_PIEScreenshotToDisk(const FMCPRequest& Request)
 	FViewport* Viewport = EDT_FindPIEGameViewport();
 	if (!Viewport)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			TEXT("no PIE game viewport available (PIE may still be initialising)"));
 	}
 	FString WorldPath;
@@ -569,7 +550,7 @@ FMCPResponse Tool_PIEScreenshotToDisk(const FMCPRequest& Request)
 	FString CaptureErr;
 	if (!FMCPScreenshotUtils::CaptureViewport(Viewport, Width, Height, Pixels, OutW, OutH, CaptureErr))
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			FString::Printf(TEXT("PIE viewport capture failed: %s"), *CaptureErr));
 	}
 
@@ -580,15 +561,15 @@ FMCPResponse Tool_PIEScreenshotToDisk(const FMCPRequest& Request)
 		FMCPScreenshotUtils::EImageFormat::PNG, /*JpegQuality*/ 0,
 		AbsPath, BytesWritten, SaveErr))
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("path"), AbsPath);
 	Out->SetNumberField(TEXT("bytes"), static_cast<double>(BytesWritten));
 	Out->SetStringField(TEXT("world"), WorldPath);
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.get_camera ─────────────────────────────────────────────────────────────────────────
@@ -610,7 +591,7 @@ FMCPResponse Tool_GetCamera(const FMCPRequest& Request)
 	FLevelEditorViewportClient* Client = EDT_FindActiveLevelViewportClient();
 	if (!Client)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			TEXT("no active level viewport (NO_VIEWPORT) — open a level editor tab"));
 	}
 
@@ -619,7 +600,7 @@ FMCPResponse Tool_GetCamera(const FMCPRequest& Request)
 	const float FOV = Client->ViewFOV;
 	const bool bOrtho = Client->IsOrtho();
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("location"), EDT_VectorToArray(Location));
 	Out->SetArrayField(TEXT("rotation"), EDT_RotatorToArray(Rotation));
 	Out->SetNumberField(TEXT("fov"), FOV);
@@ -635,7 +616,7 @@ FMCPResponse Tool_GetCamera(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("ortho_width"), MakeShared<FJsonValueNull>());
 	}
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.set_camera ─────────────────────────────────────────────────────────────────────────
@@ -660,19 +641,19 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FVector Location = FVector::ZeroVector;
 	FString Err;
 	if (!EDT_ReadVectorArray(Request.Args, TEXT("location"), Location, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 	FVector RotationVec = FVector::ZeroVector;
 	if (!EDT_ReadVectorArray(Request.Args, TEXT("rotation"), RotationVec, Err))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, Err);
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, Err);
 	}
 	const FRotator Rotation(RotationVec.X, RotationVec.Y, RotationVec.Z); // pitch, yaw, roll
 
@@ -680,14 +661,14 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 	const bool bHasFov = Request.Args->TryGetNumberField(TEXT("fov"), FOV);
 	if (bHasFov && (FOV < 1.0 || FOV > 175.0))
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams,
 			FString::Printf(TEXT("fov %g out of range (1.0, 175.0)"), FOV));
 	}
 
 	FLevelEditorViewportClient* Client = EDT_FindActiveLevelViewportClient();
 	if (!Client)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			TEXT("no active level viewport (NO_VIEWPORT) — open a level editor tab"));
 	}
 
@@ -701,9 +682,9 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 	// the next natural redraw trigger.
 	Client->Invalidate();
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("set"), true);
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.get_selection ──────────────────────────────────────────────────────────────────────
@@ -725,7 +706,7 @@ FMCPResponse Tool_GetSelection(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 
 	// Enumerate actors.
@@ -776,10 +757,10 @@ FMCPResponse Tool_GetSelection(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("actors"), ActorsArr);
 	Out->SetArrayField(TEXT("components"), ComponentsArr);
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.set_selection ──────────────────────────────────────────────────────────────────────
@@ -805,18 +786,18 @@ FMCPResponse Tool_SetSelection(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* IdsArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("actor_ids"), IdsArr) || !IdsArr)
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams,
 			TEXT("missing required array field 'actor_ids'"));
 	}
 	if (IdsArr->Num() > kEDTMaxSelectionSize)
 	{
-		return EDT_MakeError(Request, kMCPErrorInputTooLarge,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInputTooLarge,
 			FString::Printf(TEXT("actor_ids.length=%d exceeds cap of %d"),
 				IdsArr->Num(), kEDTMaxSelectionSize));
 	}
@@ -827,7 +808,7 @@ FMCPResponse Tool_SetSelection(const FMCPRequest& Request)
 	UEditorActorSubsystem* Subsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorActorSubsystem>() : nullptr;
 	if (!Subsystem)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			TEXT("UEditorActorSubsystem unavailable"));
 	}
 
@@ -840,7 +821,7 @@ FMCPResponse Tool_SetSelection(const FMCPRequest& Request)
 		FString IdStr;
 		if (!Val.IsValid() || !Val->TryGetString(IdStr) || IdStr.IsEmpty())
 		{
-			return EDT_MakeError(Request, kEDTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams,
 				TEXT("actor_ids entries must be non-empty strings"));
 		}
 		bool bAmbig = false;
@@ -871,7 +852,7 @@ FMCPResponse Tool_SetSelection(const FMCPRequest& Request)
 		{
 			List += FString::Printf(TEXT(" (and %d more)"), Unresolved.Num() - ListCap);
 		}
-		return EDT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not resolve %d of %d actor_ids: %s"),
 				Unresolved.Num(), IdsArr->Num(), *List));
 	}
@@ -895,12 +876,12 @@ FMCPResponse Tool_SetSelection(const FMCPRequest& Request)
 
 	Subsystem->SetSelectedLevelActors(Resolved);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	// Report what the subsystem actually selected (it may have filtered out PIE/invalid actors
 	// internally — we report the post-state count, not just Resolved.Num()).
 	const int32 PostCount = GEditor->GetSelectedActors() ? GEditor->GetSelectedActors()->Num() : 0;
 	Out->SetNumberField(TEXT("selected_count"), PostCount);
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.show_message ───────────────────────────────────────────────────────────────────────
@@ -924,18 +905,18 @@ FMCPResponse Tool_ShowMessage(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString Text;
 	if (!Request.Args->TryGetStringField(TEXT("text"), Text) || Text.IsEmpty())
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams,
 			TEXT("missing required non-empty string field 'text'"));
 	}
 	if (Text.Len() > 500)
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams,
 			FString::Printf(TEXT("'text' length %d exceeds 500-char cap"), Text.Len()));
 	}
 
@@ -964,7 +945,7 @@ FMCPResponse Tool_ShowMessage(const FMCPRequest& Request)
 	}
 	else
 	{
-		return EDT_MakeError(Request, kEDTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams,
 			FString::Printf(TEXT("level '%s' invalid — accepted: info | success | warning | error"),
 				*Level));
 	}
@@ -974,7 +955,7 @@ FMCPResponse Tool_ShowMessage(const FMCPRequest& Request)
 	{
 		if (Duration < 0.5 || Duration > 30.0)
 		{
-			return EDT_MakeError(Request, kEDTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kEDTErrorInvalidParams,
 				FString::Printf(TEXT("duration %g out of range [0.5, 30.0]"), Duration));
 		}
 	}
@@ -990,9 +971,9 @@ FMCPResponse Tool_ShowMessage(const FMCPRequest& Request)
 		Item->SetCompletionState(State);
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("shown"), true);
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.current_world ──────────────────────────────────────────────────────────────────────
@@ -1016,18 +997,18 @@ FMCPResponse Tool_CurrentWorld(const FMCPRequest& Request)
 	UWorld* World = FMCPWorldContext::GetEditorWorld();
 	if (!World)
 	{
-		return EDT_MakeError(Request, kEDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kEDTErrorInternal,
 			TEXT("no editor world available (NO_WORLD) — GEditor missing or level switch in progress"));
 	}
 
 	const FString PackagePath = World->GetOutermost() ? World->GetOutermost()->GetName() : FString();
 	const FString WorldName = World->GetName();
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("world_path"), PackagePath);
 	Out->SetStringField(TEXT("world_name"), WorldName);
 	Out->SetBoolField(TEXT("pie_active"), FMCPWorldContext::IsPIEActive());
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── editor.tick_once ──────────────────────────────────────────────────────────────────────────
@@ -1057,13 +1038,13 @@ FMCPResponse Tool_TickOnce(const FMCPRequest& Request)
 	constexpr float TickDt = 1.0f / 60.0f;
 	FTSTicker::GetCoreTicker().Tick(TickDt);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("ticked"), true);
 	Out->SetNumberField(TEXT("delta_seconds"), TickDt);
 	Out->SetStringField(TEXT("note"),
 		TEXT("FTSTicker advanced; GEditor->Tick is unsafe mid-frame and is NOT called here. "
 			 "Engine render/anim/physics ticks still require a natural editor frame."));
-	return EDT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

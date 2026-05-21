@@ -3,6 +3,7 @@
 #include "TestTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
 
@@ -20,8 +21,9 @@
 
 namespace
 {
-	// TST_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
+	// TST_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx
+	// from MCPToolHelpers.h.
 	constexpr int32 kTSTErrorInvalidParams = -32602;
 
 	// Wall-clock cap for the sync ``test.run_single_test`` path. Smoke tests routinely complete
@@ -37,31 +39,6 @@ namespace
 
 	// Default page size for ``test.list_automation_specs``. Mirrors Phase 4 bp.list_* defaults.
 	constexpr int32 kTSTDefaultPageSize = 100;
-
-	void TST_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse TST_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		TST_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse TST_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		TST_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	int32 TST_ClampPageSize(const TSharedPtr<FJsonObject>& Args, const TCHAR* FieldName, int32 Default)
 	{
@@ -83,13 +60,13 @@ namespace
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(TokenWire, OutCursor, DecodeErr))
 		{
-			OutError = TST_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = TST_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated 'filter' between pages; "
 					 "restart pagination with page_token=null"));
 			return false;
@@ -418,7 +395,7 @@ FMCPResponse Tool_ListAutomationSpecs(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return TST_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── test.run_single_test ─────────────────────────────────────────────────────────────────────
@@ -448,12 +425,12 @@ FMCPResponse Tool_RunSingleTest(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return TST_MakeError(Request, kTSTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kTSTErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString TestName;
 	if (!Request.Args->TryGetStringField(TEXT("test_name"), TestName) || TestName.IsEmpty())
 	{
-		return TST_MakeError(Request, kTSTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTSTErrorInvalidParams,
 			TEXT("missing required string field 'test_name'"));
 	}
 
@@ -463,7 +440,7 @@ FMCPResponse Tool_RunSingleTest(const FMCPRequest& Request)
 	FAutomationTestInfo Info;
 	if (!TST_FindTestByFullPath(TestName, Info))
 	{
-		return TST_MakeError(Request, kMCPErrorTestNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorTestNotFound,
 			FString::Printf(TEXT("automation test '%s' not found; see test.list_automation_specs"),
 				*TestName));
 	}
@@ -529,7 +506,7 @@ FMCPResponse Tool_RunSingleTest(const FMCPRequest& Request)
 	// + ``completed=false`` is the cap-hit signal — caller branches on those flags rather than
 	// the wire envelope. (FMCPResponse's serializer can't carry a Result block alongside an
 	// error block, so we'd lose the partial results if we returned an error envelope.)
-	return TST_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── test.get_last_results ────────────────────────────────────────────────────────────────────
@@ -566,7 +543,7 @@ FMCPResponse Tool_GetLastResults(const FMCPRequest& Request)
 		Out->SetNumberField(TEXT("duration_secs"), 0.0);
 		TArray<TSharedPtr<FJsonValue>> EmptyArr;
 		Out->SetArrayField(TEXT("entries"), EmptyArr);
-		return TST_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	FAutomationTestExecutionInfo ExecInfo;
@@ -586,7 +563,7 @@ FMCPResponse Tool_GetLastResults(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("warning_count"),  static_cast<double>(ExecInfo.GetWarningTotal()));
 	Out->SetNumberField(TEXT("duration_secs"),  ExecInfo.Duration);
 	Out->SetArrayField(TEXT("entries"), EntriesArr);
-	return TST_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── test.cancel_current ──────────────────────────────────────────────────────────────────────
@@ -630,7 +607,7 @@ FMCPResponse Tool_CancelCurrent(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("was_running"),              bWasRunning);
 	Out->SetBoolField(TEXT("stop_succeeded"),           bSuccessful);
 	Out->SetStringField(TEXT("current_test_full_path"), PriorFullPath);
-	return TST_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── test.list_categories ─────────────────────────────────────────────────────────────────────
@@ -687,7 +664,7 @@ FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("categories"), CatArr);
 	Out->SetNumberField(TEXT("total"), static_cast<double>(Sorted.Num()));
-	return TST_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── test.get_test_info ───────────────────────────────────────────────────────────────────────
@@ -704,24 +681,24 @@ FMCPResponse Tool_GetTestInfo(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return TST_MakeError(Request, kTSTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kTSTErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString TestName;
 	if (!Request.Args->TryGetStringField(TEXT("test_name"), TestName) || TestName.IsEmpty())
 	{
-		return TST_MakeError(Request, kTSTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTSTErrorInvalidParams,
 			TEXT("missing required string field 'test_name'"));
 	}
 
 	FAutomationTestInfo Info;
 	if (!TST_FindTestByFullPath(TestName, Info))
 	{
-		return TST_MakeError(Request, kMCPErrorTestNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorTestNotFound,
 			FString::Printf(TEXT("automation test '%s' not found; see test.list_automation_specs"),
 				*TestName));
 	}
 
-	return TST_MakeSuccessObj(Request, TST_BuildSpecJson(Info));
+	return FMCPToolHelpers::MakeSuccessObj(Request, TST_BuildSpecJson(Info));
 }
 
 // ─── test.set_filter_flags ────────────────────────────────────────────────────────────────────
@@ -748,12 +725,12 @@ FMCPResponse Tool_SetFilterFlags(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return TST_MakeError(Request, kTSTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kTSTErrorInvalidParams, TEXT("missing args object"));
 	}
 	const TArray<TSharedPtr<FJsonValue>>* FlagsArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("flags"), FlagsArr) || !FlagsArr)
 	{
-		return TST_MakeError(Request, kTSTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTSTErrorInvalidParams,
 			TEXT("missing required array field 'flags' (e.g. [\"SmokeFilter\",\"EngineFilter\"])"));
 	}
 
@@ -796,7 +773,7 @@ FMCPResponse Tool_SetFilterFlags(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("applied"),       AppliedArr);
 	Out->SetArrayField(TEXT("rejected"),      RejectedArr);
 	Out->SetNumberField(TEXT("applied_mask"), static_cast<double>(static_cast<uint32>(AppliedMask)));
-	return TST_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

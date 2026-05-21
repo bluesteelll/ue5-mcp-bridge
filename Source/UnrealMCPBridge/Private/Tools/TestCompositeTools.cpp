@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 
 #include "HAL/PlatformProcess.h"
@@ -17,37 +18,14 @@
 
 namespace
 {
-	// TSC_ prefix per the unity-build symbol-collision pattern.
+	// TSC_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx
+	// from MCPToolHelpers.h.
 	constexpr int32 kTSCErrorInvalidParams = -32602;
 
 	// Per-test inner pump cadence — same value as the sync TestTools path. Trades GT
 	// responsiveness against drain frequency.
 	constexpr float kTSCDrainSleepSeconds = 0.005f;
-
-	void TSC_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse TSC_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		TSC_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse TSC_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		TSC_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	const TCHAR* TSC_EventTypeToString(EAutomationEventType Type)
 	{
@@ -183,7 +161,7 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return TSC_MakeError(Request, kTSCErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kTSCErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// ─── Parse test_names ──────────────────────────────────────────────────────────────────────
@@ -191,7 +169,7 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 	if (!Request.Args->TryGetArrayField(TEXT("test_names"), NamesArr) || !NamesArr ||
 		NamesArr->Num() == 0)
 	{
-		return TSC_MakeError(Request, kTSCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTSCErrorInvalidParams,
 			TEXT("missing or empty required array field 'test_names'"));
 	}
 
@@ -202,7 +180,7 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 		FString Name;
 		if (!(*NamesArr)[i].IsValid() || !(*NamesArr)[i]->TryGetString(Name) || Name.IsEmpty())
 		{
-			return TSC_MakeError(Request, kTSCErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kTSCErrorInvalidParams,
 				FString::Printf(TEXT("'test_names'[%d] is not a non-empty string"), i));
 		}
 		RawNames.Add(MoveTemp(Name));
@@ -218,7 +196,7 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 	{
 		if (!TSC_LookupFlag(FilterName, FilterFlag))
 		{
-			return TSC_MakeError(Request, kTSCErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kTSCErrorInvalidParams,
 				FString::Printf(
 					TEXT("unknown run_smoke_filter '%s' (see EAutomationTestFlags_GetTestFlagsMap for canonical names; ")
 					TEXT("e.g. \"SmokeFilter\", \"EngineFilter\", \"ProductFilter\")"),
@@ -441,13 +419,13 @@ FMCPResponse Tool_RunAutomationInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return TSC_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return TSC_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

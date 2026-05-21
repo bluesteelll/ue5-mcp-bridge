@@ -3,6 +3,8 @@
 #include "BlueprintTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPBlueprintUtils.h"
@@ -30,7 +32,6 @@
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Logging/TokenizedMessage.h"
-#include "ScopedTransaction.h"
 #include "UObject/Class.h"
 #include "UObject/Script.h"
 #include "UObject/UnrealType.h"
@@ -43,53 +44,18 @@
 
 namespace
 {
-	// BP_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kBPErrorInvalidParams = -32602;
-	constexpr int32 kBPErrorInternal      = -32603;
-
-	void BP_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse BP_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		BP_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse BP_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		BP_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	// BP_ prefix per the unity-build symbol-collision pattern. XX_StampIds / XX_MakeError /
+	// XX_MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx from MCPToolHelpers.h
+	// (kMCPErrorInvalidParams replaced by canonical kMCPErrorInvalidParams). Per-surface internal
+	// code retained for readability — same value as kMCPErrorInternal, distinct semantic naming.
+	constexpr int32 kBPErrorInternal = -32603;
 
 	// ─── arg parsing helpers ─────────────────────────────────────────────────────────────────────
 
 	/** Read ``args.blueprint_path`` field; emit -32602 InvalidParams on missing/empty. */
 	bool BP_RequireBlueprintPath(const FMCPRequest& Request, FString& OutPath, FMCPResponse& OutError)
 	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = BP_MakeError(Request, kBPErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(TEXT("blueprint_path"), OutPath) || OutPath.IsEmpty())
-		{
-			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
-				TEXT("missing required string field 'blueprint_path'"));
-			return false;
-		}
-		return true;
+		return FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), OutPath, OutError);
 	}
 
 	/** Resolve blueprint by path + emit appropriate error. Returns nullptr + populates OutError on failure. */
@@ -100,7 +66,7 @@ namespace
 		UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(Path, ErrCode, ErrMsg);
 		if (!Blueprint)
 		{
-			OutError = BP_MakeError(Request, ErrCode, ErrMsg);
+			OutError = FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 			return nullptr;
 		}
 		return Blueprint;
@@ -126,13 +92,13 @@ namespace
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(TokenWire, OutCursor, DecodeErr))
 		{
-			OutError = BP_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = BP_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated filter (likely blueprint_path) "
 					 "between pages; restart pagination with page_token=null"));
 			return false;
@@ -169,7 +135,7 @@ namespace
 		TSharedPtr<FJsonObject> Obj = FMCPPinTypeUtils::ToJson(PinType, ErrCode, ErrMsg);
 		if (!Obj.IsValid())
 		{
-			OutError = BP_MakeError(Request, ErrCode, ErrMsg);
+			OutError = FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 		}
 		return Obj;
 	}
@@ -494,18 +460,8 @@ namespace
 	}
 
 	// ─── Days 6-10: write-side helpers ────────────────────────────────────────────────────────────
-
-	/** Frozen PIE-mutator refusal — every BP write surfaces this exact pair (smoke asserts substrings). */
-	FMCPResponse BP_MakePIEError(const FMCPRequest& Request)
-	{
-		return BP_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
-
-	/** True if PIE is running. Centralised so write tools share one call site. */
-	bool BP_IsPIEActive()
-	{
-		return FMCPWorldContext::IsPIEActive();
-	}
+	// BP_MakePIEError / BP_IsPIEActive removed in Phase 3 — FMCPMutatorScope handles PIE guard
+	// + FScopedTransaction + MarkPackageDirty queue as a single RAII bundle for every BP mutator.
 
 	/**
 	 * Resolve a UClass from a class path arg. Returns nullptr + populates OutError on:
@@ -523,7 +479,7 @@ namespace
 	{
 		if (ClassPath.IsEmpty() || ClassPath[0] != TEXT('/'))
 		{
-			OutError = BP_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(
 					TEXT("class_path '%s' invalid — must start with '/' (e.g. '/Script/Engine.Pawn')"),
 					*ClassPath));
@@ -531,7 +487,7 @@ namespace
 		}
 		if (ClassPath.Contains(TEXT("\\")))
 		{
-			OutError = BP_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(TEXT("class_path '%s' contains backslash"), *ClassPath));
 			return nullptr;
 		}
@@ -543,7 +499,7 @@ namespace
 		}
 		if (!Class)
 		{
-			OutError = BP_MakeError(Request, kMCPErrorClassNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 				FString::Printf(
 					TEXT("class_path '%s' could not be resolved (LoadObject returned null); ")
 					TEXT("Blueprint paths usually need trailing '_C'"),
@@ -566,7 +522,7 @@ namespace
 		const TSharedPtr<FJsonObject>* PinTypeObjPtr = nullptr;
 		if (!Request.Args->TryGetObjectField(FieldName, PinTypeObjPtr) || !PinTypeObjPtr || !PinTypeObjPtr->IsValid())
 		{
-			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("missing required object field '%s'"), FieldName));
 			return false;
 		}
@@ -574,7 +530,7 @@ namespace
 		FString ErrMsg;
 		if (!FMCPPinTypeUtils::FromJson(*PinTypeObjPtr, OutPinType, ErrCode, ErrMsg))
 		{
-			OutError = BP_MakeError(Request, ErrCode, ErrMsg);
+			OutError = FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 			return false;
 		}
 		return true;
@@ -733,7 +689,7 @@ namespace
 	{
 		if (!Request.Args->TryGetStringField(TEXT("direction"), OutDirectionStr) || OutDirectionStr.IsEmpty())
 		{
-			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				TEXT("missing required string field 'direction' ('input' or 'output')"));
 			return false;
 		}
@@ -747,7 +703,7 @@ namespace
 			bIsInputDir = false;
 			return true;
 		}
-		OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+		OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("'direction' must be 'input' or 'output', got '%s'"), *OutDirectionStr));
 		return false;
 	}
@@ -859,7 +815,7 @@ namespace
 		}
 		if (!Request.Args->TryGetStringField(TEXT("function_name"), OutFnNameStr) || OutFnNameStr.IsEmpty())
 		{
-			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				TEXT("missing required string field 'function_name'"));
 			return false;
 		}
@@ -870,7 +826,7 @@ namespace
 		OutGraph = FMCPBlueprintUtils::FindFunctionGraph(OutBlueprint, FnName);
 		if (!OutGraph)
 		{
-			OutError = BP_MakeError(Request, kMCPErrorVariableNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorVariableNotFound,
 				FString::Printf(TEXT("function '%s' not found on blueprint '%s'"),
 					*OutFnNameStr, *OutPath));
 			return false;
@@ -879,7 +835,7 @@ namespace
 		BP_GetFunctionTerminators(OutGraph, OutEntry, OutResult);
 		if (!OutEntry)
 		{
-			OutError = BP_MakeError(Request, kBPErrorInternal,
+			OutError = FMCPToolHelpers::MakeError(Request, kBPErrorInternal,
 				FString::Printf(
 					TEXT("function '%s' on '%s' has no UK2Node_FunctionEntry (corrupt blueprint?)"),
 					*OutFnNameStr, *OutPath));
@@ -961,18 +917,18 @@ FMCPResponse Tool_Exists(const FMCPRequest& Request)
 		// "no asset found" path collapses to exists=false (matches cb.exists semantics).
 		if (ErrCode == kMCPErrorInvalidPath)
 		{
-			return BP_MakeError(Request, ErrCode, ErrMsg);
+			return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 		}
 		if (ErrCode == kMCPErrorBlueprintTypeMismatch)
 		{
-			return BP_MakeError(Request, ErrCode, ErrMsg);
+			return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 		}
 		// -32004 ObjectNotFound → exists=false success response.
 		Out->SetBoolField(TEXT("exists"), false);
 		Out->SetField(TEXT("generated_class_path"), MakeShared<FJsonValueNull>());
 		Out->SetField(TEXT("parent_class_path"), MakeShared<FJsonValueNull>());
 		Out->SetBoolField(TEXT("is_data_only"), false);
-		return BP_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	Out->SetBoolField(TEXT("exists"), true);
@@ -993,7 +949,7 @@ FMCPResponse Tool_Exists(const FMCPRequest& Request)
 		Out->SetField(TEXT("parent_class_path"), MakeShared<FJsonValueNull>());
 	}
 	Out->SetBoolField(TEXT("is_data_only"), FMCPBlueprintUtils::IsDataOnlyBlueprint(Blueprint));
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.get_variable (Lane A, no PIE guard) ──────────────────────────────────────────────────
@@ -1022,7 +978,7 @@ FMCPResponse Tool_GetVariable(const FMCPRequest& Request)
 	FString VarNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
@@ -1034,7 +990,7 @@ FMCPResponse Tool_GetVariable(const FMCPRequest& Request)
 	const int32 Idx = FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName);
 	if (Idx == INDEX_NONE)
 	{
-		return BP_MakeError(Request, kMCPErrorVariableNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorVariableNotFound,
 			FString::Printf(TEXT("variable '%s' not found on blueprint '%s'"),
 				*VarNameStr, *Path));
 	}
@@ -1049,7 +1005,7 @@ FMCPResponse Tool_GetVariable(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetObjectField(TEXT("variable"), VarObj);
 	Out->SetBoolField(TEXT("found"), true);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.list_variables (Lane A, no PIE guard, paginated) ─────────────────────────────────────
@@ -1147,7 +1103,7 @@ FMCPResponse Tool_ListVariables(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.list_functions (Lane A, no PIE guard, paginated) ─────────────────────────────────────
@@ -1239,7 +1195,7 @@ FMCPResponse Tool_ListFunctions(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.get_function (Lane A, no PIE guard) ──────────────────────────────────────────────────
@@ -1260,7 +1216,7 @@ FMCPResponse Tool_GetFunction(const FMCPRequest& Request)
 	FString FnNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("function_name"), FnNameStr) || FnNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
 
@@ -1272,7 +1228,7 @@ FMCPResponse Tool_GetFunction(const FMCPRequest& Request)
 	UEdGraph* Graph = FMCPBlueprintUtils::FindFunctionGraph(Blueprint, FnName);
 	if (!Graph)
 	{
-		return BP_MakeError(Request, kMCPErrorVariableNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorVariableNotFound,
 			FString::Printf(TEXT("function '%s' not found on blueprint '%s'"),
 				*FnNameStr, *Path));
 	}
@@ -1303,7 +1259,7 @@ FMCPResponse Tool_GetFunction(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetObjectField(TEXT("function"), FnObj);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.list_nodes_in_function (Lane A, no PIE guard, paginated) ─────────────────────────────
@@ -1328,7 +1284,7 @@ FMCPResponse Tool_ListNodesInFunction(const FMCPRequest& Request)
 	FString FnNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("function_name"), FnNameStr) || FnNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
 
@@ -1340,7 +1296,7 @@ FMCPResponse Tool_ListNodesInFunction(const FMCPRequest& Request)
 	UEdGraph* Graph = FMCPBlueprintUtils::FindFunctionGraph(Blueprint, FnName);
 	if (!Graph)
 	{
-		return BP_MakeError(Request, kMCPErrorVariableNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorVariableNotFound,
 			FString::Printf(TEXT("function '%s' not found on blueprint '%s'"),
 				*FnNameStr, *Path));
 	}
@@ -1414,7 +1370,7 @@ FMCPResponse Tool_ListNodesInFunction(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.add_variable (Lane A, PIE-guarded — edit-const gate carve-out) ───────────────────────
@@ -1453,7 +1409,8 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPAddVariable", "MCP: add blueprint variable"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1462,7 +1419,7 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 	FString VarNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
@@ -1483,7 +1440,7 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 	// false silently on collision — same surface but losing the per-tool error code).
 	if (FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName) != INDEX_NONE)
 	{
-		return BP_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(
 				TEXT("variable '%s' already exists on blueprint '%s'; use bp.remove_variable + bp.add_variable to replace"),
 				*VarNameStr, *Path));
@@ -1492,16 +1449,14 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 	const TSharedPtr<FJsonValue> DefaultValueField = Request.Args->TryGetField(TEXT("default_value"));
 	const FString DefaultValueText = BP_ConvertJsonDefaultToText(DefaultValueField);
 
-	// FScopedTransaction owns the undo group; AddMemberVariable internally calls Modify+Mark.
-	const FScopedTransaction Transaction(LOCTEXT("BPAddVariable", "MCP: add blueprint variable"));
-
+	// Scope owns the undo group; AddMemberVariable internally calls Modify+Mark.
 	const bool bAdded = FBlueprintEditorUtils::AddMemberVariable(
 		Blueprint, VarName, NewPinType, DefaultValueText);
 	if (!bAdded)
 	{
 		// Fall-through: UE rejected the add for an internal reason we didn't pre-screen. Most
 		// common is a colliding parent-class variable (we only checked the BP's own NewVariables).
-		return BP_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(
 				TEXT("AddMemberVariable failed for '%s' on '%s' — likely masks a variable in a base class"),
 				*VarNameStr, *Path));
@@ -1554,7 +1509,7 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("added"), true);
 	Out->SetStringField(TEXT("variable_name"), VarNameStr);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.remove_variable (Lane A, PIE-guarded, idempotent) ────────────────────────────────────
@@ -1574,7 +1529,8 @@ FMCPResponse Tool_RemoveVariable(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPRemoveVariable", "MCP: remove blueprint variable"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1583,7 +1539,7 @@ FMCPResponse Tool_RemoveVariable(const FMCPRequest& Request)
 	FString VarNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
@@ -1599,15 +1555,15 @@ FMCPResponse Tool_RemoveVariable(const FMCPRequest& Request)
 	{
 		Out->SetBoolField(TEXT("removed"), false);
 		Out->SetBoolField(TEXT("was_present"), false);
-		return BP_MakeSuccessObj(Request, Out);
+		Scope.Abort();
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("BPRemoveVariable", "MCP: remove blueprint variable"));
 	FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, VarName);
 
 	Out->SetBoolField(TEXT("removed"), true);
 	Out->SetBoolField(TEXT("was_present"), true);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.change_variable_type (Lane A, PIE-guarded) ───────────────────────────────────────────
@@ -1631,7 +1587,8 @@ FMCPResponse Tool_ChangeVariableType(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPChangeVariableType", "MCP: change blueprint variable type"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1640,7 +1597,7 @@ FMCPResponse Tool_ChangeVariableType(const FMCPRequest& Request)
 	FString VarNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
@@ -1662,7 +1619,7 @@ FMCPResponse Tool_ChangeVariableType(const FMCPRequest& Request)
 	const int32 Idx = FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName);
 	if (Idx == INDEX_NONE)
 	{
-		return BP_MakeError(Request, kMCPErrorVariableNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorVariableNotFound,
 			FString::Printf(TEXT("variable '%s' not found on blueprint '%s'"),
 				*VarNameStr, *Path));
 	}
@@ -1673,8 +1630,6 @@ FMCPResponse Tool_ChangeVariableType(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> PriorPinTypeObj = BP_PinTypeToJsonOrError(
 		Request, Blueprint->NewVariables[Idx].VarType, PriorErr);
 	if (!PriorPinTypeObj.IsValid()) { return PriorErr; }
-
-	const FScopedTransaction Transaction(LOCTEXT("BPChangeVariableType", "MCP: change blueprint variable type"));
 
 	if (bDropDefault)
 	{
@@ -1694,7 +1649,7 @@ FMCPResponse Tool_ChangeVariableType(const FMCPRequest& Request)
 			 "incompatible nodes with red error nodes that need manual reconnection. Recompile "
 			 "and inspect the graph after this call. Pass drop_default_value=true if the prior "
 			 "default is no longer type-compatible."));
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.add_function (Lane A, PIE-guarded) ───────────────────────────────────────────────────
@@ -1724,7 +1679,8 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPAddFunction", "MCP: add blueprint function"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1733,7 +1689,7 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 	FString FnNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("function_name"), FnNameStr) || FnNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
 
@@ -1744,7 +1700,7 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 	const FName FnName(*FnNameStr);
 	if (FMCPBlueprintUtils::FindFunctionGraphIndex(Blueprint, FnName) != INDEX_NONE)
 	{
-		return BP_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(
 				TEXT("function '%s' already exists on blueprint '%s'; use bp.remove_function first"),
 				*FnNameStr, *Path));
@@ -1774,7 +1730,7 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 			const TSharedPtr<FJsonValue>& V = (*Arr)[i];
 			if (!V.IsValid() || V->Type != EJson::Object)
 			{
-				OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					FString::Printf(TEXT("%s[%d] is not an object"), FieldName, i));
 				return false;
 			}
@@ -1782,14 +1738,14 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 			FString PinNameStr;
 			if (!Item->TryGetStringField(TEXT("name"), PinNameStr) || PinNameStr.IsEmpty())
 			{
-				OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					FString::Printf(TEXT("%s[%d] missing 'name'"), FieldName, i));
 				return false;
 			}
 			const TSharedPtr<FJsonObject>* PinTypeObjPtr = nullptr;
 			if (!Item->TryGetObjectField(TEXT("pin_type"), PinTypeObjPtr) || !PinTypeObjPtr || !PinTypeObjPtr->IsValid())
 			{
-				OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					FString::Printf(TEXT("%s[%d] missing 'pin_type' object"), FieldName, i));
 				return false;
 			}
@@ -1799,7 +1755,7 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 			FString ErrMsg;
 			if (!FMCPPinTypeUtils::FromJson(*PinTypeObjPtr, Pin.Type, ErrCode, ErrMsg))
 			{
-				OutError = BP_MakeError(Request, ErrCode,
+				OutError = FMCPToolHelpers::MakeError(Request, ErrCode,
 					FString::Printf(TEXT("%s[%d]: %s"), FieldName, i, *ErrMsg));
 				return false;
 			}
@@ -1812,14 +1768,12 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 	if (!ParseSignatureArray(TEXT("inputs"), Inputs, SignatureErr))   { return SignatureErr; }
 	if (!ParseSignatureArray(TEXT("outputs"), Outputs, SignatureErr)) { return SignatureErr; }
 
-	const FScopedTransaction Transaction(LOCTEXT("BPAddFunction", "MCP: add blueprint function"));
-
 	// Create the empty function graph. UEdGraphSchema_K2 is the schema for K2 (Blueprint) graphs.
 	UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
 		Blueprint, FnName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
 	if (!NewGraph)
 	{
-		return BP_MakeError(Request, -32603,
+		return FMCPToolHelpers::MakeError(Request, kBPErrorInternal,
 			FString::Printf(TEXT("CreateNewGraph returned null for function '%s'"), *FnNameStr));
 	}
 
@@ -1838,7 +1792,7 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 	{
 		// AddFunctionGraph guarantees an entry node — if missing the BP is corrupt; surface.
 		FBlueprintEditorUtils::RemoveGraph(Blueprint, NewGraph, EGraphRemoveFlags::Recompile);
-		return BP_MakeError(Request, -32603,
+		return FMCPToolHelpers::MakeError(Request, kBPErrorInternal,
 			TEXT("AddFunctionGraph did not produce a UK2Node_FunctionEntry; aborted (graph rolled back)"));
 	}
 
@@ -1890,7 +1844,7 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("added"), true);
 	Out->SetStringField(TEXT("function_name"), FnNameStr);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.remove_function (Lane A, PIE-guarded, idempotent) ────────────────────────────────────
@@ -1907,7 +1861,8 @@ FMCPResponse Tool_RemoveFunction(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPRemoveFunction", "MCP: remove blueprint function"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1916,7 +1871,7 @@ FMCPResponse Tool_RemoveFunction(const FMCPRequest& Request)
 	FString FnNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("function_name"), FnNameStr) || FnNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
 	}
 
@@ -1932,15 +1887,15 @@ FMCPResponse Tool_RemoveFunction(const FMCPRequest& Request)
 	{
 		Out->SetBoolField(TEXT("removed"), false);
 		Out->SetBoolField(TEXT("was_present"), false);
-		return BP_MakeSuccessObj(Request, Out);
+		Scope.Abort();
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("BPRemoveFunction", "MCP: remove blueprint function"));
 	FBlueprintEditorUtils::RemoveGraph(Blueprint, Graph, EGraphRemoveFlags::Recompile);
 
 	Out->SetBoolField(TEXT("removed"), true);
 	Out->SetBoolField(TEXT("was_present"), true);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.reparent (Lane A, PIE-guarded, EXPERIMENTAL, confirm_dangerous-gated) ────────────────
@@ -1969,7 +1924,8 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPReparent", "MCP: reparent blueprint"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1978,7 +1934,7 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 	FString NewParentPath;
 	if (!Request.Args->TryGetStringField(TEXT("new_parent_class_path"), NewParentPath) || NewParentPath.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'new_parent_class_path'"));
 	}
 
@@ -1988,7 +1944,7 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 	const bool bHasConfirm = Request.Args->TryGetBoolField(TEXT("confirm_dangerous"), bConfirmDangerous);
 	if (!bHasConfirm || !bConfirmDangerous)
 	{
-		return BP_MakeError(Request, kMCPErrorReparentUnsafe,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorReparentUnsafe,
 			TEXT("bp.reparent requires args.confirm_dangerous=true; this operation may invalidate "
 				 "variables/functions inherited from prior parent class; see failure_modes"));
 	}
@@ -2008,7 +1964,7 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 	if (OldParentClass && OldParentClass->IsChildOf(AActor::StaticClass())
 		&& !NewParentClass->IsChildOf(AActor::StaticClass()))
 	{
-		return BP_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(
 				TEXT("blueprint's current parent '%s' is an AActor subclass; cannot reparent to non-AActor class '%s'"),
 				*OldParentClass->GetPathName(), *NewParentClass->GetPathName()));
@@ -2023,7 +1979,8 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 		NoOpOut->SetStringField(TEXT("prior_parent"), OldParentClass->GetPathName());
 		NoOpOut->SetArrayField(TEXT("lost_variables"), TArray<TSharedPtr<FJsonValue>>());
 		NoOpOut->SetArrayField(TEXT("lost_functions"), TArray<TSharedPtr<FJsonValue>>());
-		return BP_MakeSuccessObj(Request, NoOpOut);
+		Scope.Abort();
+		return FMCPToolHelpers::MakeSuccessObj(Request, NoOpOut);
 	}
 
 	// Diff variables / functions that the OLD parent declared but the NEW parent does NOT.
@@ -2039,8 +1996,7 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 
 	// Perform reparent — mirror UBlueprintEditorLibrary::ReparentBlueprint's body to avoid a hard
 	// dep on the BlueprintEditorLibrary module. Same compile options it uses for the post-reparent
-	// compile pass.
-	const FScopedTransaction Transaction(LOCTEXT("BPReparent", "MCP: reparent blueprint"));
+	// compile pass. Scope (declared at function entry) owns the transaction.
 	Blueprint->Modify();
 
 	Blueprint->ParentClass = NewParentClass;
@@ -2076,7 +2032,7 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("prior_parent"), OldParentName);
 	Out->SetArrayField(TEXT("lost_variables"), BP_StringSetToJsonArray(LostVars));
 	Out->SetArrayField(TEXT("lost_functions"), BP_StringSetToJsonArray(LostFuncs));
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.compile (Lane A sync, PIE-guarded) ────────────────────────────────────────────────────
@@ -2101,7 +2057,8 @@ FMCPResponse Tool_Compile(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPCompile", "MCP: compile blueprint"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -2155,7 +2112,7 @@ FMCPResponse Tool_Compile(const FMCPRequest& Request)
 
 	if (bFailOnError && !bCompiled)
 	{
-		FMCPResponse Err = BP_MakeError(Request, kMCPErrorKismetCompilationError,
+		FMCPResponse Err = FMCPToolHelpers::MakeError(Request, kMCPErrorKismetCompilationError,
 			FString::Printf(
 				TEXT("blueprint '%s' failed strict compile: %d errors, %d warnings (status=%s)"),
 				*Path, Errors.Num(), Warnings.Num(), StatusStr));
@@ -2165,7 +2122,7 @@ FMCPResponse Tool_Compile(const FMCPRequest& Request)
 		return Err;
 	}
 
-	return BP_MakeSuccessObj(Request, ResultObj);
+	return FMCPToolHelpers::MakeSuccessObj(Request, ResultObj);
 }
 
 // ─── bp.create_blueprint — create new UBlueprint asset with specified parent class ──────────
@@ -2197,26 +2154,24 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (GEditor && GEditor->PlayWorld != nullptr)
-	{
-		return BP_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPCreateBlueprint", "MCP: create blueprint"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("bp.create_blueprint requires args.parent_class_path + args.dest_path"));
 	}
 
 	FString ParentClassPath, DestPathRaw;
 	if (!Request.Args->TryGetStringField(TEXT("parent_class_path"), ParentClassPath) || ParentClassPath.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'parent_class_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'dest_path'"));
 	}
 
@@ -2229,7 +2184,7 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 	}
 	if (!ParentClass)
 	{
-		return BP_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ParentClassPath));
 	}
 	if (ParentClass->HasAnyClassFlags(CLASS_Abstract))
@@ -2242,12 +2197,12 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
 	if (DestPathNorm.IsEmpty())
 	{
-		return BP_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed path"), *DestPathRaw));
 	}
 	if (FPackageName::DoesPackageExist(DestPathNorm))
 	{
-		return BP_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
 	}
 
@@ -2262,15 +2217,15 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, UBlueprint::StaticClass(), Factory);
 	if (!NewAsset)
 	{
-		return BP_MakeError(Request, kBPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kBPErrorInternal,
 			FString::Printf(TEXT("UBlueprintFactory failed to create BP from parent '%s' at '%s'"),
 				*ParentClass->GetPathName(), *DestPathNorm));
 	}
 
 	UBlueprint* NewBP = Cast<UBlueprint>(NewAsset);
-	if (NewBP && NewBP->GetOutermost())
+	if (NewBP)
 	{
-		NewBP->GetOutermost()->MarkPackageDirty();
+		Scope.DirtyPackage(NewBP->GetOutermost());
 	}
 
 	bool bSaveRequested = false, bSavedOk = false;
@@ -2283,14 +2238,14 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("created"), true);
 	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
 	Out->SetStringField(TEXT("generated_class"),
 		NewBP && NewBP->GeneratedClass ? NewBP->GeneratedClass->GetPathName() : FString());
 	Out->SetStringField(TEXT("parent_class"), ParentClass->GetPathName());
 	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.add_function_parameter (Lane A, PIE-guarded) ─────────────────────────────────────────
@@ -2320,7 +2275,8 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPAddFunctionParameter", "MCP: add function parameter"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path, FnNameStr;
 	UBlueprint* Blueprint = nullptr;
@@ -2336,7 +2292,7 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 	FString ParamNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("param_name"), ParamNameStr) || ParamNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'param_name'"));
 	}
 
@@ -2356,7 +2312,6 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 	Request.Args->TryGetStringField(TEXT("default_value"), DefaultValue);
 
 	const FName ParamName(*ParamNameStr);
-	const FScopedTransaction Transaction(LOCTEXT("BPAddFunctionParameter", "MCP: add function parameter"));
 
 	// Resolve the owning terminator (Entry for inputs, Result for outputs). For outputs we lazily
 	// create the result node if it doesn't yet exist on the function graph.
@@ -2375,7 +2330,7 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 	}
 	if (!Owner)
 	{
-		return BP_MakeError(Request, kBPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kBPErrorInternal,
 			TEXT("could not resolve or create function terminator for parameter add"));
 	}
 
@@ -2395,7 +2350,7 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 
 	if (UserDefinedPinExistsInline(Owner, ParamName))
 	{
-		return BP_MakeError(Request, kMCPErrorFunctionParameterDuplicate,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorFunctionParameterDuplicate,
 			FString::Printf(
 				TEXT("parameter '%s' already exists on %s of function '%s' on blueprint '%s'"),
 				*ParamNameStr,
@@ -2408,7 +2363,7 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 	UEdGraphPin* CreatedPin = Owner->CreateUserDefinedPin(ParamName, PinType, TerminatorPinDir, /*bUseUniqueName*/ false);
 	if (!CreatedPin)
 	{
-		return BP_MakeError(Request, kBPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kBPErrorInternal,
 			FString::Printf(
 				TEXT("CreateUserDefinedPin returned null for '%s' on function '%s' "
 					 "(terminator rejected the pin type via CanCreateUserDefinedPin)"),
@@ -2441,7 +2396,7 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("added"), true);
 	Out->SetStringField(TEXT("param_name"), ParamNameStr);
 	Out->SetStringField(TEXT("direction"), bIsInputDir ? TEXT("input") : TEXT("output"));
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.remove_function_parameter (Lane A, PIE-guarded, idempotent on terminator side) ───────
@@ -2464,7 +2419,8 @@ FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPRemoveFunctionParameter", "MCP: remove function parameter"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path, FnNameStr;
 	UBlueprint* Blueprint = nullptr;
@@ -2480,7 +2436,7 @@ FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
 	FString ParamNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("param_name"), ParamNameStr) || ParamNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'param_name'"));
 	}
 
@@ -2515,10 +2471,10 @@ FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
 	{
 		Out->SetBoolField(TEXT("removed"), false);
 		Out->SetField(TEXT("direction"), MakeShared<FJsonValueNull>());
-		return BP_MakeSuccessObj(Request, Out);
+		Scope.Abort();
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("BPRemoveFunctionParameter", "MCP: remove function parameter"));
 	Owner->Modify();
 	Owner->RemoveUserDefinedPinByName(ParamName);
 	Owner->ReconstructNode();
@@ -2528,7 +2484,7 @@ FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
 
 	Out->SetBoolField(TEXT("removed"), true);
 	Out->SetStringField(TEXT("direction"), bWasInputDir ? TEXT("input") : TEXT("output"));
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.list_function_parameters (Lane A, NO PIE guard — read) ───────────────────────────────
@@ -2587,7 +2543,7 @@ FMCPResponse Tool_ListFunctionParameters(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetField(TEXT("inputs"), InputsArr);
 	Out->SetField(TEXT("outputs"), OutputsArr);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.set_function_metadata (Lane A, PIE-guarded) ──────────────────────────────────────────
@@ -2627,7 +2583,8 @@ FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPSetFunctionMetadata", "MCP: set function metadata"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path, FnNameStr;
 	UBlueprint* Blueprint = nullptr;
@@ -2643,7 +2600,7 @@ FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
 	const TSharedPtr<FJsonObject>* MetadataObjPtr = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("metadata"), MetadataObjPtr) || !MetadataObjPtr || !MetadataObjPtr->IsValid())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required object field 'metadata'"));
 	}
 	const TSharedPtr<FJsonObject>& Metadata = *MetadataObjPtr;
@@ -2669,7 +2626,7 @@ FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
 			}
 			else
 			{
-				return BP_MakeError(Request, kBPErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					FString::Printf(
 						TEXT("metadata.access_specifier must be 'public'|'protected'|'private', got '%s'"),
 						*AccessStr));
@@ -2681,7 +2638,6 @@ FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
 	// Snapshot BEFORE we mutate.
 	TSharedPtr<FJsonObject> PriorSnap = BP_BuildFunctionMetadataSnapshot(Entry, Graph);
 
-	const FScopedTransaction Transaction(LOCTEXT("BPSetFunctionMetadata", "MCP: set function metadata"));
 	Entry->Modify();
 
 	// is_pure / is_const — written to Entry->ExtraFlags. SetExtraFlags strips FUNC_Native; we
@@ -2746,7 +2702,7 @@ FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetObjectField(TEXT("prior"), PriorSnap);
 	Out->SetObjectField(TEXT("new"), NewSnap);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Wave F Surface 4 — Blueprint interface implementation surface (3 tools) ─────────────────
@@ -2786,13 +2742,13 @@ namespace
 	{
 		if (!Request.Args.IsValid())
 		{
-			OutError = BP_MakeError(Request, kBPErrorInvalidParams, TEXT("missing args object"));
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 			return nullptr;
 		}
 		if (!Request.Args->TryGetStringField(TEXT("interface_class_path"), OutInterfaceClassPath)
 			|| OutInterfaceClassPath.IsEmpty())
 		{
-			OutError = BP_MakeError(Request, kBPErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				TEXT("missing required string field 'interface_class_path'"));
 			return nullptr;
 		}
@@ -2802,7 +2758,7 @@ namespace
 
 		if (!InterfaceClass->HasAnyClassFlags(CLASS_Interface))
 		{
-			OutError = BP_MakeError(Request, kMCPErrorWrongClass,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 				FString::Printf(
 					TEXT("interface_class_path '%s' resolves to UClass '%s' but it is not a UInterface "
 						 "(CLASS_Interface flag absent); pass a path to an interface class such as "
@@ -2845,7 +2801,8 @@ FMCPResponse Tool_AddInterface(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPAddInterface", "MCP: add blueprint interface"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -2866,20 +2823,18 @@ FMCPResponse Tool_AddInterface(const FMCPRequest& Request)
 	{
 		if (Desc.Interface == InterfaceClass)
 		{
-			return BP_MakeError(Request, kMCPErrorPathInUse,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 				FString::Printf(
 					TEXT("interface '%s' is already implemented on blueprint '%s'"),
 					*InterfaceClassPath, *Path));
 		}
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("BPAddInterface", "MCP: add blueprint interface"));
-
 	const FTopLevelAssetPath InterfacePath = InterfaceClass->GetClassPathName();
 	const bool bImplemented = FBlueprintEditorUtils::ImplementNewInterface(Blueprint, InterfacePath);
 	if (!bImplemented)
 	{
-		return BP_MakeError(Request, kBPErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kBPErrorInternal,
 			FString::Printf(
 				TEXT("FBlueprintEditorUtils::ImplementNewInterface returned false for '%s' on '%s' "
 					 "(interface may carry CannotImplementInterfaceInBlueprint meta, OR the BP's parent "
@@ -2910,7 +2865,7 @@ FMCPResponse Tool_AddInterface(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("added"), true);
 	Out->SetStringField(TEXT("interface_class"), InterfacePath.ToString());
 	Out->SetNumberField(TEXT("generated_event_count"), GeneratedEventCount);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.remove_interface (Lane A, PIE-guarded) ───────────────────────────────────────────────
@@ -2941,7 +2896,8 @@ FMCPResponse Tool_RemoveInterface(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPRemoveInterface", "MCP: remove blueprint interface"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -2966,13 +2922,11 @@ FMCPResponse Tool_RemoveInterface(const FMCPRequest& Request)
 	}
 	if (!bWasImplemented)
 	{
-		return BP_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("interface '%s' is not implemented on blueprint '%s'; nothing to remove"),
 				*InterfaceClassPath, *Path));
 	}
-
-	const FScopedTransaction Transaction(LOCTEXT("BPRemoveInterface", "MCP: remove blueprint interface"));
 
 	const FTopLevelAssetPath InterfacePath = InterfaceClass->GetClassPathName();
 	FBlueprintEditorUtils::RemoveInterface(Blueprint, InterfacePath, /*bPreserveFunctions*/ false);
@@ -2984,7 +2938,7 @@ FMCPResponse Tool_RemoveInterface(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("removed"), true);
 	Out->SetStringField(TEXT("interface_class"), InterfacePath.ToString());
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.list_interfaces (Lane A, read — no PIE guard) ────────────────────────────────────────
@@ -3057,7 +3011,7 @@ FMCPResponse Tool_ListInterfaces(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("implemented_interfaces"), Items);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Wave F Surface 5 — Blueprint variable metadata + category enumeration (2 tools) ─────────
@@ -3196,7 +3150,8 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (BP_IsPIEActive()) { return BP_MakePIEError(Request); }
+	FMCPMutatorScope Scope(Request, LOCTEXT("BPSetVariableMetadata", "MCP: set variable metadata"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -3205,14 +3160,14 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 	FString VarNameStr;
 	if (!Request.Args->TryGetStringField(TEXT("variable_name"), VarNameStr) || VarNameStr.IsEmpty())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
 
 	const TSharedPtr<FJsonObject>* MetadataObjPtr = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("metadata"), MetadataObjPtr) || !MetadataObjPtr || !MetadataObjPtr->IsValid())
 	{
-		return BP_MakeError(Request, kBPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required object field 'metadata'"));
 	}
 	const TSharedPtr<FJsonObject>& Metadata = *MetadataObjPtr;
@@ -3225,7 +3180,7 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 	const int32 Idx = FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName);
 	if (Idx == INDEX_NONE)
 	{
-		return BP_MakeError(Request, kMCPErrorVariableNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorVariableNotFound,
 			FString::Printf(TEXT("variable '%s' not found on blueprint '%s'"),
 				*VarNameStr, *Path));
 	}
@@ -3241,7 +3196,7 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 		else if (ReplicateStr.Equals(TEXT("rep_notify"), ESearchCase::IgnoreCase)) { ReplicateMode = EReplicateMode::RepNotify; }
 		else
 		{
-			return BP_MakeError(Request, kBPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(
 					TEXT("metadata.replicate must be 'none'|'replicated'|'rep_notify', got '%s'"),
 					*ReplicateStr));
@@ -3250,8 +3205,6 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 
 	// Snapshot prior BEFORE any mutation so the response carries the rollback state.
 	TSharedPtr<FJsonObject> PriorSnap = BP_BuildVariableMetadataSnapshot(Blueprint->NewVariables[Idx]);
-
-	const FScopedTransaction Transaction(LOCTEXT("BPSetVariableMetadata", "MCP: set variable metadata"));
 
 	// ─── Category (uses canonical helper which also handles recompile flag) ──────────────────
 	FString CategoryStr;
@@ -3426,7 +3379,7 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetObjectField(TEXT("prior"), PriorSnap);
 	Out->SetObjectField(TEXT("new"), NewSnap);
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── bp.list_categories (Lane A, no PIE guard, READ) ─────────────────────────────────────────
@@ -3482,7 +3435,7 @@ FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("categories"), BP_StringSetToJsonArray(Categories));
-	return BP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

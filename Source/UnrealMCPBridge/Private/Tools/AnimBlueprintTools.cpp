@@ -3,10 +3,11 @@
 #include "AnimBlueprintTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
-#include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPBlueprintUtils.h"
-#include "Utils/MCPWorldContext.h"
 
 #include "AnimationGraph.h"
 #include "AnimationGraphSchema.h"
@@ -26,7 +27,6 @@
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraph/EdGraphSchema.h"
 #include "Kismet2/BlueprintEditorUtils.h"
-#include "ScopedTransaction.h"
 #include "UObject/Package.h"
 
 #include "Dom/JsonObject.h"
@@ -36,7 +36,11 @@
 
 namespace
 {
-	// ABP_ prefix per the unity-build symbol-collision convention.
+	// ABP_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d). UAnimSequence loader migrated to
+	// FMCPAssetLoader::Load<T>; UAnimBlueprint loader stays here because it layers a typed
+	// class-narrow on top of FMCPBlueprintUtils::LoadBlueprintByPath.
 	constexpr int32 kABPErrorInvalidParams   = -32602;
 	constexpr int32 kABPErrorInternal        = -32603;
 	constexpr int32 kABPErrorObjectNotFound  = kMCPErrorObjectNotFound;       // -32004
@@ -45,48 +49,6 @@ namespace
 	constexpr int32 kABPErrorPathInUse       = kMCPErrorPathInUse;            // -32014
 	constexpr int32 kABPErrorPIEActive       = kMCPErrorPIEActive;            // -32027
 	constexpr int32 kABPErrorBlueprintTypeMismatch = kMCPErrorBlueprintTypeMismatch; // -32031
-
-	void ABP_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse ABP_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		ABP_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse ABP_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		ABP_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool ABP_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = ABP_MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = ABP_MakeError(Request, kABPErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
 
 	// ─── UAnimBlueprint load + class-narrow ─────────────────────────────────────────────────────────
 
@@ -209,49 +171,6 @@ namespace
 			if (Cast<const UAnimStateNode>(Node)) { ++Count; }
 		}
 		return Count;
-	}
-
-	/** Load a UAnimSequence by path. Mirrors AnimTools' loader but kept local to this surface. */
-	UAnimSequence* ABP_LoadAnimSequenceByPath(const FString& Path, int32& OutErrorCode, FString& OutErrorMsg)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kABPErrorInvalidPath;
-			OutErrorMsg = TEXT("anim_sequence_path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kABPErrorInvalidPath;
-			OutErrorMsg = FString::Printf(TEXT("anim_sequence_path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kABPErrorObjectNotFound;
-			OutErrorMsg = FString::Printf(TEXT("anim_sequence_path '%s' not loadable"), *Path);
-			return nullptr;
-		}
-		UAnimSequence* Seq = Cast<UAnimSequence>(Loaded);
-		if (!Seq)
-		{
-			OutErrorCode = kABPErrorWrongClass;
-			OutErrorMsg = FString::Printf(
-				TEXT("'%s' is class '%s'; expected UAnimSequence"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return Seq;
 	}
 
 	// ─── Inner-graph sequence player wiring (for add_state) ────────────────────────────────────────
@@ -427,13 +346,13 @@ FMCPResponse Tool_ListStateMachines(const FMCPRequest& Request)
 	// 3 tools in this surface for symmetry).
 	if (!Request.Args.IsValid())
 	{
-		return ABP_MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("anim_blueprint_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 	{
 		if (!Request.Args->TryGetStringField(TEXT("anim_bp_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 		{
-			return ABP_MakeError(Request, kABPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams,
 				TEXT("missing required string field 'anim_blueprint_path' (or 'anim_bp_path')"));
 		}
 	}
@@ -441,7 +360,7 @@ FMCPResponse Tool_ListStateMachines(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UAnimBlueprint* ABP = ABP_LoadAnimBlueprintByPath(AnimBPPath, LoadErrCode, LoadErrMsg);
-	if (!ABP) { return ABP_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!ABP) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	TArray<TSharedPtr<FJsonValue>> SMArr;
 	for (UEdGraph* Graph : ABP->FunctionGraphs)
@@ -468,7 +387,7 @@ FMCPResponse Tool_ListStateMachines(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("state_machines"), SMArr);
 	Out->SetStringField(TEXT("anim_blueprint_path"), ABP->GetPathName());
-	return ABP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── animbp.get_states ─────────────────────────────────────────────────────────────────────────
@@ -491,28 +410,28 @@ FMCPResponse Tool_GetStates(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!Request.Args.IsValid())
 	{
-		return ABP_MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("anim_bp_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 	{
 		// Tolerate ``anim_blueprint_path`` for symmetry with list_state_machines.
 		if (!Request.Args->TryGetStringField(TEXT("anim_blueprint_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 		{
-			return ABP_MakeError(Request, kABPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams,
 				TEXT("missing required string field 'anim_bp_path' (or 'anim_blueprint_path')"));
 		}
 	}
-	if (!ABP_RequireStringField(Request, TEXT("state_machine_name"), SMName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("state_machine_name"), SMName, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UAnimBlueprint* ABP = ABP_LoadAnimBlueprintByPath(AnimBPPath, LoadErrCode, LoadErrMsg);
-	if (!ABP) { return ABP_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!ABP) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UAnimGraphNode_StateMachine* SMNode = ABP_FindStateMachineNodeByName(ABP, SMName);
 	if (!SMNode || !SMNode->EditorStateMachineGraph)
 	{
-		return ABP_MakeError(Request, kABPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kABPErrorObjectNotFound,
 			FString::Printf(TEXT("state machine '%s' not found in anim blueprint '%s'"),
 				*SMName, *AnimBPPath));
 	}
@@ -531,7 +450,7 @@ FMCPResponse Tool_GetStates(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("states"), StatesArr);
 	Out->SetStringField(TEXT("state_machine_name"), SMName);
-	return ABP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── animbp.add_state ──────────────────────────────────────────────────────────────────────────
@@ -544,7 +463,7 @@ FMCPResponse Tool_GetStates(const FMCPRequest& Request)
 //   1. PIE guard.
 //   2. Resolve anim BP + state machine graph (-32004 / -32011 as appropriate).
 //   3. Verify state name uniqueness — -32014 PathInUse on collision (rejects engine's silent rename).
-//   4. FScopedTransaction begin + SMGraph->Modify().
+//   4. FMCPMutatorScope holds FScopedTransaction; SMGraph->Modify().
 //   5. NewObject<UAnimStateNode> + CreateNewGuid + place + PostPlacedNewNode + AllocateDefaultPins.
 //      PostPlacedNewNode creates the inner UAnimationStateGraph + auto-creates the State Result node.
 //   6. Rename the inner BoundGraph to match the requested state_name (since AnimStateNode::GetStateName
@@ -559,27 +478,25 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ABP_MakeError(Request, kABPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddAnimState", "Add Anim State"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString AnimBPPath, SMName, StateName;
 	FMCPResponse Err;
 	if (!Request.Args.IsValid())
 	{
-		return ABP_MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("anim_bp_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 	{
 		if (!Request.Args->TryGetStringField(TEXT("anim_blueprint_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 		{
-			return ABP_MakeError(Request, kABPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams,
 				TEXT("missing required string field 'anim_bp_path' (or 'anim_blueprint_path')"));
 		}
 	}
-	if (!ABP_RequireStringField(Request, TEXT("state_machine_name"), SMName,    Err)) { return Err; }
-	if (!ABP_RequireStringField(Request, TEXT("state_name"),         StateName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("state_machine_name"), SMName,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("state_name"),         StateName, Err)) { return Err; }
 
 	int32 PosX = 0, PosY = 0;
 	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
@@ -587,14 +504,14 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 	{
 		if (PositionArr->Num() != 2)
 		{
-			return ABP_MakeError(Request, kABPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams,
 				FString::Printf(TEXT("'position' must be [x, y] (2 numbers); got %d entries"),
 					PositionArr->Num()));
 		}
 		double X = 0.0, Y = 0.0;
 		if (!(*PositionArr)[0]->TryGetNumber(X) || !(*PositionArr)[1]->TryGetNumber(Y))
 		{
-			return ABP_MakeError(Request, kABPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams,
 				TEXT("'position' entries must be numbers"));
 		}
 		PosX = static_cast<int32>(X);
@@ -609,12 +526,12 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UAnimBlueprint* ABP = ABP_LoadAnimBlueprintByPath(AnimBPPath, LoadErrCode, LoadErrMsg);
-	if (!ABP) { return ABP_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!ABP) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UAnimGraphNode_StateMachine* SMNode = ABP_FindStateMachineNodeByName(ABP, SMName);
 	if (!SMNode || !SMNode->EditorStateMachineGraph)
 	{
-		return ABP_MakeError(Request, kABPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kABPErrorObjectNotFound,
 			FString::Printf(TEXT("state machine '%s' not found in anim blueprint '%s'"),
 				*SMName, *AnimBPPath));
 	}
@@ -623,7 +540,7 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 	// ─── State name uniqueness check (pre-mutation, no transaction overhead on bad input) ──────
 	if (ABP_FindStateNodeByName(SMGraph, StateName) != nullptr)
 	{
-		return ABP_MakeError(Request, kABPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kABPErrorPathInUse,
 			FString::Printf(TEXT("state '%s' already exists in state machine '%s'"),
 				*StateName, *SMName));
 	}
@@ -634,15 +551,14 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 	{
 		int32 SeqErrCode = 0;
 		FString SeqErrMsg;
-		SequenceAsset = ABP_LoadAnimSequenceByPath(SequencePath, SeqErrCode, SeqErrMsg);
+		SequenceAsset = FMCPAssetLoader::Load<UAnimSequence>(SequencePath, SeqErrCode, SeqErrMsg);
 		if (!SequenceAsset)
 		{
-			return ABP_MakeError(Request, SeqErrCode, SeqErrMsg);
+			return FMCPToolHelpers::MakeError(Request, SeqErrCode, SeqErrMsg);
 		}
 	}
 
-	// ─── Mutate graph under transaction ─────────────────────────────────────────────────────────
-	FScopedTransaction Transaction(LOCTEXT("MCP_AddAnimState", "Add Anim State"));
+	// ─── Mutate graph under transaction (held by FMCPMutatorScope) ──────────────────────────────
 	ABP->Modify();
 	SMGraph->Modify();
 
@@ -650,7 +566,8 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 		SMGraph, NAME_None, RF_Transactional);
 	if (!NewState)
 	{
-		return ABP_MakeError(Request, kABPErrorInternal,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInternal,
 			TEXT("NewObject<UAnimStateNode> returned null"));
 	}
 	NewState->NodePosX = PosX;
@@ -670,7 +587,8 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 
 	if (!NewState->BoundGraph)
 	{
-		return ABP_MakeError(Request, kABPErrorInternal,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInternal,
 			TEXT("PostPlacedNewNode did not create BoundGraph on UAnimStateNode"));
 	}
 
@@ -700,7 +618,7 @@ FMCPResponse Tool_AddState(const FMCPRequest& Request)
 			Out->SetStringField(TEXT("sequence_notice"), SequenceWireNotice);
 		}
 	}
-	return ABP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── animbp.add_transition ─────────────────────────────────────────────────────────────────────
@@ -725,32 +643,30 @@ FMCPResponse Tool_AddTransition(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ABP_MakeError(Request, kABPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddAnimStateTransition", "Add Anim State Transition"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString AnimBPPath, SMName, FromStateName, ToStateName;
 	FMCPResponse Err;
 	if (!Request.Args.IsValid())
 	{
-		return ABP_MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams, TEXT("missing args object"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("anim_bp_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 	{
 		if (!Request.Args->TryGetStringField(TEXT("anim_blueprint_path"), AnimBPPath) || AnimBPPath.IsEmpty())
 		{
-			return ABP_MakeError(Request, kABPErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams,
 				TEXT("missing required string field 'anim_bp_path' (or 'anim_blueprint_path')"));
 		}
 	}
-	if (!ABP_RequireStringField(Request, TEXT("state_machine_name"), SMName,        Err)) { return Err; }
-	if (!ABP_RequireStringField(Request, TEXT("from_state"),         FromStateName, Err)) { return Err; }
-	if (!ABP_RequireStringField(Request, TEXT("to_state"),           ToStateName,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("state_machine_name"), SMName,        Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("from_state"),         FromStateName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("to_state"),           ToStateName,   Err)) { return Err; }
 
 	if (FromStateName == ToStateName)
 	{
-		return ABP_MakeError(Request, kABPErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInvalidParams,
 			FString::Printf(TEXT("from_state == to_state ('%s'); self-transitions require the "
 				"engine's CreateSelfTransition path which is outside this surface"),
 				*FromStateName));
@@ -759,12 +675,12 @@ FMCPResponse Tool_AddTransition(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UAnimBlueprint* ABP = ABP_LoadAnimBlueprintByPath(AnimBPPath, LoadErrCode, LoadErrMsg);
-	if (!ABP) { return ABP_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!ABP) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UAnimGraphNode_StateMachine* SMNode = ABP_FindStateMachineNodeByName(ABP, SMName);
 	if (!SMNode || !SMNode->EditorStateMachineGraph)
 	{
-		return ABP_MakeError(Request, kABPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kABPErrorObjectNotFound,
 			FString::Printf(TEXT("state machine '%s' not found in anim blueprint '%s'"),
 				*SMName, *AnimBPPath));
 	}
@@ -773,20 +689,19 @@ FMCPResponse Tool_AddTransition(const FMCPRequest& Request)
 	UAnimStateNode* FromState = ABP_FindStateNodeByName(SMGraph, FromStateName);
 	if (!FromState)
 	{
-		return ABP_MakeError(Request, kABPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kABPErrorObjectNotFound,
 			FString::Printf(TEXT("from_state '%s' not found in state machine '%s'"),
 				*FromStateName, *SMName));
 	}
 	UAnimStateNode* ToState = ABP_FindStateNodeByName(SMGraph, ToStateName);
 	if (!ToState)
 	{
-		return ABP_MakeError(Request, kABPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kABPErrorObjectNotFound,
 			FString::Printf(TEXT("to_state '%s' not found in state machine '%s'"),
 				*ToStateName, *SMName));
 	}
 
-	// ─── Mutate graph under transaction ─────────────────────────────────────────────────────────
-	FScopedTransaction Transaction(LOCTEXT("MCP_AddAnimStateTransition", "Add Anim State Transition"));
+	// ─── Mutate graph under transaction (held by FMCPMutatorScope) ──────────────────────────────
 	ABP->Modify();
 	SMGraph->Modify();
 	FromState->Modify();
@@ -796,7 +711,8 @@ FMCPResponse Tool_AddTransition(const FMCPRequest& Request)
 		SMGraph, NAME_None, RF_Transactional);
 	if (!TransNode)
 	{
-		return ABP_MakeError(Request, kABPErrorInternal,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kABPErrorInternal,
 			TEXT("NewObject<UAnimStateTransitionNode> returned null"));
 	}
 
@@ -824,7 +740,7 @@ FMCPResponse Tool_AddTransition(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("from_state"), FromStateName);
 	Out->SetStringField(TEXT("to_state"),   ToStateName);
 	Out->SetArrayField(TEXT("position"), ABP_IntPointToJsonArray(TransNode->NodePosX, TransNode->NodePosY));
-	return ABP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

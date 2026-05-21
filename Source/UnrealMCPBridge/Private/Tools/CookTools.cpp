@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPathSandbox.h"
@@ -36,7 +37,11 @@
 
 namespace
 {
-	// COOK_ prefix per the unity-build symbol-collision convention.
+	// COOK_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d). All cook.* submitters are Lane A; cook.start's
+	// async body runs on a worker thread but never touches FMCPMutatorScope (no GEditor / no PIE-
+	// guard semantics for a separate-process cook subprocess).
 	constexpr int32 kCOOKErrorInvalidParams = -32602;
 	constexpr int32 kCOOKErrorInternal      = -32603;
 
@@ -55,31 +60,6 @@ namespace
 	// sub-second responsiveness for IsRunning/cancel polling. 500 ms balances cancel latency
 	// against CPU overhead from the wakeup loop.
 	constexpr double kCOOKPollIntervalSecs  = 0.5;
-
-	void COOK_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse COOK_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		COOK_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse COOK_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		COOK_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	/**
 	 * Resolve the TargetPlatformManager module. Returns nullptr + populates OutError when the
@@ -159,7 +139,7 @@ FMCPResponse Tool_CookListPlatforms(const FMCPRequest& Request)
 	ITargetPlatformManagerModule* TPM = COOK_GetTPM(TPMErr);
 	if (!TPM)
 	{
-		return COOK_MakeError(Request, kCOOKErrorInternal, TPMErr);
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInternal, TPMErr);
 	}
 
 	const TArray<ITargetPlatform*>& All    = TPM->GetTargetPlatforms();
@@ -202,7 +182,7 @@ FMCPResponse Tool_CookListPlatforms(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("platforms"), PlatformsArr);
 	Out->SetNumberField(TEXT("total"), PlatformsArr.Num());
 	Out->SetNumberField(TEXT("active_count"), Active.Num());
-	return COOK_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cook.validate_cookable ───────────────────────────────────────────────────────────────────
@@ -243,13 +223,13 @@ FMCPResponse Tool_CookValidateCookable(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return COOK_MakeError(Request, kCOOKErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString PlatformName;
 	if (!Request.Args->TryGetStringField(TEXT("platform_name"), PlatformName) || PlatformName.IsEmpty())
 	{
-		return COOK_MakeError(Request, kCOOKErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInvalidParams,
 			TEXT("missing required string field 'platform_name'"));
 	}
 
@@ -257,7 +237,7 @@ FMCPResponse Tool_CookValidateCookable(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("max_assets"), MaxAssets);
 	if (MaxAssets < 1 || MaxAssets > kCOOKMaxAssetsHardCap)
 	{
-		return COOK_MakeError(Request, kCOOKErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInvalidParams,
 			FString::Printf(TEXT("max_assets=%d out of range [1, %d]"),
 				MaxAssets, kCOOKMaxAssetsHardCap));
 	}
@@ -268,12 +248,12 @@ FMCPResponse Tool_CookValidateCookable(const FMCPRequest& Request)
 	ITargetPlatformManagerModule* TPM = COOK_GetTPM(TPMErr);
 	if (!TPM)
 	{
-		return COOK_MakeError(Request, kCOOKErrorInternal, TPMErr);
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInternal, TPMErr);
 	}
 	ITargetPlatform* Target = TPM->FindTargetPlatform(PlatformName);
 	if (!Target)
 	{
-		return COOK_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("target platform '%s' not registered (use cook.list_platforms "
 				"to enumerate valid names)"), *PlatformName));
 	}
@@ -293,14 +273,14 @@ FMCPResponse Tool_CookValidateCookable(const FMCPRequest& Request)
 		{
 			if (!V.IsValid() || V->Type != EJson::String)
 			{
-				return COOK_MakeError(Request, kCOOKErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kCOOKErrorInvalidParams,
 					TEXT("'asset_paths' entries must be strings"));
 			}
 			const FString Raw = V->AsString();
 			const FString Normalised = FMCPAssetPathUtils::Normalize(Raw);
 			if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
 			{
-				return COOK_MakeError(Request, kMCPErrorInvalidPath,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 					FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Raw));
 			}
 			PackagePaths.Add(Normalised);
@@ -426,7 +406,7 @@ FMCPResponse Tool_CookValidateCookable(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("total_known"), Assets.Num());
 	Out->SetBoolField(TEXT("max_assets_reached"), bMaxReached);
 	Out->SetArrayField(TEXT("errors"), ErrorsArr);
-	return COOK_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cook.start ──────────────────────────────────────────────────────────────────────────────
@@ -470,20 +450,20 @@ FMCPResponse Tool_CookStart(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return COOK_MakeError(Request, kCOOKErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString PlatformName;
 	if (!Request.Args->TryGetStringField(TEXT("platform_name"), PlatformName) || PlatformName.IsEmpty())
 	{
-		return COOK_MakeError(Request, kCOOKErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInvalidParams,
 			TEXT("missing required string field 'platform_name'"));
 	}
 
 	FString OutputDirRaw;
 	if (!Request.Args->TryGetStringField(TEXT("output_directory"), OutputDirRaw) || OutputDirRaw.IsEmpty())
 	{
-		return COOK_MakeError(Request, kCOOKErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInvalidParams,
 			TEXT("missing required string field 'output_directory'"));
 	}
 
@@ -496,7 +476,7 @@ FMCPResponse Tool_CookStart(const FMCPRequest& Request)
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(OutputDirRaw, OutputDirAbs, SandboxErr))
 	{
-		return COOK_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 
 	// Validate platform_name BEFORE submitting — we don't want a job_id for an obviously bad input.
@@ -505,12 +485,12 @@ FMCPResponse Tool_CookStart(const FMCPRequest& Request)
 	ITargetPlatformManagerModule* TPM = COOK_GetTPM(TPMErr);
 	if (!TPM)
 	{
-		return COOK_MakeError(Request, kCOOKErrorInternal, TPMErr);
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInternal, TPMErr);
 	}
 	ITargetPlatform* Target = TPM->FindTargetPlatform(PlatformName);
 	if (!Target)
 	{
-		return COOK_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("target platform '%s' not registered (use cook.list_platforms "
 				"to enumerate valid names)"), *PlatformName));
 	}
@@ -520,7 +500,7 @@ FMCPResponse Tool_CookStart(const FMCPRequest& Request)
 	const FString EditorExe = COOK_GetEditorCmdPath();
 	if (EditorExe.IsEmpty() || !IFileManager::Get().FileExists(*EditorExe))
 	{
-		return COOK_MakeError(Request, kCOOKErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInternal,
 			FString::Printf(TEXT("UnrealEditor-Cmd executable not found at expected path '%s'; "
 				"cook cannot launch"), *EditorExe));
 	}
@@ -530,7 +510,7 @@ FMCPResponse Tool_CookStart(const FMCPRequest& Request)
 	const FString ProjectFilePath = FPaths::GetProjectFilePath();
 	if (ProjectFilePath.IsEmpty())
 	{
-		return COOK_MakeError(Request, kCOOKErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCOOKErrorInternal,
 			TEXT("FPaths::GetProjectFilePath() is empty — cannot determine .uproject for cook"));
 	}
 
@@ -680,15 +660,15 @@ FMCPResponse Tool_CookStart(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return COOK_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
 	Out->SetNumberField(TEXT("started_at"), SubmittedAt);
 	Out->SetStringField(TEXT("command_line"), CookCommandLine);
-	return COOK_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

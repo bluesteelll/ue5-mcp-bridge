@@ -3,6 +3,9 @@
 #include "TextureTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
@@ -20,7 +23,6 @@
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "PixelFormat.h"
-#include "ScopedTransaction.h"
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
@@ -35,92 +37,7 @@ namespace
 {
 	// TEX_ prefix per unity-build symbol-collision convention (MakeError/MakeSuccess shapes recur
 	// across sibling tool TUs in the unity build — keep prefixes per surface).
-	constexpr int32 kTEXErrorInvalidParams = -32602;
-	constexpr int32 kTEXErrorInternal      = -32603;
-
-	void TEX_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse TEX_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		TEX_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse TEX_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		TEX_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool TEX_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = TEX_MakeError(Request, kTEXErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = TEX_MakeError(Request, kTEXErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	/** Load a UTexture2D by path. Mirror of MSH_LoadMeshByPath. */
-	UTexture2D* TEX_LoadTextureByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("'%s' not loadable"), *Path);
-			return nullptr;
-		}
-		UTexture2D* Tex = Cast<UTexture2D>(Loaded);
-		if (!Tex)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(TEXT("'%s' is class '%s'; expected UTexture2D"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return Tex;
-	}
+	constexpr int32 kTEXErrorInternal = -32603;
 
 	/**
 	 * String → TextureCompressionSettings. Whitelist mirrors the brief's enum table. Returns
@@ -251,12 +168,12 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return TEX_MakeError(Request, kTEXErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return TEX_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 		}
 		while (StartIdx < Assets.Num() &&
@@ -291,7 +208,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return TEX_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── texture.get_info ─────────────────────────────────────────────────────────────────────────
@@ -310,12 +227,12 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 
 	FString TexPath;
 	FMCPResponse Err;
-	if (!TEX_RequireStringField(Request, TEXT("texture_path"), TexPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("texture_path"), TexPath, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UTexture2D* Tex = TEX_LoadTextureByPath(TexPath, LoadErrCode, LoadErrMsg);
-	if (!Tex) { return TEX_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UTexture2D* Tex = FMCPAssetLoader::Load<UTexture2D>(TexPath, LoadErrCode, LoadErrMsg);
+	if (!Tex) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("asset_path"), Tex->GetPathName());
@@ -339,7 +256,7 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("address_x"),    TEX_AddressToString(Tex->GetTextureAddressX()));
 	Out->SetStringField(TEXT("address_y"),    TEX_AddressToString(Tex->GetTextureAddressY()));
 
-	return TEX_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── texture.set_compression ──────────────────────────────────────────────────────────────────
@@ -356,20 +273,18 @@ FMCPResponse Tool_SetCompression(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return TEX_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_Texture_SetCompression", "Set Texture Compression"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString TexPath, CompStr;
 	FMCPResponse Err;
-	if (!TEX_RequireStringField(Request, TEXT("texture_path"),         TexPath, Err)) { return Err; }
-	if (!TEX_RequireStringField(Request, TEXT("compression_settings"), CompStr, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("texture_path"),         TexPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("compression_settings"), CompStr, Err)) { return Err; }
 
 	const TextureCompressionSettings NewComp = TEX_ParseCompression(CompStr);
 	if (NewComp == TC_MAX)
 	{
-		return TEX_MakeError(Request, kTEXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("compression_settings '%s' unrecognised; valid: TC_Default, "
 				"TC_Normalmap, TC_Masks, TC_Grayscale, TC_HDR, TC_Alpha, TC_BC7, TC_HalfFloat, "
 				"TC_LQ, TC_VectorDisplacementmap, TC_DistanceFieldFont"), *CompStr));
@@ -380,12 +295,11 @@ FMCPResponse Tool_SetCompression(const FMCPRequest& Request)
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UTexture2D* Tex = TEX_LoadTextureByPath(TexPath, LoadErrCode, LoadErrMsg);
-	if (!Tex) { return TEX_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UTexture2D* Tex = FMCPAssetLoader::Load<UTexture2D>(TexPath, LoadErrCode, LoadErrMsg);
+	if (!Tex) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const TextureCompressionSettings PriorComp = Tex->CompressionSettings;
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_Texture_SetCompression", "Set Texture Compression"));
 	Tex->Modify();
 	Tex->CompressionSettings = NewComp;
 	if (bUpdateResource)
@@ -397,14 +311,14 @@ FMCPResponse Tool_SetCompression(const FMCPRequest& Request)
 		Tex->UpdateResource();
 	}
 
-	if (UPackage* Pkg = Tex->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Tex->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("asset_path"),            Tex->GetPathName());
 	Out->SetStringField(TEXT("prior_compression"),     TEX_CompressionToString(PriorComp));
 	Out->SetStringField(TEXT("new_compression"),       TEX_CompressionToString(NewComp));
 	Out->SetBoolField  (TEXT("update_resource_called"), bUpdateResource);
-	return TEX_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── texture.generate_solid_color ─────────────────────────────────────────────────────────────
@@ -429,20 +343,18 @@ FMCPResponse Tool_GenerateSolidColor(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return TEX_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_Texture_GenerateSolid", "Generate Solid-Color Texture"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString DestRaw;
 	FMCPResponse Err;
-	if (!TEX_RequireStringField(Request, TEXT("dest_path"), DestRaw, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("dest_path"), DestRaw, Err)) { return Err; }
 
 	const TArray<TSharedPtr<FJsonValue>>* ColorArr = nullptr;
 	if (!Request.Args.IsValid() ||
 	    !Request.Args->TryGetArrayField(TEXT("color"), ColorArr) || !ColorArr || ColorArr->Num() != 4)
 	{
-		return TEX_MakeError(Request, kTEXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("texture.generate_solid_color requires args.color = [r, g, b, a] (4 floats in [0,1])"));
 	}
 	auto ClampFloat = [](double V) -> uint8
@@ -459,14 +371,14 @@ FMCPResponse Tool_GenerateSolidColor(const FMCPRequest& Request)
 	if (Request.Args.IsValid()) { Request.Args->TryGetNumberField(TEXT("size"), Size); }
 	if (Size < 1 || Size > 1024)
 	{
-		return TEX_MakeError(Request, kTEXErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("size %d out of range; must be in [1, 1024]"), Size));
 	}
 
 	const FString DestNorm = FMCPAssetPathUtils::Normalize(DestRaw);
 	if (DestNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestNorm))
 	{
-		return TEX_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' malformed or unknown mount"), *DestRaw));
 	}
 	const FString PackagePath = FPaths::GetPath(DestNorm);
@@ -478,7 +390,7 @@ FMCPResponse Tool_GenerateSolidColor(const FMCPRequest& Request)
 	if (FPackageName::DoesPackageExist(DestNorm) ||
 	    FindObject<UObject>(nullptr, *(DestNorm + TEXT(".") + AssetName)) != nullptr)
 	{
-		return TEX_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists (on disk or in-memory)"), *DestNorm));
 	}
 
@@ -486,7 +398,7 @@ FMCPResponse Tool_GenerateSolidColor(const FMCPRequest& Request)
 	UPackage* DestPkg = CreatePackage(*PackageName);
 	if (!DestPkg)
 	{
-		return TEX_MakeError(Request, kTEXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kTEXErrorInternal,
 			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *PackageName));
 	}
 	DestPkg->FullyLoad();
@@ -497,7 +409,7 @@ FMCPResponse Tool_GenerateSolidColor(const FMCPRequest& Request)
 		DestPkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
 	if (!NewTex)
 	{
-		return TEX_MakeError(Request, kTEXErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kTEXErrorInternal,
 			FString::Printf(TEXT("UTexture2D NewObject returned null for '%s'"), *DestNorm));
 	}
 
@@ -542,7 +454,7 @@ FMCPResponse Tool_GenerateSolidColor(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("asset_path"), NewTex->GetPathName());
 	Out->SetBoolField  (TEXT("saved"),      bSavedOk);
 	Out->SetNumberField(TEXT("size"),       Size);
-	return TEX_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

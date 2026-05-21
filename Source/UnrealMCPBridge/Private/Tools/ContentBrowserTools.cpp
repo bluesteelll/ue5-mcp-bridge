@@ -4,6 +4,8 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPathSandbox.h"
@@ -42,34 +44,9 @@
 
 namespace
 {
-	// CB_ prefix per the unity-build symbol-collision pattern.
-	constexpr int32 kCBErrorInvalidParams = -32602;
-	constexpr int32 kCBErrorInternal      = -32603;
-
-	void CB_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse CB_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		CB_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse CB_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		CB_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	// CB_ prefix retained for any helper unique to this surface.
+	constexpr int32 kCBErrorInvalidParams = kMCPErrorInvalidParams;
+	constexpr int32 kCBErrorInternal      = kMCPErrorInternal;
 
 	/**
 	 * Resolve a path arg with INVALID_PATH on malformed. Mirrors AR_RequirePath but lives here
@@ -78,22 +55,15 @@ namespace
 	bool CB_RequirePath(const FMCPRequest& Request, const TCHAR* FieldName,
 		FString& OutNormalized, FMCPResponse& OutError)
 	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = CB_MakeError(Request, kCBErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
 		FString Raw;
-		if (!Request.Args->TryGetStringField(FieldName, Raw) || Raw.IsEmpty())
+		if (!FMCPToolHelpers::RequireStringField(Request, FieldName, Raw, OutError))
 		{
-			OutError = CB_MakeError(Request, kCBErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
 			return false;
 		}
 		const FString Normalized = FMCPAssetPathUtils::Normalize(Raw);
 		if (Normalized.IsEmpty())
 		{
-			OutError = CB_MakeError(Request, kMCPErrorInvalidPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(TEXT("invalid path '%s' on field '%s'"), *Raw, FieldName));
 			return false;
 		}
@@ -181,7 +151,7 @@ FMCPResponse Tool_CreateFolder(const FMCPRequest& Request)
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
 	{
-		return CB_MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
 	}
 
 	// Idempotent: if the directory already exists we return created=false (not an error).
@@ -198,16 +168,16 @@ FMCPResponse Tool_CreateFolder(const FMCPRequest& Request)
 			// Disk-write failure (permissions / disk-full / parent path doesn't exist for
 			// non-recursive creates). We've already issued the transaction; nothing rolled back
 			// since no asset was modified.
-			return CB_MakeError(Request, -32000,
+			return FMCPToolHelpers::MakeError(Request, -32000,
 				FString::Printf(TEXT("MakeDirectory failed for '%s' (permissions or disk-full?)"),
 					*NormalizedPath));
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("created"), bCreated);
 	Out->SetStringField(TEXT("normalized_path"), NormalizedPath);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.rename ───────────────────────────────────────────────────────────────────────────────
@@ -221,17 +191,17 @@ FMCPResponse Tool_Rename(const FMCPRequest& Request)
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
 	{
-		return CB_MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
 	}
 
 	if (!Subsys->DoesAssetExist(OldNormalized))
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("source asset '%s' does not exist"), *OldNormalized));
 	}
 	if (Subsys->DoesAssetExist(NewNormalized))
 	{
-		return CB_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("destination '%s' already exists"), *NewNormalized));
 	}
 
@@ -244,17 +214,17 @@ FMCPResponse Tool_Rename(const FMCPRequest& Request)
 			// EditorAssetSubsystem returned false — could be SC reject, readonly file, or a
 			// race where the asset got modified by another tool. Transaction auto-rollbacks
 			// when bSuccess=false (no Modify() call landed).
-			return CB_MakeError(Request, -32000,
+			return FMCPToolHelpers::MakeError(Request, -32000,
 				FString::Printf(TEXT("RenameAsset returned false for '%s' -> '%s' "
 					"(SC reject / readonly file / cross-cook collision?)"),
 					*OldNormalized, *NewNormalized));
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("success"), true);
 	Out->SetStringField(TEXT("canonical_new_path"), NewNormalized);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.save ─────────────────────────────────────────────────────────────────────────────────
@@ -270,21 +240,21 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
 	{
-		return CB_MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
 	}
 
 	if (!Subsys->DoesAssetExist(NormalizedPath))
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("asset '%s' does not exist"), *NormalizedPath));
 	}
 
 	// Saves don't participate in undo, so no FScopedTransaction.
 	const bool bSaved = Subsys->SaveAsset(NormalizedPath, bOnlyIfDirty);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("saved"), bSaved);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.move ─────────────────────────────────────────────────────────────────────────────────
@@ -292,7 +262,7 @@ FMCPResponse Tool_Move(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// source_paths: required, non-empty array.
@@ -300,7 +270,7 @@ FMCPResponse Tool_Move(const FMCPRequest& Request)
 	if (!Request.Args->TryGetArrayField(TEXT("source_paths"), SourcesPtr)
 		|| SourcesPtr == nullptr || SourcesPtr->Num() == 0)
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 			TEXT("missing or empty required array field 'source_paths'"));
 	}
 
@@ -308,27 +278,27 @@ FMCPResponse Tool_Move(const FMCPRequest& Request)
 	FString DestFolderRaw;
 	if (!Request.Args->TryGetStringField(TEXT("dest_folder"), DestFolderRaw) || DestFolderRaw.IsEmpty())
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 			TEXT("missing required string field 'dest_folder'"));
 	}
 	const FString DestFolder = FMCPAssetPathUtils::Normalize(DestFolderRaw);
 	if (DestFolder.IsEmpty())
 	{
-		return CB_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("invalid dest_folder '%s'"), *DestFolderRaw));
 	}
 
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
 	{
-		return CB_MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
 	}
 
 	if (!Subsys->DoesDirectoryExist(DestFolder))
 	{
 		// FOLDER_NOT_FOUND is not a distinct code in MCPTypes — surface as ObjectNotFound for
 		// consistency with rename/delete (the destination concept is "the folder asset").
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("destination folder '%s' does not exist — call cb.create_folder first"),
 				*DestFolder));
 	}
@@ -342,13 +312,13 @@ FMCPResponse Tool_Move(const FMCPRequest& Request)
 		FString S;
 		if (!V.IsValid() || !V->TryGetString(S))
 		{
-			return CB_MakeError(Request, kCBErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 				TEXT("source_paths: expected array of strings"));
 		}
 		const FString Norm = FMCPAssetPathUtils::Normalize(S);
 		if (Norm.IsEmpty())
 		{
-			return CB_MakeError(Request, kMCPErrorInvalidPath,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(TEXT("source_paths entry '%s' is malformed"), *S));
 		}
 		NormalizedSources.Add(Norm);
@@ -402,10 +372,10 @@ FMCPResponse Tool_Move(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("moved"), Moved);
 	Out->SetArrayField(TEXT("failed"), Failed);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.duplicate ────────────────────────────────────────────────────────────────────────────
@@ -419,17 +389,17 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
 	{
-		return CB_MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
 	}
 
 	if (!Subsys->DoesAssetExist(Src))
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("source asset '%s' does not exist"), *Src));
 	}
 	if (Subsys->DoesAssetExist(Dest))
 	{
-		return CB_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("destination '%s' already exists"), *Dest));
 	}
 
@@ -439,15 +409,15 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 		NewObj = Subsys->DuplicateAsset(Src, Dest);
 		if (NewObj == nullptr)
 		{
-			return CB_MakeError(Request, -32000,
+			return FMCPToolHelpers::MakeError(Request, -32000,
 				FString::Printf(TEXT("DuplicateAsset returned null for '%s' -> '%s' (locked / cross-package?)"),
 					*Src, *Dest));
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("new_path"), Dest);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.delete ───────────────────────────────────────────────────────────────────────────────
@@ -463,7 +433,7 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys == nullptr)
 	{
-		return CB_MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInternal, TEXT("EditorAssetSubsystem unavailable (no GEditor)"));
 	}
 
 	// Asset-vs-folder guard: cb.delete is per-spec single-asset only. A folder path resolves
@@ -474,17 +444,17 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 		// Distinguish "folder" from "missing asset" — only fail INVALID if it IS a known folder.
 		if (Subsys->DoesDirectoryExist(NormalizedPath))
 		{
-			return CB_MakeError(Request, kMCPErrorInvalidPath,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(TEXT("path '%s' is a folder, not an asset — cb.delete is single-asset only"),
 					*NormalizedPath));
 		}
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no package on disk for '%s'"), *NormalizedPath));
 	}
 
 	if (!Subsys->DoesAssetExist(NormalizedPath))
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -504,7 +474,7 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not resolve FAssetData for '%s'"), *NormalizedPath));
 	}
 
@@ -526,7 +496,7 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 			}
 			if (Obj == nullptr)
 			{
-				return CB_MakeError(Request, kMCPErrorObjectNotFound,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 					FString::Printf(TEXT("could not load object '%s' for force-delete"), *ObjectPath));
 			}
 			DeletedCount = ObjectTools::ForceDeleteObjects({ Obj }, /*bShowConfirmation*/ false);
@@ -557,15 +527,15 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	if (!bDeleted && !bForce)
 	{
 		// Most likely cause for soft-delete failure: asset has referencers.
-		return CB_MakeError(Request, -32000,
+		return FMCPToolHelpers::MakeError(Request, -32000,
 			FString::Printf(TEXT("delete failed for '%s' (likely referenced — retry with force=true)"),
 				*NormalizedPath));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("deleted"), bDeleted);
 	Out->SetBoolField(TEXT("redirector_left"), bRedirectorLeft);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.fix_redirectors ──────────────────────────────────────────────────────────────────────
@@ -593,7 +563,7 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	constexpr int32 kRedirectorCap = 500;
 	if (RedirectorData.Num() > kRedirectorCap)
 	{
-		return CB_MakeError(Request, kMCPErrorOverlyBroadQuery,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOverlyBroadQuery,
 			FString::Printf(TEXT("path '%s' contains %d redirectors (cap=%d) — narrow `path` to a deeper subfolder"),
 				*NormalizedPath, RedirectorData.Num(), kRedirectorCap));
 	}
@@ -601,10 +571,10 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	if (RedirectorData.Num() == 0)
 	{
 		// Idempotent: zero work to do is success, not error.
-		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		Out->SetNumberField(TEXT("fixed_count"), 0);
 		Out->SetNumberField(TEXT("removed_count"), 0);
-		return CB_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// FixupReferencers needs the redirector objects loaded. Loading is per-redirector and
@@ -641,13 +611,13 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	IAR.GetAssets(Filter, PostData);
 	const int32 RemovedCount = FMath::Max(0, PreCount - PostData.Num());
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	// `fixed_count` is referencers patched — FixupReferencers doesn't return a number directly,
 	// so we use redirectors-removed as the closest signal. Both fields in the schema are present;
 	// removed_count is authoritative, fixed_count is informational.
 	Out->SetNumberField(TEXT("fixed_count"), RemovedCount);
 	Out->SetNumberField(TEXT("removed_count"), RemovedCount);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.list_folders (Lane A post-hotfix — body remains Lane-B-safe for Phase 3+ revival) ──
@@ -671,7 +641,7 @@ FMCPResponse Tool_ListFolders(const FMCPRequest& Request)
 	constexpr int32 kFolderCap = 10000;
 	if (SubPaths.Num() > kFolderCap)
 	{
-		return CB_MakeError(Request, kMCPErrorOverlyBroadQuery,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOverlyBroadQuery,
 			FString::Printf(TEXT("parent_path '%s' enumerates %d folders (cap=%d) — narrow scope"),
 				*ParentPath, SubPaths.Num(), kFolderCap));
 	}
@@ -694,9 +664,9 @@ FMCPResponse Tool_ListFolders(const FMCPRequest& Request)
 		Items.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("folders"), Items);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.import ───────────────────────────────────────────────────────────────────────────────
@@ -704,13 +674,13 @@ FMCPResponse Tool_Import(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString SourceRaw;
 	if (!Request.Args->TryGetStringField(TEXT("source_file"), SourceRaw) || SourceRaw.IsEmpty())
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 			TEXT("missing required string field 'source_file'"));
 	}
 
@@ -723,12 +693,12 @@ FMCPResponse Tool_Import(const FMCPRequest& Request)
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(SourceRaw, AbsSource, SandboxErr))
 	{
-		return CB_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 
 	if (!IFileManager::Get().FileExists(*AbsSource))
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("source file not found: %s"), *AbsSource));
 	}
 
@@ -738,7 +708,7 @@ FMCPResponse Tool_Import(const FMCPRequest& Request)
 	UEditorAssetSubsystem* Subsys = CB_GetSubsystem();
 	if (Subsys != nullptr && Subsys->DoesAssetExist(DestPath) && !bReplaceExisting)
 	{
-		return CB_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists; pass replace_existing=true to overwrite"),
 				*DestPath));
 	}
@@ -751,7 +721,7 @@ FMCPResponse Tool_Import(const FMCPRequest& Request)
 		UClass* FactoryCls = LoadClass<UFactory>(nullptr, *FactoryClassPath);
 		if (FactoryCls == nullptr)
 		{
-			return CB_MakeError(Request, kCBErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 				FString::Printf(TEXT("factory_class '%s' does not resolve to a UFactory class"),
 					*FactoryClassPath));
 		}
@@ -779,16 +749,16 @@ FMCPResponse Tool_Import(const FMCPRequest& Request)
 
 		if (Task->ImportedObjectPaths.Num() == 0)
 		{
-			return CB_MakeError(Request, -32000,
+			return FMCPToolHelpers::MakeError(Request, -32000,
 				FString::Printf(TEXT("ImportAssetTasks produced no output for '%s' (factory unresolved / source corrupt?)"),
 					*AbsSource));
 		}
 		ImportedPath = Task->ImportedObjectPaths[0];
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("asset_path"), ImportedPath);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.export ───────────────────────────────────────────────────────────────────────────────
@@ -801,7 +771,7 @@ FMCPResponse Tool_Export(const FMCPRequest& Request)
 	FString DestFileRaw;
 	if (!Request.Args->TryGetStringField(TEXT("dest_file"), DestFileRaw) || DestFileRaw.IsEmpty())
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 			TEXT("missing required string field 'dest_file'"));
 	}
 
@@ -810,13 +780,13 @@ FMCPResponse Tool_Export(const FMCPRequest& Request)
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(DestFileRaw, AbsDest, SandboxErr))
 	{
-		return CB_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 
 	FAssetData Data;
 	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
 	}
 
@@ -831,7 +801,7 @@ FMCPResponse Tool_Export(const FMCPRequest& Request)
 	UObject* AssetToExport = Data.GetAsset();
 	if (!AssetToExport)
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("asset '%s' could not be loaded"), *NormalizedPath));
 	}
 
@@ -851,7 +821,7 @@ FMCPResponse Tool_Export(const FMCPRequest& Request)
 	}
 	if (!Exporter)
 	{
-		return CB_MakeError(Request, -32000,
+		return FMCPToolHelpers::MakeError(Request, -32000,
 			FString::Printf(TEXT("no compatible UExporter for class %s + ext '%s' "
 								"(try .png/.jpg for textures, .fbx for meshes, .t3d for levels)"),
 				*Data.AssetClassPath.ToString(), *DestExt));
@@ -877,17 +847,17 @@ FMCPResponse Tool_Export(const FMCPRequest& Request)
 
 	if (!bExported || !IFileManager::Get().FileExists(*AbsDest))
 	{
-		return CB_MakeError(Request, -32000,
+		return FMCPToolHelpers::MakeError(Request, -32000,
 			FString::Printf(TEXT("UExporter::RunAssetExportTask failed for '%s' (Exporter=%s, dest='%s')"),
 				*NormalizedPath, *Exporter->GetClass()->GetName(), *AbsDest));
 	}
 
 	const int64 Bytes = IFileManager::Get().FileSize(*AbsDest);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("exported"), true);
 	Out->SetNumberField(TEXT("bytes"), static_cast<double>(Bytes > 0 ? Bytes : 0));
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.save_all_dirty (async, inline lambda body per D5/D10) ───────────────────────────────
@@ -954,13 +924,13 @@ FMCPResponse Tool_SaveAllDirty(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return CB_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.reimport (refresh asset from source) ─────────────────────────────────────────────────
@@ -981,10 +951,8 @@ FMCPResponse Tool_Reimport(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (GEditor && GEditor->PlayWorld != nullptr)
-	{
-		return CB_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("CBReimport", "MCP: reimport asset"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString NormalizedPath;
 	FMCPResponse Err;
@@ -993,7 +961,7 @@ FMCPResponse Tool_Reimport(const FMCPRequest& Request)
 	UObject* AssetObj = StaticLoadObject(UObject::StaticClass(), nullptr, *NormalizedPath);
 	if (!AssetObj)
 	{
-		return CB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not load asset '%s' for reimport"), *NormalizedPath));
 	}
 
@@ -1009,11 +977,11 @@ FMCPResponse Tool_Reimport(const FMCPRequest& Request)
 		FString SandboxErr;
 		if (!FMCPPathSandbox::Resolve(SourceFileOverride, AbsSrc, SandboxErr))
 		{
-			return CB_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 		}
 		if (!IFileManager::Get().FileExists(*AbsSrc))
 		{
-			return CB_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("source_file '%s' does not exist on disk"), *AbsSrc));
 		}
 
@@ -1035,7 +1003,6 @@ FMCPResponse Tool_Reimport(const FMCPRequest& Request)
 		SourceFileOverride = AbsSrc;  // for response echo
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("CBReimport", "MCP: reimport asset"));
 	const bool bReimported = FReimportManager::Instance()->Reimport(
 		AssetObj,
 		/*bAskForNewFileIfMissing*/ false,
@@ -1044,16 +1011,16 @@ FMCPResponse Tool_Reimport(const FMCPRequest& Request)
 
 	if (!bReimported)
 	{
-		return CB_MakeError(Request, -32000,
+		return FMCPToolHelpers::MakeError(Request, -32000,
 			FString::Printf(TEXT("FReimportManager::Reimport returned false for '%s' "
 				"(no factory accepted the reimport; check editor log)"), *NormalizedPath));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("reimported"), true);
 	Out->SetStringField(TEXT("asset_path"), NormalizedPath);
 	Out->SetStringField(TEXT("source_file"), SourceFileOverride);
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── cb.list_supported_formats (discover factories + supported file extensions) ─────────────
@@ -1140,10 +1107,10 @@ FMCPResponse Tool_ListSupportedFormats(const FMCPRequest& Request)
 		Out.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
 	ResultObj->SetArrayField(TEXT("factories"), Out);
 	ResultObj->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-	return CB_MakeSuccessObj(Request, ResultObj);
+	return FMCPToolHelpers::MakeSuccessObj(Request, ResultObj);
 }
 
 // ─── cb.bulk_import (async, inline lambda body per D5/D10) ──────────────────────────────────
@@ -1151,27 +1118,27 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* FilesPtr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("source_files"), FilesPtr)
 		|| FilesPtr == nullptr || FilesPtr->Num() == 0)
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 			TEXT("missing or empty required array field 'source_files'"));
 	}
 
 	FString DestFolderRaw;
 	if (!Request.Args->TryGetStringField(TEXT("dest_folder"), DestFolderRaw) || DestFolderRaw.IsEmpty())
 	{
-		return CB_MakeError(Request, kCBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 			TEXT("missing required string field 'dest_folder'"));
 	}
 	const FString DestFolder = FMCPAssetPathUtils::Normalize(DestFolderRaw);
 	if (DestFolder.IsEmpty())
 	{
-		return CB_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("invalid dest_folder '%s'"), *DestFolderRaw));
 	}
 
@@ -1187,14 +1154,14 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 		FString S;
 		if (!V.IsValid() || !V->TryGetString(S))
 		{
-			return CB_MakeError(Request, kCBErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCBErrorInvalidParams,
 				TEXT("source_files: expected array of strings"));
 		}
 		FString Abs;
 		FString SandboxErr;
 		if (!FMCPPathSandbox::Resolve(S, Abs, SandboxErr))
 		{
-			return CB_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 		}
 		AbsFiles.Add(Abs);
 	}
@@ -1290,13 +1257,13 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return CB_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return CB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

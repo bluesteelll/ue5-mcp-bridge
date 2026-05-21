@@ -3,10 +3,11 @@
 #include "CurveTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
-#include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
-#include "Utils/MCPWorldContext.h"
 
 #include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetData.h"
@@ -21,7 +22,6 @@
 #include "Curves/RichCurve.h"
 #include "Curves/SimpleCurve.h"
 #include "Engine/CurveTable.h"
-#include "ScopedTransaction.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 
@@ -32,87 +32,23 @@
 
 namespace
 {
-	// CRV_ prefix per the unity-build symbol-collision convention.
+	// CRV_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d). Polymorphic curve-family loader still lives
+	// here because it accepts EITHER UCurveBase OR UCurveTable (FMCPAssetLoader::Load<T> is
+	// single-class).
 	constexpr int32 kCRVErrorInvalidParams = -32602;
 	constexpr int32 kCRVErrorInternal      = -32603;
 
-	void CRV_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse CRV_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		CRV_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse CRV_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		CRV_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool CRV_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = CRV_MakeError(Request, kCRVErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = CRV_MakeError(Request, kCRVErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
 	/**
 	 * Load a curve-family UObject (UCurveFloat / UCurveLinearColor / UCurveVector / UCurveTable)
-	 * by path. Mirrors MeshTools' MSH_LoadMeshByPath shape but returns the polymorphic base UObject
-	 * — caller downcasts. Returns nullptr + OutError populated on any failure.
+	 * by path. Wraps FMCPAssetLoader::LoadRaw + the polymorphic curve-family gate (UCurveBase OR
+	 * UCurveTable). Returns nullptr + OutError populated on any failure.
 	 */
 	UObject* CRV_LoadCurveByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
 	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("'%s' not loadable"), *Path);
-			return nullptr;
-		}
+		UObject* Loaded = FMCPAssetLoader::LoadRaw(Path, OutErrorCode, OutError);
+		if (!Loaded) { return nullptr; }
 
 		// Curve-family gate. UCurveBase covers Float/LinearColor/Vector; UCurveTable is independent.
 		const bool bIsCurveBase  = Loaded->IsA<UCurveBase>();
@@ -503,7 +439,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		TSharedRef<FJsonObject> OutEmpty = MakeShared<FJsonObject>();
 		OutEmpty->SetArrayField(TEXT("curves"), {});
 		OutEmpty->SetNumberField(TEXT("total_known"), 0);
-		return CRV_MakeSuccessObj(Request, OutEmpty);
+		return FMCPToolHelpers::MakeSuccessObj(Request, OutEmpty);
 	}
 	Filter.bRecursiveClasses = false;
 	Filter.bRecursivePaths   = true;
@@ -529,12 +465,12 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return CRV_MakeError(Request, kCRVErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return CRV_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix or types changed); restart pagination"));
 		}
 		while (StartIdx < Assets.Num() &&
@@ -583,7 +519,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return CRV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── curve.get_data ───────────────────────────────────────────────────────────────────────────
@@ -600,7 +536,7 @@ FMCPResponse Tool_GetData(const FMCPRequest& Request)
 
 	FString CurvePath;
 	FMCPResponse Err;
-	if (!CRV_RequireStringField(Request, TEXT("curve_path"), CurvePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("curve_path"), CurvePath, Err)) { return Err; }
 
 	FString RowName;
 	if (Request.Args.IsValid()) { Request.Args->TryGetStringField(TEXT("key"), RowName); }
@@ -608,7 +544,7 @@ FMCPResponse Tool_GetData(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UObject* CurveObj = CRV_LoadCurveByPath(CurvePath, LoadErrCode, LoadErrMsg);
-	if (!CurveObj) { return CRV_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!CurveObj) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("curve_class"), CRV_ClassNameWire(CurveObj));
@@ -641,7 +577,7 @@ FMCPResponse Tool_GetData(const FMCPRequest& Request)
 	{
 		if (RowName.IsEmpty())
 		{
-			return CRV_MakeError(Request, kCRVErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams,
 				TEXT("UCurveTable requires 'key' field (row name); use marshall.list_properties or curve.list to discover rows"));
 		}
 		const FName RowFName(*RowName);
@@ -649,7 +585,7 @@ FMCPResponse Tool_GetData(const FMCPRequest& Request)
 		FRealCurve* const* Found = RowMap.Find(RowFName);
 		if (!Found || !*Found)
 		{
-			return CRV_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("row '%s' not found in CurveTable '%s'"), *RowName, *CurvePath));
 		}
 		// Branch on table mode for downcast safety.
@@ -669,12 +605,12 @@ FMCPResponse Tool_GetData(const FMCPRequest& Request)
 	else
 	{
 		// Shouldn't happen — CRV_LoadCurveByPath gates the class family.
-		return CRV_MakeError(Request, kCRVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kCRVErrorInternal,
 			FString::Printf(TEXT("unhandled curve subclass '%s'"), *CurveObj->GetClass()->GetPathName()));
 	}
 
 	Out->SetArrayField(TEXT("keys"), KeysArr);
-	return CRV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── curve.set_data ───────────────────────────────────────────────────────────────────────────
@@ -683,8 +619,8 @@ FMCPResponse Tool_GetData(const FMCPRequest& Request)
 //            tangent_in?, tangent_out?, channel? (multi-channel curves only) }] }
 // Result:  { prior_key_count, new_key_count }
 //
-// PIE-guarded mutator. Replaces the ENTIRE key set (clear-then-add). FScopedTransaction wraps the
-// mutation; MarkPackageDirty fired before return. For multi-channel curves (UCurveLinearColor /
+// PIE-guarded mutator. Replaces the ENTIRE key set (clear-then-add). FMCPMutatorScope wraps the
+// PIE-guard + transaction + MarkPackageDirty. For multi-channel curves (UCurveLinearColor /
 // UCurveVector) each input key MUST carry a ``channel`` field — keys missing channel route to
 // channel 0 to preserve single-channel-input parity for UCurveFloat callers. UCurveTable requires
 // ``key`` (row name).
@@ -692,20 +628,18 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return CRV_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_Curve_SetData", "Set Curve Data"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString CurvePath;
 	FMCPResponse Err;
-	if (!CRV_RequireStringField(Request, TEXT("curve_path"), CurvePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("curve_path"), CurvePath, Err)) { return Err; }
 
 	// Required keys array.
 	const TArray<TSharedPtr<FJsonValue>>* KeysArrPtr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("keys"), KeysArrPtr) || !KeysArrPtr)
 	{
-		return CRV_MakeError(Request, kCRVErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams,
 			TEXT("curve.set_data requires args.keys (array of key descriptors)"));
 	}
 	const TArray<TSharedPtr<FJsonValue>>& InKeys = *KeysArrPtr;
@@ -716,7 +650,7 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UObject* CurveObj = CRV_LoadCurveByPath(CurvePath, LoadErrCode, LoadErrMsg);
-	if (!CurveObj) { return CRV_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!CurveObj) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	// Resolve operating FRichCurve(s).
 	TArray<FRichCurve*> RichCurves;
@@ -724,7 +658,7 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 	FString ResolveErrMsg;
 	if (!CRV_GetRichCurvesForWrite(CurveObj, RowName, RichCurves, ResolveErrCode, ResolveErrMsg))
 	{
-		return CRV_MakeError(Request, ResolveErrCode, ResolveErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErrMsg);
 	}
 	check(RichCurves.Num() >= 1);
 	const bool bIsMultiChannel = RichCurves.Num() > 1;
@@ -739,7 +673,7 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 		const TSharedPtr<FJsonValue>& V = InKeys[KeyIdx];
 		if (!V.IsValid() || V->Type != EJson::Object)
 		{
-			return CRV_MakeError(Request, kCRVErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams,
 				FString::Printf(TEXT("keys[%d] is not an object"), KeyIdx));
 		}
 		const TSharedPtr<FJsonObject>& Obj = V->AsObject();
@@ -748,7 +682,7 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 		FString ParseErr;
 		if (!CRV_ParseKeyDesc(Obj, RCKey, ChannelName, ParseErr))
 		{
-			return CRV_MakeError(Request, kCRVErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams,
 				FString::Printf(TEXT("keys[%d]: %s"), KeyIdx, *ParseErr));
 		}
 		int32 ChannelIdx = 0;
@@ -758,7 +692,7 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 			ChannelIdx = CRV_ChannelNameToIndex(ChannelName, bIsColor, ChannelErr);
 			if (ChannelIdx < 0)
 			{
-				return CRV_MakeError(Request, kCRVErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams,
 					FString::Printf(TEXT("keys[%d]: %s"), KeyIdx, *ChannelErr));
 			}
 			check(ChannelIdx >= 0 && ChannelIdx < Buckets.Num());
@@ -774,7 +708,6 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 		PriorKeyCount += RC->GetConstRefOfKeys().Num();
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_Curve_SetData", "Set Curve Data"));
 	CurveObj->Modify();
 
 	int32 NewKeyCount = 0;
@@ -796,12 +729,12 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 		NewKeyCount += RC->GetConstRefOfKeys().Num();
 	}
 
-	if (UPackage* Pkg = CurveObj->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(CurveObj->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetNumberField(TEXT("prior_key_count"), PriorKeyCount);
 	Out->SetNumberField(TEXT("new_key_count"),   NewKeyCount);
-	return CRV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── curve.add_key ────────────────────────────────────────────────────────────────────────────
@@ -818,29 +751,27 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return CRV_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_Curve_AddKey", "Add Curve Key"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString CurvePath;
 	FMCPResponse Err;
-	if (!CRV_RequireStringField(Request, TEXT("curve_path"), CurvePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("curve_path"), CurvePath, Err)) { return Err; }
 
 	if (!Request.Args.IsValid())
 	{
-		return CRV_MakeError(Request, kCRVErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	double Time = 0.0;
 	if (!Request.Args->TryGetNumberField(TEXT("time"), Time))
 	{
-		return CRV_MakeError(Request, kCRVErrorInvalidParams, TEXT("missing required number field 'time'"));
+		return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams, TEXT("missing required number field 'time'"));
 	}
 	double Value = 0.0;
 	if (!Request.Args->TryGetNumberField(TEXT("value"), Value))
 	{
-		return CRV_MakeError(Request, kCRVErrorInvalidParams, TEXT("missing required number field 'value'"));
+		return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams, TEXT("missing required number field 'value'"));
 	}
 
 	FString InterpStr = TEXT("Cubic");
@@ -849,7 +780,7 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 	const ERichCurveInterpMode Mode = CRV_InterpModeFromString(InterpStr, bInterpOk);
 	if (!bInterpOk)
 	{
-		return CRV_MakeError(Request, kCRVErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams,
 			FString::Printf(TEXT("unknown interp_mode '%s' (expected Linear/Constant/Cubic/None/Auto/User)"),
 				*InterpStr));
 	}
@@ -868,14 +799,14 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UObject* CurveObj = CRV_LoadCurveByPath(CurvePath, LoadErrCode, LoadErrMsg);
-	if (!CurveObj) { return CRV_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!CurveObj) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	TArray<FRichCurve*> RichCurves;
 	int32 ResolveErrCode = 0;
 	FString ResolveErrMsg;
 	if (!CRV_GetRichCurvesForWrite(CurveObj, RowName, RichCurves, ResolveErrCode, ResolveErrMsg))
 	{
-		return CRV_MakeError(Request, ResolveErrCode, ResolveErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErrMsg);
 	}
 	check(RichCurves.Num() >= 1);
 
@@ -888,7 +819,7 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 		ChannelIdx = CRV_ChannelNameToIndex(ChannelName, bIsColor, ChannelErr);
 		if (ChannelIdx < 0)
 		{
-			return CRV_MakeError(Request, kCRVErrorInvalidParams, ChannelErr);
+			return FMCPToolHelpers::MakeError(Request, kCRVErrorInvalidParams, ChannelErr);
 		}
 		check(ChannelIdx >= 0 && ChannelIdx < RichCurves.Num());
 	}
@@ -897,7 +828,6 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 
 	const int32 PriorKeyCount = TargetCurve->GetConstRefOfKeys().Num();
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_Curve_AddKey", "Add Curve Key"));
 	CurveObj->Modify();
 
 	// UpdateOrAddKey uses UE_KINDA_SMALL_NUMBER as the time tolerance by default — matches engine
@@ -913,13 +843,13 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 	const bool bWasReplaced = (NewKeyCount == PriorKeyCount);
 	const bool bAdded       = !bWasReplaced;
 
-	if (UPackage* Pkg = CurveObj->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(CurveObj->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField  (TEXT("added"),         bAdded);
 	Out->SetBoolField  (TEXT("was_replaced"),  bWasReplaced);
 	Out->SetNumberField(TEXT("new_key_count"), NewKeyCount);
-	return CRV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

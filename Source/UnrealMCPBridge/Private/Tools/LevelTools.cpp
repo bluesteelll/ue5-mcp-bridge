@@ -4,6 +4,8 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
 #include "Utils/MCPReflection.h"
@@ -37,40 +39,14 @@
 
 namespace
 {
-	// LVL_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kLVLErrorInvalidParams = -32602;
-	constexpr int32 kLVLErrorInternal      = -32603;
-
-	void LVL_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse LVL_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		LVL_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse LVL_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		LVL_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	// LVL_ prefix retained for any helper unique to this surface.
+	constexpr int32 kLVLErrorInvalidParams = kMCPErrorInvalidParams;
+	constexpr int32 kLVLErrorInternal      = kMCPErrorInternal;
 
 	/** Frozen PIE-mutator refusal (per D10 — smoke asserts both "Phase 5" and "pie." substrings). */
 	FMCPResponse LVL_MakePIEError(const FMCPRequest& Request)
 	{
-		return LVL_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	/** Read optional ``map_path`` arg; empty string means "use editor world". */
@@ -168,14 +144,14 @@ namespace
 			|| !Request.Args->TryGetStringField(TEXT("map_path"), MapPath)
 			|| MapPath.IsEmpty())
 		{
-			OutError = LVL_MakeError(Request, kLVLErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 				TEXT("missing required string field 'map_path'"));
 			return nullptr;
 		}
 		UWorld* World = FMCPWorldContext::GetEditorWorld();
 		if (!World)
 		{
-			OutError = LVL_MakeError(Request, kMCPErrorLevelNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				TEXT("no editor world available (GEditor missing)"));
 			return nullptr;
 		}
@@ -183,7 +159,7 @@ namespace
 		ULevel* Level = FMCPWorldContext::ResolveLevelByMapPath(World, MapPath, bRejectPartitioned, bWPRejected);
 		if (bWPRejected)
 		{
-			OutError = LVL_MakeError(Request, kMCPErrorWorldPartitionNotSupported,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorWorldPartitionNotSupported,
 				FString::Printf(
 					TEXT("editor world is partitioned — Phase 5 will ship wp.* tools for this surface (map='%s')"),
 					*MapPath));
@@ -191,7 +167,7 @@ namespace
 		}
 		if (!Level)
 		{
-			OutError = LVL_MakeError(Request, kMCPErrorLevelNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				FString::Printf(TEXT("no loaded sublevel matches map_path='%s'"), *MapPath));
 			return nullptr;
 		}
@@ -284,13 +260,13 @@ namespace
 		{
 			// Fail-fast on malformed token: -32602 (invalid params) per the CLAUDE.md contract, not
 			// STALE_CURSOR (which is reserved for "valid encoding, wrong filter").
-			OutError = LVL_MakeError(Request, kLVLErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = LVL_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated filter between pages; "
 					 "restart pagination with page_token=null"));
 			return false;
@@ -332,7 +308,7 @@ FMCPResponse Tool_Phase3LaneBSanity(const FMCPRequest& Request)
 	const uint32 TID = FPlatformTLS::GetCurrentThreadId();
 	Out->SetStringField(TEXT("thread_id"), FString::FromInt(static_cast<int32>(TID)));
 
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.list_loaded (read-only — works in PIE) ────────────────────────────────────────────
@@ -348,7 +324,7 @@ FMCPResponse Tool_ListLoaded(const FMCPRequest& Request)
 	UWorld* World = LVL_ResolveReadWorld();
 	if (!World)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			TEXT("no world available (GEditor missing and no PIE world)"));
 	}
 
@@ -369,7 +345,7 @@ FMCPResponse Tool_ListLoaded(const FMCPRequest& Request)
 	}
 	Out->SetArrayField(TEXT("levels"), Levels);
 	Out->SetNumberField(TEXT("total"), static_cast<double>(Levels.Num()));
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.current_map (read-only — works in PIE) ────────────────────────────────────────────
@@ -384,7 +360,7 @@ FMCPResponse Tool_CurrentMap(const FMCPRequest& Request)
 	UWorld* World = LVL_ResolveReadWorld();
 	if (!World)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			TEXT("no world available (GEditor missing and no PIE world)"));
 	}
 
@@ -394,7 +370,7 @@ FMCPResponse Tool_CurrentMap(const FMCPRequest& Request)
 
 	const UPackage* Pkg = World->GetOutermost();
 	Out->SetBoolField(TEXT("is_dirty"), Pkg && Pkg->IsDirty());
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.load (mutator — PIE-guarded) ──────────────────────────────────────────────────────
@@ -411,43 +387,40 @@ FMCPResponse Tool_Load(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LVL_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelLoad", "MCP: load level"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString MapPath;
 	if (!Request.Args->TryGetStringField(TEXT("map_path"), MapPath) || MapPath.IsEmpty())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("missing required string field 'map_path'"));
 	}
 	const FString Norm = FMCPWorldContext::NormaliseMapPath(MapPath);
 	if (Norm.IsEmpty())
 	{
-		return LVL_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("malformed map_path '%s'"), *MapPath));
 	}
 
 	// LoadLevel asserts the map exists on disk — pre-flight via FPackageName.
 	if (!FPackageName::DoesPackageExist(Norm))
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			FString::Printf(TEXT("map_path '%s' does not exist on disk"), *Norm));
 	}
 
 	ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
 	if (!LES)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("ULevelEditorSubsystem unavailable"));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("LevelLoad", "MCP: load level"));
 	const bool bOk = LES->LoadLevel(Norm);
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
@@ -455,10 +428,10 @@ FMCPResponse Tool_Load(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("map_path"), Norm);
 	if (!bOk)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("LoadLevel('%s') returned false (see editor log)"), *Norm));
 	}
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.save (mutator — PIE-guarded) ──────────────────────────────────────────────────────
@@ -474,15 +447,11 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LVL_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelSave", "MCP: save level"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString MapPath;
 	LVL_GetOptionalMapPathArg(Request, MapPath);
-
-	const FScopedTransaction Transaction(LOCTEXT("LevelSave", "MCP: save level"));
 
 	if (MapPath.IsEmpty())
 	{
@@ -490,7 +459,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 		ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
 		if (!LES)
 		{
-			return LVL_MakeError(Request, kLVLErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 				TEXT("ULevelEditorSubsystem unavailable"));
 		}
 		const bool bOk = LES->SaveCurrentLevel();
@@ -502,10 +471,10 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("map_path"), CurrentMap);
 		if (!bOk)
 		{
-			return LVL_MakeError(Request, kLVLErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 				FString::Printf(TEXT("SaveCurrentLevel('%s') returned false"), *CurrentMap));
 		}
-		return LVL_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// Sublevel path — resolve, save the underlying package via UEditorAssetSubsystem::SaveAsset.
@@ -519,7 +488,7 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	UEditorAssetSubsystem* EAS = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
 	if (!EAS)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("UEditorAssetSubsystem unavailable"));
 	}
 	const FString Norm = FMCPWorldContext::NormaliseMapPath(MapPath);
@@ -530,10 +499,10 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("map_path"), Norm);
 	if (!bOk)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("SaveAsset('%s') returned false"), *Norm));
 	}
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.create (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -549,25 +518,23 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LVL_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelCreate", "MCP: create level"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString MapPath;
 	if (!Request.Args->TryGetStringField(TEXT("map_path"), MapPath) || MapPath.IsEmpty())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("missing required string field 'map_path'"));
 	}
 	const FString Norm = FMCPWorldContext::NormaliseMapPath(MapPath);
 	if (Norm.IsEmpty())
 	{
-		return LVL_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("malformed map_path '%s'"), *MapPath));
 	}
 
@@ -579,12 +546,12 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 		TemplateNorm = FMCPWorldContext::NormaliseMapPath(TemplatePath);
 		if (TemplateNorm.IsEmpty())
 		{
-			return LVL_MakeError(Request, kMCPErrorInvalidPath,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 				FString::Printf(TEXT("malformed template path '%s'"), *TemplatePath));
 		}
 		if (!FPackageName::DoesPackageExist(TemplateNorm))
 		{
-			return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				FString::Printf(TEXT("template '%s' does not exist on disk"), *TemplateNorm));
 		}
 	}
@@ -592,11 +559,10 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 	ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
 	if (!LES)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("ULevelEditorSubsystem unavailable"));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("LevelCreate", "MCP: create level"));
 	const bool bOk = TemplateNorm.IsEmpty()
 		? LES->NewLevel(Norm, /*bIsPartitionedWorld*/ false)
 		: LES->NewLevelFromTemplate(Norm, TemplateNorm);
@@ -606,10 +572,10 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("map_path"), Norm);
 	if (!bOk)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("NewLevel('%s') returned false (path already exists? template missing?)"), *Norm));
 	}
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.unload (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -624,10 +590,8 @@ FMCPResponse Tool_Unload(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LVL_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelUnload", "MCP: unload level"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FMCPResponse ResolveErr;
 	ULevel* Level = LVL_ResolveSubLevelArg(Request, /*bRejectPartitioned*/ true, ResolveErr);
@@ -640,11 +604,10 @@ FMCPResponse Tool_Unload(const FMCPRequest& Request)
 	check(World);
 	if (Level == World->PersistentLevel)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotStreamingEntry,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotStreamingEntry,
 			TEXT("cannot unload the persistent level — use level.load to switch maps instead"));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("LevelUnload", "MCP: unload level"));
 	const bool bOk = UEditorLevelUtils::RemoveLevelFromWorld(Level);
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
@@ -655,10 +618,10 @@ FMCPResponse Tool_Unload(const FMCPRequest& Request)
 	}
 	if (!bOk)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("RemoveLevelFromWorld returned false"));
 	}
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.set_streaming_state (mutator — PIE-guarded) ───────────────────────────────────────
@@ -673,19 +636,17 @@ FMCPResponse Tool_SetStreamingState(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LVL_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelSetStreamingState", "MCP: set streaming state"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString LevelPath;
 	if (!Request.Args->TryGetStringField(TEXT("level_path"), LevelPath) || LevelPath.IsEmpty())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("missing required string field 'level_path'"));
 	}
 	bool bLoaded = true;
@@ -696,24 +657,23 @@ FMCPResponse Tool_SetStreamingState(const FMCPRequest& Request)
 	UWorld* World = FMCPWorldContext::GetEditorWorld();
 	if (!World)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			TEXT("no editor world available"));
 	}
 	if (World->IsPartitionedWorld())
 	{
-		return LVL_MakeError(Request, kMCPErrorWorldPartitionNotSupported,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWorldPartitionNotSupported,
 			TEXT("editor world is partitioned — Phase 5 wp.* tools required for streaming state"));
 	}
 	ULevelStreaming* Streaming = LVL_FindStreamingEntry(World, LevelPath);
 	if (!Streaming)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotStreamingEntry,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotStreamingEntry,
 			FString::Printf(
 				TEXT("level '%s' is not in World->GetStreamingLevels() — only sublevels added via the streaming list can have their state toggled"),
 				*LevelPath));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("LevelSetStreamingState", "MCP: set streaming state"));
 	Streaming->SetShouldBeLoaded(bLoaded);
 	Streaming->SetShouldBeVisible(bVisible);
 
@@ -722,7 +682,7 @@ FMCPResponse Tool_SetStreamingState(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("level_path"), FMCPWorldContext::NormaliseMapPath(LevelPath));
 	Out->SetBoolField(TEXT("loaded"), bLoaded);
 	Out->SetBoolField(TEXT("visible"), bVisible);
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.get_world_settings (read-only — works in PIE) ─────────────────────────────────────
@@ -741,7 +701,7 @@ FMCPResponse Tool_GetWorldSettings(const FMCPRequest& Request)
 	UWorld* World = LVL_ResolveReadWorld();
 	if (!World)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			TEXT("no world available"));
 	}
 
@@ -756,7 +716,7 @@ FMCPResponse Tool_GetWorldSettings(const FMCPRequest& Request)
 		const FString CurMap = FMCPWorldContext::GetWorldPackagePath(World);
 		if (!Norm.Equals(CurMap, ESearchCase::IgnoreCase))
 		{
-			return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				FString::Printf(
 					TEXT("map_path '%s' does not match current world '%s' — per-sublevel WorldSettings query not yet implemented"),
 					*Norm, *CurMap));
@@ -766,7 +726,7 @@ FMCPResponse Tool_GetWorldSettings(const FMCPRequest& Request)
 	AWorldSettings* Settings = World->GetWorldSettings(/*bCheckStreamingPersistent*/ false, /*bChecked*/ false);
 	if (!Settings)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("World->GetWorldSettings returned null"));
 	}
 
@@ -801,7 +761,7 @@ FMCPResponse Tool_GetWorldSettings(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World));
 	Out->SetObjectField(TEXT("properties"), Properties);
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.set_world_settings (mutator — PIE-guarded) ────────────────────────────────────────
@@ -824,27 +784,27 @@ FMCPResponse Tool_SetWorldSettings(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	const TSharedPtr<FJsonObject>* PropsPtr = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("properties"), PropsPtr) || !PropsPtr->IsValid())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("missing required object field 'properties'"));
 	}
 
 	UWorld* World = FMCPWorldContext::GetEditorWorld();
 	if (!World)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			TEXT("no editor world available"));
 	}
 
 	AWorldSettings* Settings = World->GetWorldSettings(/*bCheckStreamingPersistent*/ false, /*bChecked*/ false);
 	if (!Settings)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("World->GetWorldSettings returned null"));
 	}
 
@@ -911,7 +871,7 @@ FMCPResponse Tool_SetWorldSettings(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World));
 	Out->SetArrayField(TEXT("applied"), Applied);
 	Out->SetArrayField(TEXT("rejected"), Rejected);
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.get_persistent_level_actors (read-only, paginated — works in PIE) ─────────────────
@@ -935,7 +895,7 @@ FMCPResponse Tool_GetPersistentLevelActors(const FMCPRequest& Request)
 	UWorld* World = LVL_ResolveReadWorld();
 	if (!World)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			TEXT("no world available"));
 	}
 
@@ -947,13 +907,13 @@ FMCPResponse Tool_GetPersistentLevelActors(const FMCPRequest& Request)
 		Level = FMCPWorldContext::ResolveLevelOrNull(World, MapPath);
 		if (!Level)
 		{
-			return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				FString::Printf(TEXT("map_path '%s' does not resolve to a loaded level"), *MapPath));
 		}
 	}
 	if (!Level)
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound, TEXT("no persistent level on world"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound, TEXT("no persistent level on world"));
 	}
 
 	const int32 PageSize = LVL_ClampPageSize(Request.Args, TEXT("page_size"), 200);
@@ -1039,7 +999,7 @@ FMCPResponse Tool_GetPersistentLevelActors(const FMCPRequest& Request)
 		NewCursor.TotalKnownSnapshot = TotalKnown;
 		Obj->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
 	}
-	return LVL_MakeSuccessObj(Request, Obj);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Obj);
 }
 
 // ─── level.save_all_dirty (Lane A + inline SubmitJob — per plan D3 N7 pattern) ───────────────
@@ -1120,13 +1080,13 @@ FMCPResponse Tool_SaveAllDirty(const FMCPRequest& Request)
 
 	if (!JobId.IsValid())
 	{
-		return LVL_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level.duplicate (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -1141,57 +1101,54 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LVL_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelDuplicate", "MCP: duplicate level"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString SourceMap, DestMap;
 	if (!Request.Args->TryGetStringField(TEXT("source_map"), SourceMap) || SourceMap.IsEmpty())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("missing required string field 'source_map'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("dest_map"), DestMap) || DestMap.IsEmpty())
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("missing required string field 'dest_map'"));
 	}
 	const FString SrcNorm = FMCPWorldContext::NormaliseMapPath(SourceMap);
 	const FString DstNorm = FMCPWorldContext::NormaliseMapPath(DestMap);
 	if (SrcNorm.IsEmpty() || DstNorm.IsEmpty())
 	{
-		return LVL_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			TEXT("source_map and dest_map must be valid /Game/... paths"));
 	}
 	if (SrcNorm.Equals(DstNorm, ESearchCase::IgnoreCase))
 	{
-		return LVL_MakeError(Request, kLVLErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInvalidParams,
 			TEXT("source_map and dest_map must differ"));
 	}
 	if (!FPackageName::DoesPackageExist(SrcNorm))
 	{
-		return LVL_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			FString::Printf(TEXT("source_map '%s' does not exist on disk"), *SrcNorm));
 	}
 	if (FPackageName::DoesPackageExist(DstNorm))
 	{
-		return LVL_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_map '%s' already exists on disk"), *DstNorm));
 	}
 
 	UEditorAssetSubsystem* EAS = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
 	if (!EAS)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("UEditorAssetSubsystem unavailable"));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("LevelDuplicate", "MCP: duplicate level"));
 	UObject* Result = EAS->DuplicateAsset(SrcNorm, DstNorm);
 	const bool bOk = Result != nullptr;
 
@@ -1201,10 +1158,10 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("dest_map"), DstNorm);
 	if (!bOk)
 	{
-		return LVL_MakeError(Request, kLVLErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("DuplicateAsset('%s' → '%s') returned null"), *SrcNorm, *DstNorm));
 	}
-	return LVL_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

@@ -3,9 +3,11 @@
 #include "AudioTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
-#include "Utils/MCPWorldContext.h"
 
 #include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetData.h"
@@ -14,7 +16,6 @@
 #include "Editor.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
-#include "ScopedTransaction.h"
 #include "Sound/SoundAttenuation.h"
 #include "Sound/SoundBase.h"
 #include "Sound/SoundClass.h"
@@ -35,72 +36,7 @@
 namespace
 {
 	// AUD_ prefix per unity-build convention.
-	constexpr int32 kAUDErrorInvalidParams = -32602;
 	constexpr int32 kAUDErrorInternal      = -32603;
-
-	void AUD_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse AUD_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		AUD_StampIds(Request, R);
-		R.bIsError = true; R.ErrorCode = Code; R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse AUD_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		AUD_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool AUD_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = AUD_MakeError(Request, kAUDErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = AUD_MakeError(Request, kAUDErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	UObject* AUD_LoadByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty()) { OutErrorCode = kMCPErrorInvalidPath; OutError = TEXT("path is empty"); return nullptr; }
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised) { Loaded = LoadObject<UObject>(nullptr, *ObjPath); }
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("'%s' not loadable"), *Path);
-		}
-		return Loaded;
-	}
 } // namespace
 
 namespace FAudioTools
@@ -111,19 +47,17 @@ FMCPResponse Tool_CreateSoundCue(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return AUD_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_CreateSoundCue", "Create Sound Cue"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString DestPathRaw;
 	FMCPResponse Err;
-	if (!AUD_RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
 
 	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
 	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
 	{
-		return AUD_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' malformed or unknown mount"), *DestPathRaw));
 	}
 
@@ -133,7 +67,7 @@ FMCPResponse Tool_CreateSoundCue(const FMCPRequest& Request)
 	if (FPackageName::DoesPackageExist(DestPathNorm) ||
 	    FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
 	{
-		return AUD_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists"), *DestPathNorm));
 	}
 
@@ -144,32 +78,23 @@ FMCPResponse Tool_CreateSoundCue(const FMCPRequest& Request)
 	{
 		int32 LoadErrCode = 0;
 		FString LoadErrMsg;
-		UObject* Loaded = AUD_LoadByPath(SourceWavePath, LoadErrCode, LoadErrMsg);
-		if (!Loaded) { return AUD_MakeError(Request, LoadErrCode, LoadErrMsg); }
-		SourceWave = Cast<USoundWave>(Loaded);
-		if (!SourceWave)
-		{
-			return AUD_MakeError(Request, kMCPErrorWrongClass,
-				FString::Printf(TEXT("source_wave_path '%s' is class '%s'; expected USoundWave"),
-					*SourceWavePath, *Loaded->GetClass()->GetPathName()));
-		}
+		SourceWave = FMCPAssetLoader::Load<USoundWave>(SourceWavePath, LoadErrCode, LoadErrMsg);
+		if (!SourceWave) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 	}
 
 	const FString PackageName = PackagePath + TEXT("/") + AssetName;
 	UPackage* CuePkg = CreatePackage(*PackageName);
 	if (!CuePkg)
 	{
-		return AUD_MakeError(Request, kAUDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAUDErrorInternal,
 			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *PackageName));
 	}
 	CuePkg->FullyLoad();
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_CreateSoundCue", "Create Sound Cue"));
-
 	USoundCue* Cue = NewObject<USoundCue>(CuePkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
 	if (!Cue)
 	{
-		return AUD_MakeError(Request, kAUDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kAUDErrorInternal,
 			FString::Printf(TEXT("NewObject<USoundCue> returned null for %s"), *DestPathNorm));
 	}
 
@@ -183,7 +108,7 @@ FMCPResponse Tool_CreateSoundCue(const FMCPRequest& Request)
 	}
 
 	FAssetRegistryModule::AssetCreated(Cue);
-	CuePkg->MarkPackageDirty();
+	Scope.DirtyPackage(CuePkg);
 
 	bool bSaveRequested = false, bSavedOk = false;
 	Request.Args->TryGetBoolField(TEXT("save"), bSaveRequested);
@@ -200,7 +125,7 @@ FMCPResponse Tool_CreateSoundCue(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("asset_path"), Cue->GetPathName());
 	Out->SetBoolField(TEXT("has_source_wave"), SourceWave != nullptr);
 	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return AUD_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── audio.set_attenuation ────────────────────────────────────────────────────────────────────
@@ -211,44 +136,27 @@ FMCPResponse Tool_SetAttenuation(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return AUD_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_SetAttenuation", "Set Sound Attenuation"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString SoundPath;
 	FMCPResponse Err;
-	if (!AUD_RequireStringField(Request, TEXT("sound_path"), SoundPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("sound_path"), SoundPath, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UObject* SoundObj = AUD_LoadByPath(SoundPath, LoadErrCode, LoadErrMsg);
-	if (!SoundObj) { return AUD_MakeError(Request, LoadErrCode, LoadErrMsg); }
-	USoundBase* Sound = Cast<USoundBase>(SoundObj);
-	if (!Sound)
-	{
-		return AUD_MakeError(Request, kMCPErrorWrongClass,
-			FString::Printf(TEXT("sound_path '%s' is class '%s'; expected USoundBase (USoundCue / USoundWave / ...)"),
-				*SoundPath, *SoundObj->GetClass()->GetPathName()));
-	}
+	USoundBase* Sound = FMCPAssetLoader::Load<USoundBase>(SoundPath, LoadErrCode, LoadErrMsg);
+	if (!Sound) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	// Optional attenuation_path — null/empty/missing → clear existing.
 	FString AttenuationPath;
 	USoundAttenuation* Attenuation = nullptr;
 	if (Request.Args->TryGetStringField(TEXT("attenuation_path"), AttenuationPath) && !AttenuationPath.IsEmpty())
 	{
-		UObject* AttenObj = AUD_LoadByPath(AttenuationPath, LoadErrCode, LoadErrMsg);
-		if (!AttenObj) { return AUD_MakeError(Request, LoadErrCode, LoadErrMsg); }
-		Attenuation = Cast<USoundAttenuation>(AttenObj);
-		if (!Attenuation)
-		{
-			return AUD_MakeError(Request, kMCPErrorWrongClass,
-				FString::Printf(TEXT("attenuation_path '%s' is class '%s'; expected USoundAttenuation"),
-					*AttenuationPath, *AttenObj->GetClass()->GetPathName()));
-		}
+		Attenuation = FMCPAssetLoader::Load<USoundAttenuation>(AttenuationPath, LoadErrCode, LoadErrMsg);
+		if (!Attenuation) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_SetAttenuation", "Set Sound Attenuation"));
 	Sound->Modify();
 
 	const FString PriorPath = Sound->AttenuationSettings
@@ -257,7 +165,7 @@ FMCPResponse Tool_SetAttenuation(const FMCPRequest& Request)
 
 	Sound->AttenuationSettings = Attenuation;
 
-	if (UPackage* Pkg = Sound->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Sound->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("sound_class"), Sound->GetClass()->GetPathName());
@@ -265,7 +173,7 @@ FMCPResponse Tool_SetAttenuation(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("new_attenuation"),
 		Attenuation ? Attenuation->GetPathName() : FString());
 	Out->SetBoolField(TEXT("cleared"), Attenuation == nullptr);
-	return AUD_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── audio.list_mix_classes ───────────────────────────────────────────────────────────────────
@@ -312,7 +220,7 @@ FMCPResponse Tool_ListMixClasses(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("sound_classes"), QueryClass(USoundClass::StaticClass()));
 	Out->SetArrayField(TEXT("sound_mixes"),   QueryClass(USoundMix::StaticClass()));
-	return AUD_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

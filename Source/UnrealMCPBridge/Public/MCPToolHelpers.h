@@ -31,6 +31,13 @@ namespace FMCPToolHelpers
 	/** Wrap a JSON object as a success response. The shared-ref shape avoids accidental nullptr. */
 	UNREALMCPBRIDGE_API FMCPResponse MakeSuccessObj(const FMCPRequest& Request, TSharedRef<FJsonObject> Result);
 
+	/**
+	 * Overload accepting `TSharedPtr<FJsonObject>` for ergonomic interop with existing call sites
+	 * that hold a TSharedPtr. The pointer MUST be non-null (the function `check`s). Phase 2-3
+	 * migration uses both shapes; this overload avoids forcing every surface to `.ToSharedRef()`.
+	 */
+	UNREALMCPBRIDGE_API FMCPResponse MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result);
+
 	/** Wrap an arbitrary JSON value as a success response (used for `Result` = number/array/bool). */
 	UNREALMCPBRIDGE_API FMCPResponse MakeSuccessValue(const FMCPRequest& Request, TSharedRef<FJsonValue> Result);
 

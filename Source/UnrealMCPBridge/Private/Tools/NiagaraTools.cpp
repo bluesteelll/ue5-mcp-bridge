@@ -3,6 +3,9 @@
 #include "NiagaraTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 
@@ -42,114 +45,9 @@
 
 namespace
 {
-	// NIA_ prefix per the unity-build symbol-collision pattern.
-	constexpr int32 kNIAErrorInvalidParams = -32602;
-	constexpr int32 kNIAErrorInternal      = -32603;
-
-	void NIA_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse NIA_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		NIA_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse NIA_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		NIA_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool NIA_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = NIA_MakeError(Request, kNIAErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = NIA_MakeError(Request, kNIAErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	// ─── NiagaraSystem resolution ────────────────────────────────────────────────────────────────
-
-	/**
-	 * Load a UNiagaraSystem by path. Mirror of FMCPMaterialUtils::LoadMaterialInterfaceByPath but
-	 * for Niagara systems.
-	 *
-	 * Error map:
-	 *   -32010 InvalidPath          — empty path, backslashes, unknown mount
-	 *   -32004 ObjectNotFound       — LoadObject returned null
-	 *   -32011 WrongClass           — loaded asset isn't a UNiagaraSystem
-	 */
-	UNiagaraSystem* NIA_LoadNiagaraSystemByPath(
-		const FString& Path,
-		int32& OutErrorCode,
-		FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("niagara_system_path is empty");
-			return nullptr;
-		}
-
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(
-				TEXT("niagara_system_path '%s' is malformed or references an unknown mount point"),
-				*Path);
-			return nullptr;
-		}
-
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjectPath.IsEmpty() && ObjectPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjectPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(
-				TEXT("niagara_system_path '%s' could not be loaded (no asset found)"),
-				*Path);
-			return nullptr;
-		}
-
-		UNiagaraSystem* System = Cast<UNiagaraSystem>(Loaded);
-		if (!System)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(
-				TEXT("niagara_system_path '%s' is class '%s'; expected UNiagaraSystem"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return System;
-	}
+	// NIA_ prefix retained for any helper unique to this surface.
+	constexpr int32 kNIAErrorInvalidParams = kMCPErrorInvalidParams;
+	constexpr int32 kNIAErrorInternal      = kMCPErrorInternal;
 
 	// ─── value decoding ─────────────────────────────────────────────────────────────────────────
 
@@ -649,12 +547,12 @@ FMCPResponse Tool_ListParameters(const FMCPRequest& Request)
 
 	FString Path;
 	FMCPResponse Err;
-	if (!NIA_RequireStringField(Request, TEXT("niagara_system_path"), Path, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("niagara_system_path"), Path, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
-	UNiagaraSystem* System = NIA_LoadNiagaraSystemByPath(Path, ErrCode, ErrMsg);
-	if (!System) { return NIA_MakeError(Request, ErrCode, ErrMsg); }
+	UNiagaraSystem* System = FMCPAssetLoader::Load<UNiagaraSystem>(Path, ErrCode, ErrMsg);
+	if (!System) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	// ─── User parameters (with decoded defaults) ────────────────────────────────────────────────
 	const FNiagaraUserRedirectionParameterStore& UserStore = System->GetExposedParameters();
@@ -724,7 +622,7 @@ FMCPResponse Tool_ListParameters(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("user_params"),    UserArr);
 	Out->SetArrayField(TEXT("system_params"),  SystemArr);
 	Out->SetArrayField(TEXT("emitter_params"), EmitterArr);
-	return NIA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── niagara.set_user_param ───────────────────────────────────────────────────────────────────
@@ -747,33 +645,31 @@ FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
 
 	// PIE guard — Niagara assets are shared between editor + PIE worlds, so mutating during PIE
 	// would race the live simulation; refuse exactly like every other Phase 4+ asset-mutator.
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return NIA_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_SetNiagaraUserParam", "Set Niagara user parameter"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path, Name;
 	FMCPResponse Err;
-	if (!NIA_RequireStringField(Request, TEXT("niagara_system_path"), Path, Err)) { return Err; }
-	if (!NIA_RequireStringField(Request, TEXT("name"),                Name, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("niagara_system_path"), Path, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("name"),                Name, Err)) { return Err; }
 
 	if (!Request.Args.IsValid() || !Request.Args->HasField(TEXT("value")))
 	{
-		return NIA_MakeError(Request, kNIAErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInvalidParams,
 			TEXT("niagara.set_user_param requires args.value (typed JSON: number / bool / array / object)"));
 	}
 	const TSharedPtr<FJsonValue> ValueJson = Request.Args->TryGetField(TEXT("value"));
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
-	UNiagaraSystem* System = NIA_LoadNiagaraSystemByPath(Path, ErrCode, ErrMsg);
-	if (!System) { return NIA_MakeError(Request, ErrCode, ErrMsg); }
+	UNiagaraSystem* System = FMCPAssetLoader::Load<UNiagaraSystem>(Path, ErrCode, ErrMsg);
+	if (!System) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	FNiagaraUserRedirectionParameterStore& UserStore = System->GetExposedParameters();
 	FNiagaraVariable Var;
 	if (!NIA_FindUserParamByName(UserStore, Name, Var))
 	{
-		return NIA_MakeError(Request, kMCPErrorNiagaraParameterNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNiagaraParameterNotFound,
 			FString::Printf(
 				TEXT("user_param '%s' not found on '%s' (call niagara.list_parameters for the inventory)"),
 				*Name, *System->GetPathName()));
@@ -789,14 +685,14 @@ FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
 	if (!NIA_EncodeUserParamValue(Var, ValueJson, Bytes, EncodeError, bUnsupportedType))
 	{
 		const int32 Code = bUnsupportedType ? kMCPErrorPinTypeUnsupported : kNIAErrorInvalidParams;
-		return NIA_MakeError(Request, Code, EncodeError);
+		return FMCPToolHelpers::MakeError(Request, Code, EncodeError);
 	}
 
 	// ─── apply ───────────────────────────────────────────────────────────────────────────────────
-	// Open a scoped transaction so the editor's Undo stack picks the change up alongside System->Modify
-	// (artists expect Ctrl-Z to revert).
-	FScopedTransaction Transaction(LOCTEXT("MCP_SetNiagaraUserParam", "Set Niagara user parameter"));
+	// Transaction opened by FMCPMutatorScope above. System->Modify() participates in the editor's
+	// Undo stack alongside the parameter-store write (artists expect Ctrl-Z to revert).
 	System->Modify();
+	Scope.DirtyPackage(System->GetOutermost());
 
 	// SetParameterData mutates the parameter store in place. ``bAdd=false`` because we already
 	// verified the variable exists (NIA_FindUserParamByName); passing true would silently inject
@@ -804,7 +700,7 @@ FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
 	const bool bWriteOk = UserStore.SetParameterData(Bytes.GetData(), Var, /*bAdd*/ false);
 	if (!bWriteOk)
 	{
-		return NIA_MakeError(Request, kNIAErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInternal,
 			FString::Printf(
 				TEXT("FNiagaraUserRedirectionParameterStore::SetParameterData failed for '%s' on '%s' (param vanished or type mismatch)"),
 				*Var.GetName().ToString(), *System->GetPathName()));
@@ -815,8 +711,6 @@ FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
 	// have direct access to it, but Modify()+MarkPackageDirty() is what the editor's own user-param
 	// panel does — that's enough for the asset to round-trip on the next save.
 
-	if (UPackage* Pkg = System->GetOutermost()) { Pkg->MarkPackageDirty(); }
-
 	// Decode-after-write so the response carries the canonical "as the store sees it" value.
 	TSharedPtr<FJsonValue> NewValue = NIA_DecodeUserParamDefault(UserStore, Var);
 
@@ -826,7 +720,7 @@ FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("type"), Var.GetType().GetName());
 	Out->SetField(TEXT("prior"), Prior);
 	Out->SetField(TEXT("new"),   NewValue);
-	return NIA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── niagara.create_emitter ───────────────────────────────────────────────────────────────────
@@ -850,26 +744,24 @@ FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return NIA_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_CreateNiagaraEmitter", "Create Niagara Emitter"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString DestPathRaw;
 	FMCPResponse Err;
-	if (!NIA_RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
 
 	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
 	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
 	{
-		return NIA_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(
 				TEXT("dest_path '%s' is malformed or references an unknown mount (need /Game/... or /Plugin/...)"),
 				*DestPathRaw));
 	}
 	if (FPackageName::DoesPackageExist(DestPathNorm))
 	{
-		return NIA_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
 	}
 
@@ -891,13 +783,13 @@ FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request)
 	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, UNiagaraEmitter::StaticClass(), Factory);
 	if (!NewAsset)
 	{
-		return NIA_MakeError(Request, kNIAErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInternal,
 			FString::Printf(TEXT("IAssetTools::CreateAsset returned null for emitter %s/%s "
 				"(factory may have rejected; check editor log)"),
 				*PackagePath, *AssetName));
 	}
 
-	if (UPackage* Pkg = NewAsset->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(NewAsset->GetOutermost());
 
 	bool bSaveRequested = false;
 	bool bSavedOk       = false;
@@ -915,7 +807,7 @@ FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
 	Out->SetBoolField(TEXT("saved"), bSavedOk);
 	Out->SetBoolField(TEXT("default_modules"), bAddDefaultModules);
-	return NIA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── niagara.set_emitter_enabled ──────────────────────────────────────────────────────────────
@@ -943,19 +835,19 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 
 	FString ActorPath;
 	FMCPResponse Err;
-	if (!NIA_RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
 
 	int32 EmitterIndex = -1;
 	if (!Request.Args->TryGetNumberField(TEXT("emitter_index"), EmitterIndex) || EmitterIndex < 0)
 	{
-		return NIA_MakeError(Request, kNIAErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInvalidParams,
 			TEXT("niagara.set_emitter_enabled requires args.emitter_index (non-negative integer)"));
 	}
 
 	bool bEnabled = false;
 	if (!Request.Args->TryGetBoolField(TEXT("enabled"), bEnabled))
 	{
-		return NIA_MakeError(Request, kNIAErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInvalidParams,
 			TEXT("niagara.set_emitter_enabled requires args.enabled (bool)"));
 	}
 
@@ -967,7 +859,7 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 	AActor* Actor = FMCPActorPathUtils::ResolveActor(ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return NIA_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s%s"),
 				*ActorPath, *ResolveErr, bAmbiguous ? *(FString(TEXT(" (candidates: ")) + AmbiguityHint + TEXT(")")) : TEXT("")));
 	}
@@ -977,7 +869,7 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 	Actor->GetComponents<UNiagaraComponent>(NiagaraComps);
 	if (NiagaraComps.Num() == 0)
 	{
-		return NIA_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(TEXT("actor '%s' has no UNiagaraComponent"), *Actor->GetPathName()));
 	}
 
@@ -990,7 +882,7 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 		}
 		if (!TargetComp)
 		{
-			return NIA_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("UNiagaraComponent named '%s' not found on actor '%s'"),
 					*ComponentName, *Actor->GetPathName()));
 		}
@@ -1003,7 +895,7 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 			CandidateList += (i == 0 ? TEXT("") : TEXT(", "));
 			CandidateList += NiagaraComps[i]->GetName();
 		}
-		return NIA_MakeError(Request, kMCPErrorAmbiguousComponent,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorAmbiguousComponent,
 			FString::Printf(TEXT("actor '%s' has %d UNiagaraComponents; pass component_name to disambiguate (candidates: %s)"),
 				*Actor->GetPathName(), NiagaraComps.Num(), *CandidateList));
 	}
@@ -1016,7 +908,7 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 	UNiagaraSystem* SysAsset = TargetComp->GetAsset();
 	if (!SysAsset)
 	{
-		return NIA_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("UNiagaraComponent '%s' on actor '%s' has no system asset bound"),
 				*TargetComp->GetName(), *Actor->GetPathName()));
 	}
@@ -1024,7 +916,7 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 	const TArray<FNiagaraEmitterHandle>& Handles = SysAsset->GetEmitterHandles();
 	if (EmitterIndex >= Handles.Num())
 	{
-		return NIA_MakeError(Request, kMCPErrorPropertyIndexOOB,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyIndexOOB,
 			FString::Printf(TEXT("emitter_index %d out of range (system has %d emitters)"),
 				EmitterIndex, Handles.Num()));
 	}
@@ -1038,7 +930,7 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("emitter_name"), EmitterFName.ToString());
 	Out->SetNumberField(TEXT("emitter_index"), static_cast<double>(EmitterIndex));
 	Out->SetBoolField(TEXT("enabled"), bEnabled);
-	return NIA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── niagara.spawn_at_location ────────────────────────────────────────────────────────────────
@@ -1064,26 +956,26 @@ FMCPResponse Tool_SpawnAtLocation(const FMCPRequest& Request)
 	UWorld* World = NIA_ResolveWorld();
 	if (!World)
 	{
-		return NIA_MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
 	}
 
 	FString Path;
 	FMCPResponse Err;
-	if (!NIA_RequireStringField(Request, TEXT("system_path"), Path, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("system_path"), Path, Err)) { return Err; }
 
 	FVector Location, Rotation, Scale;
 	FString ErrStr;
 	if (!NIA_ReadVector3(Request.Args, TEXT("location"), Location, ErrStr))
 	{
-		return NIA_MakeError(Request, kNIAErrorInvalidParams, ErrStr);
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInvalidParams, ErrStr);
 	}
 	if (!NIA_ReadOptionalVector3(Request.Args, TEXT("rotation"), FVector::ZeroVector, Rotation, ErrStr))
 	{
-		return NIA_MakeError(Request, kNIAErrorInvalidParams, ErrStr);
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInvalidParams, ErrStr);
 	}
 	if (!NIA_ReadOptionalVector3(Request.Args, TEXT("scale"), FVector(1.0, 1.0, 1.0), Scale, ErrStr))
 	{
-		return NIA_MakeError(Request, kNIAErrorInvalidParams, ErrStr);
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInvalidParams, ErrStr);
 	}
 
 	bool bAutoDestroy = true;
@@ -1091,8 +983,8 @@ FMCPResponse Tool_SpawnAtLocation(const FMCPRequest& Request)
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
-	UNiagaraSystem* System = NIA_LoadNiagaraSystemByPath(Path, ErrCode, ErrMsg);
-	if (!System) { return NIA_MakeError(Request, ErrCode, ErrMsg); }
+	UNiagaraSystem* System = FMCPAssetLoader::Load<UNiagaraSystem>(Path, ErrCode, ErrMsg);
+	if (!System) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	// [pitch, yaw, roll] (degrees) → FRotator.
 	const FRotator Rot(
@@ -1107,7 +999,7 @@ FMCPResponse Tool_SpawnAtLocation(const FMCPRequest& Request)
 
 	if (!Comp)
 	{
-		return NIA_MakeError(Request, kNIAErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInternal,
 			FString::Printf(TEXT("UNiagaraFunctionLibrary::SpawnSystemAtLocation returned null for system '%s' "
 				"(asset may be invalid for spawning, or world is uninitialised)"),
 				*System->GetPathName()));
@@ -1117,7 +1009,7 @@ FMCPResponse Tool_SpawnAtLocation(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("component_path"), Comp->GetPathName());
 	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
 	Out->SetBoolField(TEXT("auto_destroy"), bAutoDestroy);
-	return NIA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── niagara.stop_all ─────────────────────────────────────────────────────────────────────────
@@ -1138,7 +1030,7 @@ FMCPResponse Tool_StopAll(const FMCPRequest& Request)
 	UWorld* World = NIA_ResolveWorld();
 	if (!World)
 	{
-		return NIA_MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
 	}
 
 	int32 StoppedCount = 0;
@@ -1156,7 +1048,7 @@ FMCPResponse Tool_StopAll(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetNumberField(TEXT("stopped_count"), static_cast<double>(StoppedCount));
 	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
-	return NIA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── niagara.list_active ──────────────────────────────────────────────────────────────────────
@@ -1186,7 +1078,7 @@ FMCPResponse Tool_ListActive(const FMCPRequest& Request)
 	UWorld* World = NIA_ResolveWorld();
 	if (!World)
 	{
-		return NIA_MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
+		return FMCPToolHelpers::MakeError(Request, kNIAErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
 	}
 
 	TArray<TSharedPtr<FJsonValue>> Components;
@@ -1226,7 +1118,7 @@ FMCPResponse Tool_ListActive(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("components"), Components);
 	Out->SetNumberField(TEXT("count"), static_cast<double>(Components.Num()));
 	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
-	return NIA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

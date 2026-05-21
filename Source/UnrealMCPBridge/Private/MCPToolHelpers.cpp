@@ -29,6 +29,12 @@ namespace FMCPToolHelpers
 		return R;
 	}
 
+	FMCPResponse MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
+	{
+		check(Result.IsValid());
+		return MakeSuccessObj(Request, Result.ToSharedRef());
+	}
+
 	FMCPResponse MakeSuccessValue(const FMCPRequest& Request, TSharedRef<FJsonValue> Result)
 	{
 		FMCPResponse R;

@@ -3,6 +3,9 @@
 #include "MaterialTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPMaterialUtils.h"
@@ -35,10 +38,10 @@
 
 namespace
 {
-	// MAT_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kMATErrorInvalidParams = -32602;
-	constexpr int32 kMATErrorInternal      = -32603;
+	// Per-file alias constants (kept for readability at call sites — helpers themselves come from
+	// FMCPToolHelpers).
+	constexpr int32 kMATErrorInvalidParams = kMCPErrorInvalidParams;
+	constexpr int32 kMATErrorInternal      = kMCPErrorInternal;
 
 	/**
 	 * Shader compile queue soft cap (D8). Refuses ``material.set_static_switch`` writes when the
@@ -48,75 +51,21 @@ namespace
 	 */
 	constexpr int32 kMATShaderQueueSoftLimit = 1000;
 
-	void MAT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse MAT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		MAT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse MAT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		MAT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	/** Frozen PIE-mutator refusal (per D11 — smoke asserts both "Phase 5" and "pie." substrings). */
-	FMCPResponse MAT_MakePIEError(const FMCPRequest& Request)
-	{
-		return MAT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
-
-	bool MAT_IsPIEActive()
-	{
-		return FMCPWorldContext::IsPIEActive();
-	}
-
 	// ─── arg parsing helpers ─────────────────────────────────────────────────────────────────────
 
 	/** Read ``args.material_path`` field; emit -32602 InvalidParams on missing/empty. */
 	bool MAT_RequireMaterialPath(const FMCPRequest& Request, FString& OutPath, FMCPResponse& OutError,
 		const TCHAR* FieldName = TEXT("material_path"))
 	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = MAT_MakeError(Request, kMATErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutPath) || OutPath.IsEmpty())
-		{
-			OutError = MAT_MakeError(Request, kMATErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
+		return FMCPToolHelpers::RequireStringField(Request, FieldName, OutPath, OutError);
 	}
 
 	/** Read ``args.parameter_name`` field; emit -32602 InvalidParams on missing/empty. */
 	bool MAT_RequireParameterName(const FMCPRequest& Request, FName& OutName, FMCPResponse& OutError)
 	{
 		FString NameStr;
-		if (!Request.Args.IsValid())
+		if (!FMCPToolHelpers::RequireStringField(Request, TEXT("parameter_name"), NameStr, OutError))
 		{
-			OutError = MAT_MakeError(Request, kMATErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(TEXT("parameter_name"), NameStr) || NameStr.IsEmpty())
-		{
-			OutError = MAT_MakeError(Request, kMATErrorInvalidParams,
-				TEXT("missing required string field 'parameter_name'"));
 			return false;
 		}
 		OutName = FName(*NameStr);
@@ -143,13 +92,13 @@ namespace
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(TokenWire, OutCursor, DecodeErr))
 		{
-			OutError = MAT_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = MAT_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated filter (likely material_path) "
 					 "between pages; restart pagination with page_token=null"));
 			return false;
@@ -370,7 +319,7 @@ FMCPResponse Tool_ListParameters(const FMCPRequest& Request)
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UMaterialInterface* Material = FMCPMaterialUtils::LoadMaterialInterfaceByPath(Path, ErrCode, ErrMsg);
-	if (!Material) { return MAT_MakeError(Request, ErrCode, ErrMsg); }
+	if (!Material) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	TArray<FName> ScalarNames, VectorNames, TextureNames, StaticSwitchNames;
 	MAT_CollectAllParameters(Material, ScalarNames, VectorNames, TextureNames, StaticSwitchNames);
@@ -492,7 +441,7 @@ FMCPResponse Tool_ListParameters(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
 	}
 
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── material.get_parameter (Lane A, no PIE guard) ────────────────────────────────────────────
@@ -522,7 +471,7 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UMaterialInterface* Material = FMCPMaterialUtils::LoadMaterialInterfaceByPath(Path, ErrCode, ErrMsg);
-	if (!Material) { return MAT_MakeError(Request, ErrCode, ErrMsg); }
+	if (!Material) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	FString ExplicitType;
 	if (Request.Args.IsValid())
@@ -548,7 +497,7 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		Out->SetNumberField(TEXT("value"), Value);
 		Out->SetNumberField(TEXT("default"), Default);
 		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = MAT_MakeSuccessObj(Request, Out);
+		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
 		return true;
 	};
 
@@ -569,7 +518,7 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		Out->SetObjectField(TEXT("value"),   MAT_LinearColorToJson(Value));
 		Out->SetObjectField(TEXT("default"), MAT_LinearColorToJson(Default));
 		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = MAT_MakeSuccessObj(Request, Out);
+		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
 		return true;
 	};
 
@@ -590,7 +539,7 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("value"),   Value   ? Value->GetPathName()   : FString());
 		Out->SetStringField(TEXT("default"), Default ? Default->GetPathName() : FString());
 		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = MAT_MakeSuccessObj(Request, Out);
+		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
 		return true;
 	};
 
@@ -612,7 +561,7 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		Out->SetBoolField(TEXT("value"),   bValue);
 		Out->SetBoolField(TEXT("default"), bDefault);
 		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = MAT_MakeSuccessObj(Request, Out);
+		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
 		return true;
 	};
 
@@ -637,7 +586,7 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		}
 		else
 		{
-			return MAT_MakeError(Request, kMATErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 				FString::Printf(
 					TEXT("parameter_type '%s' invalid; expected one of 'scalar' / 'vector' / 'texture' / 'static_switch'"),
 					*ExplicitType));
@@ -652,7 +601,7 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		if (TryStaticSwitch()) { return PathErr; }
 	}
 
-	return MAT_MakeError(Request, kMCPErrorParameterNotFound,
+	return FMCPToolHelpers::MakeError(Request, kMCPErrorParameterNotFound,
 		FString::Printf(
 			TEXT("parameter '%s' not found on '%s'; check material.list_parameters"),
 			*ParamName.ToString(), *Path));
@@ -678,9 +627,9 @@ bool MAT_PreWriteResolve(
 	FString& OutPath,
 	FMCPResponse& OutError)
 {
-	if (MAT_IsPIEActive())
+	if (FMCPWorldContext::IsPIEActive())
 	{
-		OutError = MAT_MakePIEError(Request);
+		OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 		return false;
 	}
 	if (!MAT_RequireMaterialPath(Request, OutPath, OutError)) { return false; }
@@ -691,7 +640,7 @@ bool MAT_PreWriteResolve(
 	OutMIC = FMCPMaterialUtils::LoadMICByPath(OutPath, ErrCode, ErrMsg);
 	if (!OutMIC)
 	{
-		OutError = MAT_MakeError(Request, ErrCode, ErrMsg);
+		OutError = FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 		return false;
 	}
 	return true;
@@ -773,7 +722,7 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	double Value = 0.0;
 	if (!Request.Args->TryGetNumberField(TEXT("value"), Value))
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 			TEXT("missing required number field 'value'"));
 	}
 	const float ValueF = static_cast<float>(Value);
@@ -782,7 +731,7 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	float PriorValue = 0.0f;
 	if (!MIC->GetScalarParameterValue(FHashedMaterialParameterInfo(ParamName), PriorValue))
 	{
-		return MAT_MakeError(Request, kMCPErrorParameterNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorParameterNotFound,
 			FString::Printf(
 				TEXT("scalar parameter '%s' not found on '%s'; check material.list_parameters"),
 				*ParamName.ToString(), *Path));
@@ -792,7 +741,7 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	FProperty* OverrideProp = MAT_FindOverrideProperty(MIC, TEXT("ScalarParameterValues"));
 	if (!MAT_PassEditConstGate(OverrideProp, MAT_GetBypassReadonly(Request.Args)))
 	{
-		return MAT_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
 				TEXT("ScalarParameterValues blocked by CPF_EditConst/BlueprintReadOnly/DisableEditOnInstance ")
 				TEXT("for '%s'; pass args.bypass_readonly=true to override"),
@@ -811,7 +760,7 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("applied"), true);
 	Out->SetNumberField(TEXT("prior_value"), PriorValue);
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── material.set_vector_param (Lane A, PIE-guarded, MIC-only) ────────────────────────────────
@@ -833,20 +782,20 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 	const TSharedPtr<FJsonObject>* ValueObj = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("value"), ValueObj) || !ValueObj || !ValueObj->IsValid())
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 			TEXT("missing required object field 'value' (expected {r,g,b,a})"));
 	}
 	FLinearColor Value;
 	if (!MAT_ReadJsonLinearColor(*ValueObj, Value))
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 			TEXT("'value' object lacks any of r/g/b numeric fields"));
 	}
 
 	FLinearColor PriorValue = FLinearColor::Black;
 	if (!MIC->GetVectorParameterValue(FHashedMaterialParameterInfo(ParamName), PriorValue))
 	{
-		return MAT_MakeError(Request, kMCPErrorParameterNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorParameterNotFound,
 			FString::Printf(
 				TEXT("vector parameter '%s' not found on '%s'; check material.list_parameters"),
 				*ParamName.ToString(), *Path));
@@ -855,7 +804,7 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 	FProperty* OverrideProp = MAT_FindOverrideProperty(MIC, TEXT("VectorParameterValues"));
 	if (!MAT_PassEditConstGate(OverrideProp, MAT_GetBypassReadonly(Request.Args)))
 	{
-		return MAT_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
 				TEXT("VectorParameterValues blocked by CPF_EditConst/BlueprintReadOnly/DisableEditOnInstance ")
 				TEXT("for '%s'; pass args.bypass_readonly=true to override"),
@@ -873,7 +822,7 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("applied"), true);
 	Out->SetObjectField(TEXT("prior_value"), MAT_LinearColorToJson(PriorValue));
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── material.set_texture_param (Lane A, PIE-guarded, MIC-only) ───────────────────────────────
@@ -893,49 +842,23 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 	if (!MAT_PreWriteResolve(Request, MIC, ParamName, Path, Err)) { return Err; }
 
 	FString TexPathRaw;
-	if (!Request.Args->TryGetStringField(TEXT("texture_path"), TexPathRaw) || TexPathRaw.IsEmpty())
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("texture_path"), TexPathRaw, Err))
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
-			TEXT("missing required string field 'texture_path'"));
+		return Err;
 	}
 
-	// Normalise + resolve. We accept both /Game/Foo/T_X and /Game/Foo/T_X.T_X object paths.
-	const FString TexPath = FMCPAssetPathUtils::Normalize(TexPathRaw);
-	if (TexPath.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(TexPath))
-	{
-		return MAT_MakeError(Request, kMCPErrorInvalidPath,
-			FString::Printf(TEXT("texture_path '%s' is malformed or references an unknown mount point"),
-				*TexPathRaw));
-	}
-
-	UObject* Loaded = LoadObject<UObject>(nullptr, *TexPath);
-	if (!Loaded)
-	{
-		const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(TexPath);
-		if (!ObjectPath.IsEmpty() && ObjectPath != TexPath)
-		{
-			Loaded = LoadObject<UObject>(nullptr, *ObjectPath);
-		}
-	}
-	if (!Loaded)
-	{
-		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("texture_path '%s' could not be loaded (no asset found)"),
-				*TexPathRaw));
-	}
-	UTexture* Texture = Cast<UTexture>(Loaded);
+	int32 TexErrCode = 0;
+	FString TexErrMsg;
+	UTexture* Texture = FMCPAssetLoader::Load<UTexture>(TexPathRaw, TexErrCode, TexErrMsg);
 	if (!Texture)
 	{
-		return MAT_MakeError(Request, kMCPErrorWrongClass,
-			FString::Printf(
-				TEXT("texture_path '%s' is class '%s', not UTexture (any subclass — Texture2D / TextureCube / etc.)"),
-				*TexPathRaw, *Loaded->GetClass()->GetPathName()));
+		return FMCPToolHelpers::MakeError(Request, TexErrCode, TexErrMsg);
 	}
 
 	UTexture* PriorTexture = nullptr;
 	if (!MIC->GetTextureParameterValue(FHashedMaterialParameterInfo(ParamName), PriorTexture))
 	{
-		return MAT_MakeError(Request, kMCPErrorParameterNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorParameterNotFound,
 			FString::Printf(
 				TEXT("texture parameter '%s' not found on '%s'; check material.list_parameters"),
 				*ParamName.ToString(), *Path));
@@ -944,7 +867,7 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 	FProperty* OverrideProp = MAT_FindOverrideProperty(MIC, TEXT("TextureParameterValues"));
 	if (!MAT_PassEditConstGate(OverrideProp, MAT_GetBypassReadonly(Request.Args)))
 	{
-		return MAT_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
 				TEXT("TextureParameterValues blocked by CPF_EditConst/BlueprintReadOnly/DisableEditOnInstance ")
 				TEXT("for '%s'; pass args.bypass_readonly=true to override"),
@@ -963,7 +886,7 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("applied"), true);
 	Out->SetStringField(TEXT("prior_value"),
 		PriorTexture ? PriorTexture->GetPathName() : FString());
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── material.set_static_switch (Lane A, PIE-guarded, MIC-only, backpressure) ─────────────────
@@ -994,7 +917,7 @@ FMCPResponse Tool_SetStaticSwitch(const FMCPRequest& Request)
 	bool bValue = false;
 	if (!Request.Args->TryGetBoolField(TEXT("value"), bValue))
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 			TEXT("missing required boolean field 'value'"));
 	}
 
@@ -1005,7 +928,7 @@ FMCPResponse Tool_SetStaticSwitch(const FMCPRequest& Request)
 		PendingJobs = GShaderCompilingManager->GetNumRemainingJobs();
 		if (PendingJobs >= kMATShaderQueueSoftLimit)
 		{
-			return MAT_MakeError(Request, kMCPErrorShaderRecompilePending,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorShaderRecompilePending,
 				FString::Printf(
 					TEXT("shader compile queue at %d jobs (>= soft limit %d); retry after `material.is_shader_compiling` reports compiling=false"),
 					PendingJobs, kMATShaderQueueSoftLimit));
@@ -1017,7 +940,7 @@ FMCPResponse Tool_SetStaticSwitch(const FMCPRequest& Request)
 	FGuid Unused;
 	if (!MIC->GetStaticSwitchParameterValue(FHashedMaterialParameterInfo(ParamName), bPriorValue, Unused))
 	{
-		return MAT_MakeError(Request, kMCPErrorParameterNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorParameterNotFound,
 			FString::Printf(
 				TEXT("static switch parameter '%s' not found on '%s'; check material.list_parameters"),
 				*ParamName.ToString(), *Path));
@@ -1026,7 +949,7 @@ FMCPResponse Tool_SetStaticSwitch(const FMCPRequest& Request)
 	FProperty* OverrideProp = MAT_FindOverrideProperty(MIC, TEXT("StaticParameters"));
 	if (!MAT_PassEditConstGate(OverrideProp, MAT_GetBypassReadonly(Request.Args)))
 	{
-		return MAT_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
 				TEXT("StaticParameters blocked by CPF_EditConst/BlueprintReadOnly/DisableEditOnInstance ")
 				TEXT("for '%s'; pass args.bypass_readonly=true to override"),
@@ -1052,7 +975,7 @@ FMCPResponse Tool_SetStaticSwitch(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("prior_value"), bPriorValue);
 	Out->SetBoolField(TEXT("recompile_triggered"), true);
 	Out->SetBoolField(TEXT("recompile_already_pending"), bRecompileAlreadyPending);
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── material.is_shader_compiling (Lane A, no PIE guard, trivial) ─────────────────────────────
@@ -1076,7 +999,7 @@ FMCPResponse Tool_IsShaderCompiling(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("compiling"), bCompiling);
 	Out->SetNumberField(TEXT("remaining_jobs"), static_cast<double>(RemainingJobs));
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── material.create_instance (Lane A, PIE-guarded) ───────────────────────────────────────────
@@ -1098,25 +1021,14 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (MAT_IsPIEActive()) { return MAT_MakePIEError(Request); }
-
-	if (!Request.Args.IsValid())
-	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams, TEXT("missing args object"));
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPCreateMIC", "MCP: create material instance"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ParentPathRaw;
-	if (!Request.Args->TryGetStringField(TEXT("parent_material_path"), ParentPathRaw) || ParentPathRaw.IsEmpty())
-	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
-			TEXT("missing required string field 'parent_material_path'"));
-	}
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("parent_material_path"), ParentPathRaw, Err)) { return Err; }
 	FString DestPathRaw;
-	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
-	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
-			TEXT("missing required string field 'dest_path'"));
-	}
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("dest_path"), DestPathRaw, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
@@ -1124,13 +1036,13 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 		ParentPathRaw, ErrCode, ErrMsg);
 	if (!ParentMaterial)
 	{
-		return MAT_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	const FString DestPath = FMCPAssetPathUtils::Normalize(DestPathRaw);
 	if (DestPath.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPath))
 	{
-		return MAT_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is malformed or references an unknown mount point"),
 				*DestPathRaw));
 	}
@@ -1138,7 +1050,7 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 	// Conflict check (D10).
 	if (FPackageName::DoesPackageExist(DestPath))
 	{
-		return MAT_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists; cb.delete then retry or pick a new path"),
 				*DestPath));
 	}
@@ -1147,7 +1059,7 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 	const FString AssetName   = FPaths::GetBaseFilename(DestPath);
 	if (PackagePath.IsEmpty() || AssetName.IsEmpty())
 	{
-		return MAT_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' split into (folder='%s', name='%s') — neither may be empty"),
 				*DestPath, *PackagePath, *AssetName));
 	}
@@ -1155,18 +1067,14 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 	UMaterialInstanceConstantFactoryNew* Factory = NewObject<UMaterialInstanceConstantFactoryNew>();
 	Factory->InitialParent = ParentMaterial;
 
-	UObject* NewAsset = nullptr;
-	{
-		FScopedTransaction Transaction(LOCTEXT("MCPCreateMIC", "MCP: create material instance"));
-		FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(
-			TEXT("AssetTools"));
-		NewAsset = AssetToolsModule.Get().CreateAsset(
-			AssetName, PackagePath, UMaterialInstanceConstant::StaticClass(), Factory);
-	}
+	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(
+		TEXT("AssetTools"));
+	UObject* NewAsset = AssetToolsModule.Get().CreateAsset(
+		AssetName, PackagePath, UMaterialInstanceConstant::StaticClass(), Factory);
 
 	if (!NewAsset)
 	{
-		return MAT_MakeError(Request, kMATErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInternal,
 			FString::Printf(
 				TEXT("IAssetTools::CreateAsset returned null for '%s/%s' (factory init failure?)"),
 				*PackagePath, *AssetName));
@@ -1177,7 +1085,7 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 	{
 		// Defensive — factory should always produce a MIC, but if some custom override changed
 		// the class we want to fail loudly.
-		return MAT_MakeError(Request, kMATErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInternal,
 			FString::Printf(
 				TEXT("CreateAsset produced class '%s', expected UMaterialInstanceConstant"),
 				*NewAsset->GetClass()->GetPathName()));
@@ -1191,12 +1099,12 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 		FPropertyChangedEvent ChangeEvent(nullptr);
 		NewMIC->PostEditChangeProperty(ChangeEvent);
 	}
-	NewMIC->GetOutermost()->MarkPackageDirty();
+	Scope.DirtyPackage(NewMIC->GetPackage());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("created"), true);
 	Out->SetStringField(TEXT("mic_path"), NewMIC->GetPathName());
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── material.get_compile_errors (Lane A, no PIE guard) ───────────────────────────────────────
@@ -1221,7 +1129,7 @@ FMCPResponse Tool_GetCompileErrors(const FMCPRequest& Request)
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UMaterialInterface* Material = FMCPMaterialUtils::LoadMaterialInterfaceByPath(Path, ErrCode, ErrMsg);
-	if (!Material) { return MAT_MakeError(Request, ErrCode, ErrMsg); }
+	if (!Material) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	UMaterial* Base = FMCPMaterialUtils::WalkToBaseMaterial(Material);
 	TArray<TSharedPtr<FJsonValue>> ErrorArr;
@@ -1248,7 +1156,7 @@ FMCPResponse Tool_GetCompileErrors(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("has_errors"), ErrorArr.Num() > 0);
 	Out->SetArrayField(TEXT("errors"),    ErrorArr);
 	Out->SetArrayField(TEXT("warnings"),  WarningArr);
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Wave G Surface 2: material graph node editing (4 tools, all Lane A, PIE-guarded) ─────────
@@ -1289,9 +1197,9 @@ namespace
 		FString& OutPath,
 		FMCPResponse& OutError)
 	{
-		if (MAT_IsPIEActive())
+		if (FMCPWorldContext::IsPIEActive())
 		{
-			OutError = MAT_MakePIEError(Request);
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 			return false;
 		}
 		if (!MAT_RequireMaterialPath(Request, OutPath, OutError)) { return false; }
@@ -1302,13 +1210,13 @@ namespace
 			OutPath, ErrCode, ErrMsg);
 		if (!AsInterface)
 		{
-			OutError = MAT_MakeError(Request, ErrCode, ErrMsg);
+			OutError = FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 			return false;
 		}
 		UMaterial* AsBase = Cast<UMaterial>(AsInterface);
 		if (!AsBase || !FMCPMaterialUtils::IsBaseMaterial(AsInterface))
 		{
-			OutError = MAT_MakeError(Request, kMCPErrorWrongClass,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 				FString::Printf(
 					TEXT("material_path '%s' is class '%s'; graph-node editing requires a base UMaterial ")
 					TEXT("(instances inherit their parent's graph — use material.set_*_param for MIC overrides)"),
@@ -1341,12 +1249,12 @@ namespace
 	{
 		if (!Request.Args.IsValid())
 		{
-			OutError = MAT_MakeError(Request, kMATErrorInvalidParams, TEXT("missing args object"));
+			OutError = FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams, TEXT("missing args object"));
 			return false;
 		}
 		if (!Request.Args->TryGetStringField(FieldName, OutGuidString) || OutGuidString.IsEmpty())
 		{
-			OutError = MAT_MakeError(Request, kMATErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
 			return false;
 		}
@@ -1354,7 +1262,7 @@ namespace
 		FGuid Probe;
 		if (!FGuid::Parse(OutGuidString, Probe))
 		{
-			OutError = MAT_MakeError(Request, kMATErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 				FString::Printf(
 					TEXT("field '%s' value '%s' is not a valid FGuid (expected 32-hex EGuidFormats::Digits)"),
 					FieldName, *OutGuidString));
@@ -1393,16 +1301,18 @@ FMCPResponse Tool_AddExpression(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPAddExpression", "MCP: add material expression"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
 	UMaterial* Material = nullptr;
 	FString Path;
 	FMCPResponse Err;
 	if (!MAT_PreWriteResolveBaseMaterial(Request, Material, Path, Err)) { return Err; }
 
 	FString ExprClassPath;
-	if (!Request.Args->TryGetStringField(TEXT("expression_class"), ExprClassPath) || ExprClassPath.IsEmpty())
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("expression_class"), ExprClassPath, Err))
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
-			TEXT("missing required string field 'expression_class' (e.g. '/Script/Engine.MaterialExpressionScalarParameter')"));
+		return Err;
 	}
 
 	int32 PosX = 0, PosY = 0;
@@ -1416,21 +1326,21 @@ FMCPResponse Tool_AddExpression(const FMCPRequest& Request)
 	UClass* ExprClass = LoadObject<UClass>(nullptr, *ExprClassPath);
 	if (!ExprClass)
 	{
-		return MAT_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(
 				TEXT("expression_class '%s' could not be loaded (expected form '/Script/Engine.MaterialExpressionX')"),
 				*ExprClassPath));
 	}
 	if (!ExprClass->IsChildOf(UMaterialExpression::StaticClass()))
 	{
-		return MAT_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(
 				TEXT("expression_class '%s' is not a UMaterialExpression subclass (super='%s')"),
 				*ExprClassPath, *ExprClass->GetSuperClass()->GetPathName()));
 	}
 	if (ExprClass->HasAnyClassFlags(CLASS_Abstract))
 	{
-		return MAT_MakeError(Request, kMCPErrorClassAbstract,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassAbstract,
 			FString::Printf(TEXT("expression_class '%s' is abstract — cannot instantiate"),
 				*ExprClassPath));
 	}
@@ -1438,43 +1348,39 @@ FMCPResponse Tool_AddExpression(const FMCPRequest& Request)
 	FString ParamName;
 	Request.Args->TryGetStringField(TEXT("parameter_name"), ParamName);
 
-	UMaterialExpression* NewExpr = nullptr;
+	Material->Modify();
+	Material->PreEditChange(nullptr);
+
+	// UMaterialEditingLibrary::CreateMaterialExpression handles the cascade we need:
+	//   NewObject<UMaterialExpression>(Material, ExprClass, NAME_None, RF_Transactional)
+	//   → ExpressionCollection.AddExpression
+	//   → NewExpression->Material = Material
+	//   → MaterialExpressionEditorX/Y = NodePosX/NodePosY
+	//   → UpdateMaterialExpressionGuid(bForceGeneration=true, bAllowMarkingPackageDirty=true)
+	UMaterialExpression* NewExpr = UMaterialEditingLibrary::CreateMaterialExpression(
+		Material, ExprClass, PosX, PosY);
+
+	// Optional parameter-name binding. ``HasAParameterName`` covers ScalarParameter /
+	// VectorParameter / TextureParameter / StaticSwitchParameter / StaticBoolParameter /
+	// DynamicParameter / various LandscapeLayerXxxParameter — anything with a per-parameter
+	// override identity. For non-parameter expressions (Multiply, Constant3Vector, etc.) we
+	// silently ignore the field — the bp.add_node tool follows the same forgiving convention.
+	if (NewExpr && NewExpr->HasAParameterName() && !ParamName.IsEmpty())
 	{
-		FScopedTransaction Transaction(LOCTEXT("MCPAddExpression", "MCP: add material expression"));
-		Material->Modify();
-		Material->PreEditChange(nullptr);
-
-		// UMaterialEditingLibrary::CreateMaterialExpression handles the cascade we need:
-		//   NewObject<UMaterialExpression>(Material, ExprClass, NAME_None, RF_Transactional)
-		//   → ExpressionCollection.AddExpression
-		//   → NewExpression->Material = Material
-		//   → MaterialExpressionEditorX/Y = NodePosX/NodePosY
-		//   → UpdateMaterialExpressionGuid(bForceGeneration=true, bAllowMarkingPackageDirty=true)
-		NewExpr = UMaterialEditingLibrary::CreateMaterialExpression(
-			Material, ExprClass, PosX, PosY);
-
-		// Optional parameter-name binding. ``HasAParameterName`` covers ScalarParameter /
-		// VectorParameter / TextureParameter / StaticSwitchParameter / StaticBoolParameter /
-		// DynamicParameter / various LandscapeLayerXxxParameter — anything with a per-parameter
-		// override identity. For non-parameter expressions (Multiply, Constant3Vector, etc.) we
-		// silently ignore the field — the bp.add_node tool follows the same forgiving convention.
-		if (NewExpr && NewExpr->HasAParameterName() && !ParamName.IsEmpty())
-		{
-			NewExpr->SetParameterName(FName(*ParamName));
-		}
-
-		Material->PostEditChange();
+		NewExpr->SetParameterName(FName(*ParamName));
 	}
+
+	Material->PostEditChange();
 
 	if (!NewExpr)
 	{
-		return MAT_MakeError(Request, kMATErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInternal,
 			FString::Printf(
 				TEXT("UMaterialEditingLibrary::CreateMaterialExpression returned null for '%s' on '%s'"),
 				*ExprClassPath, *Path));
 	}
 
-	Material->GetOutermost()->MarkPackageDirty();
+	Scope.DirtyPackage(Material->GetPackage());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("expression_guid"), MAT_FormatExpressionGuid(NewExpr));
@@ -1487,7 +1393,7 @@ FMCPResponse Tool_AddExpression(const FMCPRequest& Request)
 	{
 		Out->SetStringField(TEXT("parameter_name"), NewExpr->GetParameterName().ToString());
 	}
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mat.connect_expressions ───────────────────────────────────────────────────────────────────
@@ -1517,6 +1423,9 @@ FMCPResponse Tool_ConnectExpressions(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPConnectExpressions", "MCP: connect material expressions"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
 	UMaterial* Material = nullptr;
 	FString Path;
 	FMCPResponse Err;
@@ -1527,10 +1436,9 @@ FMCPResponse Tool_ConnectExpressions(const FMCPRequest& Request)
 	if (!MAT_RequireExpressionGuid(Request, TEXT("to_expression_guid"),   ToGuidStr,   Err)) { return Err; }
 
 	FString ToInputName;
-	if (!Request.Args->TryGetStringField(TEXT("to_input_name"), ToInputName) || ToInputName.IsEmpty())
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("to_input_name"), ToInputName, Err))
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
-			TEXT("missing required string field 'to_input_name' (FExpressionInput name on the to-expression)"));
+		return Err;
 	}
 
 	int32 FromOutputIndex = 0;
@@ -1545,14 +1453,14 @@ FMCPResponse Tool_ConnectExpressions(const FMCPRequest& Request)
 	UMaterialExpression* FromExpr = MAT_FindExpressionByGuid(Material, FromGuidStr);
 	if (!FromExpr)
 	{
-		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("from_expression_guid '%s' not found in material '%s'"),
 				*FromGuidStr, *Path));
 	}
 	UMaterialExpression* ToExpr = MAT_FindExpressionByGuid(Material, ToGuidStr);
 	if (!ToExpr)
 	{
-		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("to_expression_guid '%s' not found in material '%s'"),
 				*ToGuidStr, *Path));
 	}
@@ -1563,37 +1471,33 @@ FMCPResponse Tool_ConnectExpressions(const FMCPRequest& Request)
 	const TArray<FExpressionOutput>& Outputs = FromExpr->GetOutputs();
 	if (FromOutputIndex < 0 || FromOutputIndex >= Outputs.Num())
 	{
-		return MAT_MakeError(Request, kMCPErrorPinNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPinNotFound,
 			FString::Printf(
 				TEXT("from_output_index %d is out of range for expression '%s' (output count=%d)"),
 				FromOutputIndex, *FromExpr->GetClass()->GetName(), Outputs.Num()));
 	}
 	const FString FromOutputName = Outputs[FromOutputIndex].OutputName.ToString();
 
-	bool bConnected = false;
-	{
-		FScopedTransaction Transaction(LOCTEXT("MCPConnectExpressions", "MCP: connect material expressions"));
-		Material->Modify();
-		ToExpr->Modify();
-		Material->PreEditChange(nullptr);
+	Material->Modify();
+	ToExpr->Modify();
+	Material->PreEditChange(nullptr);
 
-		bConnected = UMaterialEditingLibrary::ConnectMaterialExpressions(
-			FromExpr, FromOutputName, ToExpr, ToInputName);
+	const bool bConnected = UMaterialEditingLibrary::ConnectMaterialExpressions(
+		FromExpr, FromOutputName, ToExpr, ToInputName);
 
-		Material->PostEditChange();
-	}
+	Material->PostEditChange();
 
 	if (!bConnected)
 	{
 		// Library returns false when the input name doesn't match or output-index lookup fails.
 		// Output-index already validated above → narrowing to PinNotFound on the to-side.
-		return MAT_MakeError(Request, kMCPErrorPinNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPinNotFound,
 			FString::Printf(
 				TEXT("to_input_name '%s' not found on expression '%s' (UMaterialEditingLibrary::ConnectMaterialExpressions refused)"),
 				*ToInputName, *ToExpr->GetClass()->GetName()));
 	}
 
-	Material->GetOutermost()->MarkPackageDirty();
+	Scope.DirtyPackage(Material->GetPackage());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("connected"), true);
@@ -1602,7 +1506,7 @@ FMCPResponse Tool_ConnectExpressions(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("from_output_index"), FromOutputIndex);
 	Out->SetStringField(TEXT("to_guid"),      ToGuidStr);
 	Out->SetStringField(TEXT("to_input"),     ToInputName);
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mat.set_expression_parameter ──────────────────────────────────────────────────────────────
@@ -1630,6 +1534,11 @@ FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
+	// Inline PIE-check + outer FScopedTransaction here (NOT FMCPMutatorScope) — we already have an
+	// inner FMCPWritePropertyScope (which opens its OWN transaction for the property write); the
+	// outer FScopedTransaction additionally captures the material Pre/PostEditChange cascade. PIE
+	// guard runs inside MAT_PreWriteResolveBaseMaterial.
+
 	UMaterial* Material = nullptr;
 	FString Path;
 	FMCPResponse Err;
@@ -1639,23 +1548,22 @@ FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
 	if (!MAT_RequireExpressionGuid(Request, TEXT("expression_guid"), ExprGuidStr, Err)) { return Err; }
 
 	FString PropertyName;
-	if (!Request.Args->TryGetStringField(TEXT("property_name"), PropertyName) || PropertyName.IsEmpty())
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_name"), PropertyName, Err))
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
-			TEXT("missing required string field 'property_name'"));
+		return Err;
 	}
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return MAT_MakeError(Request, kMATErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMATErrorInvalidParams,
 			TEXT("missing required field 'value' (any JSON value matching the property type)"));
 	}
 
 	UMaterialExpression* Expression = MAT_FindExpressionByGuid(Material, ExprGuidStr);
 	if (!Expression)
 	{
-		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("expression_guid '%s' not found in material '%s'"),
 				*ExprGuidStr, *Path));
 	}
@@ -1663,7 +1571,7 @@ FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
 	FProperty* Prop = Expression->GetClass()->FindPropertyByName(FName(*PropertyName));
 	if (!Prop)
 	{
-		return MAT_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(TEXT("property '%s' not found on expression class '%s'"),
 				*PropertyName, *Expression->GetClass()->GetPathName()));
 	}
@@ -1675,7 +1583,7 @@ FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
 	Request.Args->TryGetBoolField(TEXT("bypass_readonly"), bBypassReadonly);
 	if (!MAT_PassEditConstGate(Prop, bBypassReadonly))
 	{
-		return MAT_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
 				TEXT("property '%s.%s' blocked by CPF_EditConst/BlueprintReadOnly/DisableEditOnInstance; ")
 				TEXT("pass args.bypass_readonly=true to override"),
@@ -1706,7 +1614,7 @@ FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
 
 	if (!bWriteOk)
 	{
-		return MAT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("write rejected on '%s.%s': %s"),
 				*Expression->GetClass()->GetName(), *PropertyName, *WriteError));
 	}
@@ -1720,7 +1628,7 @@ FMCPResponse Tool_SetExpressionParameter(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("property_name"), PropertyName);
 	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
 	Out->SetField(TEXT("new_value"),   NewValue.IsValid()   ? NewValue   : MakeShared<FJsonValueNull>());
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mat.delete_expression ─────────────────────────────────────────────────────────────────────
@@ -1751,6 +1659,9 @@ FMCPResponse Tool_DeleteExpression(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPDeleteExpression", "MCP: delete material expression"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
 	UMaterial* Material = nullptr;
 	FString Path;
 	FMCPResponse Err;
@@ -1762,7 +1673,7 @@ FMCPResponse Tool_DeleteExpression(const FMCPRequest& Request)
 	UMaterialExpression* TargetExpr = MAT_FindExpressionByGuid(Material, ExprGuidStr);
 	if (!TargetExpr)
 	{
-		return MAT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("expression_guid '%s' not found in material '%s'"),
 				*ExprGuidStr, *Path));
 	}
@@ -1794,26 +1705,24 @@ FMCPResponse Tool_DeleteExpression(const FMCPRequest& Request)
 		}
 	}
 
-	{
-		FScopedTransaction Transaction(LOCTEXT("MCPDeleteExpression", "MCP: delete material expression"));
-		Material->Modify();
-		Material->PreEditChange(nullptr);
+	Material->Modify();
+	Material->PreEditChange(nullptr);
 
-		// Library handles: BreakLinksToExpression + MP_* input clear + RemoveExpressionParameter +
-		// ExpressionCollection.RemoveExpression + MarkAsGarbage + MarkPackageDirty.
-		UMaterialEditingLibrary::DeleteMaterialExpression(Material, TargetExpr);
+	// Library handles: BreakLinksToExpression + MP_* input clear + RemoveExpressionParameter +
+	// ExpressionCollection.RemoveExpression + MarkAsGarbage + MarkPackageDirty.
+	UMaterialEditingLibrary::DeleteMaterialExpression(Material, TargetExpr);
 
-		Material->PostEditChange();
-	}
+	Material->PostEditChange();
 
-	// MarkPackageDirty is also called inside DeleteMaterialExpression — redundant here is fine.
-	Material->GetOutermost()->MarkPackageDirty();
+	// MarkPackageDirty is also called inside DeleteMaterialExpression — Scope.DirtyPackage queues
+	// our pass as well (duplicate-skipped by the scope).
+	Scope.DirtyPackage(Material->GetPackage());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("deleted"), true);
 	Out->SetNumberField(TEXT("cleared_connections_count"), static_cast<double>(ClearedConnections));
 	Out->SetStringField(TEXT("expression_guid"), ExprGuidStr);
-	return MAT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

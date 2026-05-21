@@ -3,6 +3,7 @@
 #include "PIETools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -46,40 +47,14 @@ extern ENGINE_API float GAverageMS;
 
 namespace
 {
-	// PIE_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kPIEErrorInvalidParams = -32602;
-	constexpr int32 kPIEErrorInternal      = -32603;
-
-	void PIE_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse PIE_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		PIE_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse PIE_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		PIE_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	// PIE_ prefix retained for any helper unique to this surface.
+	constexpr int32 kPIEErrorInvalidParams = kMCPErrorInvalidParams;
+	constexpr int32 kPIEErrorInternal      = kMCPErrorInternal;
 
 	/** Frozen PIE-required refusal (-32038). Smoke asserts "PIE is not running" + "pie.start" + "editor.*". */
 	FMCPResponse PIE_MakeNotActiveError(const FMCPRequest& Request)
 	{
-		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 
 	// ─── PIE world helpers ──────────────────────────────────────────────────────────────────────
@@ -345,13 +320,13 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 
 	// Already-running guard — refuse rather than silently restarting.
 	if (GEditor->IsPlaySessionInProgress() || FMCPWorldContext::IsPIEActive())
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 			TEXT("PIE session already in progress; call pie.stop first or pie.is_running to check"));
 	}
 
@@ -365,7 +340,7 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 	FString ParseErr;
 	if (!PIE_ParseStartMode(ModeRaw, Mode, ParseErr))
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, ParseErr);
 	}
 
 	// Parse viewport_size (optional).
@@ -374,7 +349,7 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 	FString SizeErr;
 	if (!PIE_ReadViewportSize(Request.Args, Size, bSizePresent, SizeErr))
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, SizeErr);
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, SizeErr);
 	}
 
 	// Parse player_count (optional).
@@ -385,7 +360,7 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 	}
 	if (PlayerCount < 1 || PlayerCount > 4)
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("player_count must be in [1, 4]; got %d"), PlayerCount));
 	}
 
@@ -397,7 +372,7 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 	ULevelEditorPlaySettings* PlaySettings = GetMutableDefault<ULevelEditorPlaySettings>();
 	if (!PlaySettings)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 			TEXT("ULevelEditorPlaySettings CDO unavailable"));
 	}
 
@@ -462,7 +437,7 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 	{
 		Out->SetStringField(TEXT("pie_world_path"), PlayWorldPath);
 	}
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.stop ──────────────────────────────────────────────────────────────────────────────────
@@ -483,7 +458,7 @@ FMCPResponse Tool_Stop(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 	if (!FMCPWorldContext::IsPIEActive())
 	{
@@ -494,7 +469,7 @@ FMCPResponse Tool_Stop(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("stopped"), true);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.pause ─────────────────────────────────────────────────────────────────────────────────
@@ -512,7 +487,7 @@ FMCPResponse Tool_Pause(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 	if (!FMCPWorldContext::IsPIEActive())
 	{
@@ -527,7 +502,7 @@ FMCPResponse Tool_Pause(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("paused"), bOk);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.resume ────────────────────────────────────────────────────────────────────────────────
@@ -543,7 +518,7 @@ FMCPResponse Tool_Resume(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 	if (!FMCPWorldContext::IsPIEActive())
 	{
@@ -554,7 +529,7 @@ FMCPResponse Tool_Resume(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("resumed"), bOk);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.step_frame ────────────────────────────────────────────────────────────────────────────
@@ -575,7 +550,7 @@ FMCPResponse Tool_StepFrame(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 	if (!FMCPWorldContext::IsPIEActive())
 	{
@@ -584,7 +559,7 @@ FMCPResponse Tool_StepFrame(const FMCPRequest& Request)
 	// Step requires pause — refuse otherwise so caller doesn't silently miss the requirement.
 	if (!PIE_IsAnyWorldPaused())
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 			TEXT("pie.step_frame requires PIE to be paused first; call pie.pause"));
 	}
 
@@ -594,7 +569,7 @@ FMCPResponse Tool_StepFrame(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("advanced"), true);
 	// GFrameCounter is the global engine frame index — a monotonic uint64. Cast to double for JSON.
 	Out->SetNumberField(TEXT("current_frame"), static_cast<double>(GFrameCounter));
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.console_exec ──────────────────────────────────────────────────────────────────────────
@@ -620,12 +595,12 @@ FMCPResponse Tool_ConsoleExec(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString Command;
 	if (!Request.Args->TryGetStringField(TEXT("command"), Command) || Command.IsEmpty())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			TEXT("missing required string field 'command'"));
 	}
 	FString WorldArg = TEXT("pie");
@@ -638,7 +613,7 @@ FMCPResponse Tool_ConsoleExec(const FMCPRequest& Request)
 		UWorld* Editor = FMCPWorldContext::GetEditorWorld();
 		if (!Editor)
 		{
-			return PIE_MakeError(Request, kPIEErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 				TEXT("no editor world available (GEditor missing?)"));
 		}
 		Targets.Add(Editor);
@@ -652,7 +627,7 @@ FMCPResponse Tool_ConsoleExec(const FMCPRequest& Request)
 		UWorld* Server = PIE_FindServerWorld();
 		if (!Server)
 		{
-			return PIE_MakeError(Request, kPIEErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 				TEXT("no dedicated-server PIE world (NO_SERVER_WORLD) — start PIE with multiplayer + dedicated server"));
 		}
 		Targets.Add(Server);
@@ -710,7 +685,7 @@ FMCPResponse Tool_ConsoleExec(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("executed"), bAnyOk);
 	Out->SetStringField(TEXT("output"), static_cast<const FString&>(OutputDevice));
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.is_running ────────────────────────────────────────────────────────────────────────────
@@ -732,7 +707,7 @@ FMCPResponse Tool_IsRunning(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("running"), bRunning);
 	Out->SetBoolField(TEXT("paused"), bPaused);
 	Out->SetNumberField(TEXT("world_count"), static_cast<double>(WorldCount));
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.get_player_controller ─────────────────────────────────────────────────────────────────
@@ -762,21 +737,21 @@ FMCPResponse Tool_GetPlayerController(const FMCPRequest& Request)
 	}
 	if (Index < 0)
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("player_index must be >= 0; got %d"), Index));
 	}
 
 	UWorld* World = PIE_FindFirstClientWorld();
 	if (!World)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 			TEXT("no PIE client world available (PIE may still be initialising)"));
 	}
 
 	APlayerController* PC = UGameplayStatics::GetPlayerController(World, Index);
 	if (!PC)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("no PlayerController at player_index=%d (INVALID_PLAYER_INDEX); use pie.is_running to inspect world_count"),
 				Index));
@@ -785,7 +760,7 @@ FMCPResponse Tool_GetPlayerController(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	TSharedPtr<FJsonObject> OutPtr = Out;
 	PIE_AddActorIdentityFields(PC, TEXT("pc_actor_guid"), TEXT("pc_path"), OutPtr);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.get_pawn ──────────────────────────────────────────────────────────────────────────────
@@ -815,21 +790,21 @@ FMCPResponse Tool_GetPawn(const FMCPRequest& Request)
 	}
 	if (Index < 0)
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("player_index must be >= 0; got %d"), Index));
 	}
 
 	UWorld* World = PIE_FindFirstClientWorld();
 	if (!World)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 			TEXT("no PIE client world available (PIE may still be initialising)"));
 	}
 
 	APlayerController* PC = UGameplayStatics::GetPlayerController(World, Index);
 	if (!PC)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("no PlayerController at player_index=%d (INVALID_PLAYER_INDEX); use pie.is_running"),
 				Index));
@@ -837,7 +812,7 @@ FMCPResponse Tool_GetPawn(const FMCPRequest& Request)
 	APawn* Pawn = PC->GetPawn();
 	if (!Pawn)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("PlayerController at player_index=%d has no possessed Pawn (NO_PAWN); possess one or wait for spawn"),
 				Index));
@@ -847,7 +822,7 @@ FMCPResponse Tool_GetPawn(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> OutPtr = Out;
 	PIE_AddActorIdentityFields(Pawn, TEXT("pawn_actor_guid"), TEXT("pawn_path"), OutPtr);
 	Out->SetStringField(TEXT("class"), Pawn->GetClass()->GetPathName());
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.focus_actor ───────────────────────────────────────────────────────────────────────────
@@ -875,7 +850,7 @@ FMCPResponse Tool_FocusActor(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 	if (!FMCPWorldContext::IsPIEActive())
 	{
@@ -883,12 +858,12 @@ FMCPResponse Tool_FocusActor(const FMCPRequest& Request)
 	}
 	if (!Request.Args.IsValid())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString ActorId;
 	if (!Request.Args->TryGetStringField(TEXT("actor_id"), ActorId) || ActorId.IsEmpty())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			TEXT("missing required string field 'actor_id'"));
 	}
 
@@ -898,7 +873,7 @@ FMCPResponse Tool_FocusActor(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("camera_distance"), CameraDistance);
 	if (CameraDistance < 1.0)
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("camera_distance must be >= 1.0; got %g"), CameraDistance));
 	}
 
@@ -909,7 +884,7 @@ FMCPResponse Tool_FocusActor(const FMCPRequest& Request)
 		/*bRejectPIE*/ false, bAmbig, AmbigHint, ResolveErr);
 	if (!Target)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
 	}
 
 	// bActiveViewportOnly=true — restrict the jump to the focused viewport so we don't disturb
@@ -918,7 +893,7 @@ FMCPResponse Tool_FocusActor(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("focused"), true);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -939,17 +914,17 @@ FMCPResponse Tool_SimulateKey(const FMCPRequest& Request)
 	check(IsInGameThread());
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 	if (!Request.Args.IsValid())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("pie.simulate_key requires args.key"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("pie.simulate_key requires args.key"));
 	}
 	FString KeyName, Action(TEXT("tap"));
 	int32 PlayerIdx = 0;
 	if (!Request.Args->TryGetStringField(TEXT("key"), KeyName) || KeyName.IsEmpty())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing required string 'key'"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("missing required string 'key'"));
 	}
 	Request.Args->TryGetStringField(TEXT("action"), Action);
 	Request.Args->TryGetNumberField(TEXT("player_index"), PlayerIdx);
@@ -957,14 +932,14 @@ FMCPResponse Tool_SimulateKey(const FMCPRequest& Request)
 	const FKey TheKey(*KeyName);
 	if (!TheKey.IsValid())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("unknown FKey name '%s' (see FKey reference, e.g. 'W', 'Space', 'LeftMouseButton')"), *KeyName));
 	}
 
 	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
 	if (!PC)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no PlayerController at player_index=%d"), PlayerIdx));
 	}
 
@@ -979,7 +954,7 @@ FMCPResponse Tool_SimulateKey(const FMCPRequest& Request)
 	}
 	if (ActionLower != TEXT("press") && ActionLower != TEXT("release") && ActionLower != TEXT("tap"))
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("unknown action '%s'; use 'press', 'release', or 'tap'"), *Action));
 	}
 
@@ -987,7 +962,7 @@ FMCPResponse Tool_SimulateKey(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("simulated"), true);
 	Out->SetStringField(TEXT("key"), KeyName);
 	Out->SetStringField(TEXT("action"), ActionLower);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.click_screen — synthesize a click at screen coordinates ────────────────────────────
@@ -1004,18 +979,18 @@ FMCPResponse Tool_ClickScreen(const FMCPRequest& Request)
 	check(IsInGameThread());
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 	if (!Request.Args.IsValid())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			TEXT("pie.click_screen requires args.x + args.y"));
 	}
 
 	double X = -1, Y = -1;
 	if (!Request.Args->TryGetNumberField(TEXT("x"), X) || !Request.Args->TryGetNumberField(TEXT("y"), Y))
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.x or args.y"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.x or args.y"));
 	}
 	FString Button(TEXT("left"));
 	Request.Args->TryGetStringField(TEXT("button"), Button);
@@ -1025,7 +1000,7 @@ FMCPResponse Tool_ClickScreen(const FMCPRequest& Request)
 	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
 	if (!PC)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no PlayerController at player_index=%d"), PlayerIdx));
 	}
 
@@ -1036,7 +1011,7 @@ FMCPResponse Tool_ClickScreen(const FMCPRequest& Request)
 	else if (BLow == TEXT("middle")) { MouseKey = EKeys::MiddleMouseButton; }
 	else
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("unknown button '%s'; use left/right/middle"), *Button));
 	}
 
@@ -1066,7 +1041,7 @@ FMCPResponse Tool_ClickScreen(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("x"), X);
 	Out->SetNumberField(TEXT("y"), Y);
 	Out->SetStringField(TEXT("button"), BLow);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.click_actor — project actor world pos to screen, then click ────────────────────────
@@ -1075,17 +1050,17 @@ FMCPResponse Tool_ClickActor(const FMCPRequest& Request)
 	check(IsInGameThread());
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 	if (!Request.Args.IsValid())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			TEXT("pie.click_actor requires args.actor_path"));
 	}
 	FString ActorPath, Button(TEXT("left"));
 	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath))
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.actor_path"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.actor_path"));
 	}
 	Request.Args->TryGetStringField(TEXT("button"), Button);
 	int32 PlayerIdx = 0;
@@ -1097,20 +1072,20 @@ FMCPResponse Tool_ClickActor(const FMCPRequest& Request)
 		bAmbig, AmbigHint, ResolveErr);
 	if (!Target)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
 	}
 
 	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
 	if (!PC)
 	{
-		return PIE_MakeError(Request, kMCPErrorObjectNotFound, TEXT("no PlayerController for projection"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, TEXT("no PlayerController for projection"));
 	}
 
 	FVector2D ScreenPos(0, 0);
 	const bool bProj = PC->ProjectWorldLocationToScreen(Target->GetActorLocation(), ScreenPos);
 	if (!bProj)
 	{
-		return PIE_MakeError(Request, kPIEErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 			TEXT("could not project actor world location to screen (behind camera?)"));
 	}
 
@@ -1138,7 +1113,7 @@ FMCPResponse Tool_ClickActor(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("screen_x"), ScreenPos.X);
 	Out->SetNumberField(TEXT("screen_y"), ScreenPos.Y);
 	Out->SetStringField(TEXT("button"), BLow);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.set_time_dilation — global time scale via UGameplayStatics::SetGlobalTimeDilation ──
@@ -1147,21 +1122,21 @@ FMCPResponse Tool_SetTimeDilation(const FMCPRequest& Request)
 	check(IsInGameThread());
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 	if (!Request.Args.IsValid())
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			TEXT("pie.set_time_dilation requires args.scale"));
 	}
 	double Scale = 1.0;
 	if (!Request.Args->TryGetNumberField(TEXT("scale"), Scale))
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.scale"));
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.scale"));
 	}
 	if (Scale < 0.0001 || Scale > 100.0)
 	{
-		return PIE_MakeError(Request, kPIEErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
 			FString::Printf(TEXT("scale=%g outside [0.0001, 100.0]"), Scale));
 	}
 	const float Prior = UGameplayStatics::GetGlobalTimeDilation(GEditor->PlayWorld);
@@ -1171,7 +1146,7 @@ FMCPResponse Tool_SetTimeDilation(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("applied"), true);
 	Out->SetNumberField(TEXT("prior_scale"), static_cast<double>(Prior));
 	Out->SetNumberField(TEXT("new_scale"), Scale);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.get_stats — collect runtime stats snapshot ────────────────────────────────────────
@@ -1180,7 +1155,7 @@ FMCPResponse Tool_GetStats(const FMCPRequest& Request)
 	check(IsInGameThread());
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 	UWorld* W = GEditor->PlayWorld;
 
@@ -1212,7 +1187,7 @@ FMCPResponse Tool_GetStats(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("time_seconds"),  W->GetTimeSeconds());
 	Out->SetNumberField(TEXT("time_dilation"), static_cast<double>(UGameplayStatics::GetGlobalTimeDilation(W)));
 	Out->SetStringField(TEXT("world_path"),    W->GetPathName());
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── pie.dump_world_state — JSON snapshot of all PIE actors (compact form) ─────────────────
@@ -1221,7 +1196,7 @@ FMCPResponse Tool_DumpWorldState(const FMCPRequest& Request)
 	check(IsInGameThread());
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return PIE_MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
 	}
 	UWorld* W = GEditor->PlayWorld;
 
@@ -1239,7 +1214,7 @@ FMCPResponse Tool_DumpWorldState(const FMCPRequest& Request)
 		}
 		if (!FilterClass)
 		{
-			return PIE_MakeError(Request, kMCPErrorClassNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 				FString::Printf(TEXT("could not resolve class_filter '%s'"), *ClassFilter));
 		}
 	}
@@ -1276,7 +1251,7 @@ FMCPResponse Tool_DumpWorldState(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("world_path"), W->GetPathName());
 	Out->SetNumberField(TEXT("total"),      static_cast<double>(Total));
 	Out->SetArrayField(TEXT("actors"),      Actors);
-	return PIE_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

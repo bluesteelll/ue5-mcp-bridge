@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPLogStream.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
 
@@ -18,38 +19,14 @@
 
 namespace
 {
-	// LOG_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
+	// LOG_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj/RequireStringField removed in Phase 3 — see
+	// FMCPToolHelpers in MCPToolHelpers.h.
 	constexpr int32 kLOGErrorInvalidParams = -32602;
 	constexpr int32 kLOGErrorInternal      = -32603;
 
 	// Default page size for ``log.list_categories``. Mirrors Phase 4/5/6 pagination defaults.
 	constexpr int32 kLOGDefaultPageSize = 100;
-
-	void LOG_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse LOG_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		LOG_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse LOG_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		LOG_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	int32 LOG_ClampPageSize(const TSharedPtr<FJsonObject>& Args, const TCHAR* FieldName, int32 Default)
 	{
@@ -71,13 +48,13 @@ namespace
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(TokenWire, OutCursor, DecodeErr))
 		{
-			OutError = LOG_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = LOG_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated 'prefix_filter' between "
 					 "pages; restart pagination with page_token=null"));
 			return false;
@@ -203,27 +180,16 @@ FMCPResponse Tool_SetCategoryVerbosity(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (!Request.Args.IsValid())
-	{
-		return LOG_MakeError(Request, kLOGErrorInvalidParams, TEXT("missing args object"));
-	}
 	FString Category;
-	if (!Request.Args->TryGetStringField(TEXT("category"), Category) || Category.IsEmpty())
-	{
-		return LOG_MakeError(Request, kLOGErrorInvalidParams,
-			TEXT("missing required string field 'category'"));
-	}
 	FString RawVerbosity;
-	if (!Request.Args->TryGetStringField(TEXT("verbosity"), RawVerbosity) || RawVerbosity.IsEmpty())
-	{
-		return LOG_MakeError(Request, kLOGErrorInvalidParams,
-			TEXT("missing required string field 'verbosity'"));
-	}
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("category"),  Category,     Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("verbosity"), RawVerbosity, Err)) { return Err; }
 
 	const FString CanonVerbosity = LOG_CanonicaliseVerbosity(RawVerbosity);
 	if (CanonVerbosity.IsEmpty())
 	{
-		return LOG_MakeError(Request, kLOGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kLOGErrorInvalidParams,
 			FString::Printf(TEXT("verbosity '%s' is not a recognised token; accepted: %s"),
 				*RawVerbosity, LOG_AcceptedVerbositiesList()));
 	}
@@ -260,7 +226,7 @@ FMCPResponse Tool_SetCategoryVerbosity(const FMCPRequest& Request)
 		// StaticExec returns false when NO registered exec handled the command. This shouldn't
 		// happen for a properly-formed ``Log`` command (FLogSuppressionImplementation always
 		// claims it) but defensive surface in case the suppression impl is torn down mid-shutdown.
-		return LOG_MakeError(Request, kLOGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLOGErrorInternal,
 			FString::Printf(TEXT("FSelfRegisteringExec::StaticExec rejected command '%s'; "
 				"FLogSuppressionImplementation may not be initialised"), *CmdString));
 	}
@@ -285,7 +251,7 @@ FMCPResponse Tool_SetCategoryVerbosity(const FMCPRequest& Request)
 				"UE_LOG from this category to confirm the value took effect."), *Category));
 	}
 
-	return LOG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── log.list_categories ─────────────────────────────────────────────────────────────────────────
@@ -422,7 +388,7 @@ FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
 	}
-	return LOG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── log.clear ───────────────────────────────────────────────────────────────────────────────────
@@ -455,7 +421,7 @@ FMCPResponse Tool_Clear(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("line_count_before"), static_cast<double>(PriorCount));
 	Out->SetNumberField(TEXT("ring_capacity"),  static_cast<double>(FMCPLogStream::kMaxEntries));
 	Out->SetNumberField(TEXT("total_observed"), static_cast<double>(FMCPLogStream::Get().GetTotalObserved()));
-	return LOG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

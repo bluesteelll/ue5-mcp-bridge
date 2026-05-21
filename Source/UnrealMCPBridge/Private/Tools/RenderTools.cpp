@@ -3,6 +3,8 @@
 #include "RenderTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPReflection.h"
@@ -14,7 +16,6 @@
 #include "Engine/Scene.h"
 #include "GameFramework/Actor.h"
 #include "LevelEditorViewport.h"
-#include "ScopedTransaction.h"
 #include "ShowFlags.h"
 #include "UObject/Package.h"
 #include "UObject/UnrealType.h"
@@ -26,40 +27,11 @@
 
 namespace
 {
-	// RND_ prefix per the unity-build symbol-collision convention.
+	// RND_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d). PIE-guard now lives in FMCPMutatorScope.
 	constexpr int32 kRNDErrorInvalidParams = -32602;
 	constexpr int32 kRNDErrorInternal      = -32603;
-
-	void RND_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse RND_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		RND_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse RND_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		RND_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	/** Frozen PIE-mutator refusal (only ``set_post_process_volume_property`` uses it). */
-	FMCPResponse RND_MakePIEError(const FMCPRequest& Request)
-	{
-		return RND_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
 
 	// ─── Viewport resolution (mirror of ViewportTools VPT_ResolveViewport semantics) ────────────────
 
@@ -78,7 +50,7 @@ namespace
 
 		if (!GEditor)
 		{
-			OutErr = RND_MakeError(Request, kRNDErrorInternal,
+			OutErr = FMCPToolHelpers::MakeError(Request, kRNDErrorInternal,
 				TEXT("GEditor unavailable (commandlet?)"));
 			return nullptr;
 		}
@@ -86,7 +58,7 @@ namespace
 		const TArray<FLevelEditorViewportClient*>& Clients = GEditor->GetLevelViewportClients();
 		if (Clients.Num() == 0)
 		{
-			OutErr = RND_MakeError(Request, kMCPErrorObjectNotFound,
+			OutErr = FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				TEXT("no level viewports available (open a level editor tab first)"));
 			return nullptr;
 		}
@@ -102,7 +74,7 @@ namespace
 		}
 		if (Index < 0 || Index >= Clients.Num())
 		{
-			OutErr = RND_MakeError(Request, kMCPErrorPropertyIndexOOB,
+			OutErr = FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyIndexOOB,
 				FString::Printf(
 					TEXT("viewport_index %d out of range [0, %d)"),
 					Index, Clients.Num()));
@@ -112,7 +84,7 @@ namespace
 		FLevelEditorViewportClient* VC = Clients[Index];
 		if (!VC)
 		{
-			OutErr = RND_MakeError(Request, kRNDErrorInternal,
+			OutErr = FMCPToolHelpers::MakeError(Request, kRNDErrorInternal,
 				FString::Printf(TEXT("level viewport client at index %d is null"), Index));
 			return nullptr;
 		}
@@ -217,7 +189,7 @@ FMCPResponse Tool_ListShowFlags(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("viewport_index"), VPIdx);
 	Out->SetNumberField(TEXT("count"), Arr.Num());
 	Out->SetArrayField(TEXT("flags"), Arr);
-	return RND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── render.set_show_flag ──────────────────────────────────────────────────────────────────────
@@ -233,20 +205,20 @@ FMCPResponse Tool_SetShowFlag(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString FlagName;
 	if (!Request.Args->TryGetStringField(TEXT("flag_name"), FlagName) || FlagName.IsEmpty())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams,
 			TEXT("missing required string field 'flag_name'"));
 	}
 
 	bool bEnabled = false;
 	if (!Request.Args->TryGetBoolField(TEXT("enabled"), bEnabled))
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams,
 			TEXT("missing required bool field 'enabled'"));
 	}
 
@@ -258,7 +230,7 @@ FMCPResponse Tool_SetShowFlag(const FMCPRequest& Request)
 	const int32 FlagIdx = FEngineShowFlags::FindIndexByName(*FlagName);
 	if (FlagIdx == INDEX_NONE)
 	{
-		return RND_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("show flag '%s' not found; use render.list_show_flags to enumerate"),
 				*FlagName));
 	}
@@ -275,7 +247,7 @@ FMCPResponse Tool_SetShowFlag(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("flag_name"), FlagName);
 	Out->SetBoolField(TEXT("prior_enabled"), bPrior);
 	Out->SetBoolField(TEXT("new_enabled"), bNew);
-	return RND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── render.set_engine_stat ────────────────────────────────────────────────────────────────────
@@ -296,26 +268,26 @@ FMCPResponse Tool_SetEngineStat(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString StatName;
 	if (!Request.Args->TryGetStringField(TEXT("stat_name"), StatName) || StatName.IsEmpty())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams,
 			TEXT("missing required string field 'stat_name'"));
 	}
 
 	bool bEnabled = false;
 	if (!Request.Args->TryGetBoolField(TEXT("enabled"), bEnabled))
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams,
 			TEXT("missing required bool field 'enabled'"));
 	}
 
 	if (!GEngine)
 	{
-		return RND_MakeError(Request, kRNDErrorInternal, TEXT("GEngine unavailable"));
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInternal, TEXT("GEngine unavailable"));
 	}
 
 	FMCPResponse Err;
@@ -332,7 +304,7 @@ FMCPResponse Tool_SetEngineStat(const FMCPRequest& Request)
 	}
 	if (!World)
 	{
-		return RND_MakeError(Request, kRNDErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInternal,
 			TEXT("no world available for SetEngineStat (no editor world)"));
 	}
 
@@ -355,7 +327,7 @@ FMCPResponse Tool_SetEngineStat(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("stat_name"), StatName);
 	Out->SetBoolField(TEXT("enabled"), bEnabled);
 	Out->SetStringField(TEXT("world_kind"), WorldKind);
-	return RND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── render.set_post_process_volume_property ───────────────────────────────────────────────────
@@ -372,7 +344,7 @@ FMCPResponse Tool_SetEngineStat(const FMCPRequest& Request)
 //                         volume actually applies the value)
 // }
 //
-// PIE-guarded. ``FScopedTransaction`` wraps the write so Ctrl-Z reverts it. ``MarkPackageDirty``
+// PIE-guarded. ``FMCPMutatorScope`` wraps the write so Ctrl-Z reverts it. ``MarkPackageDirty``
 // fires on the actor's external package (WorldPartition one-file-per-actor) with GetOutermost
 // fallback.
 //
@@ -385,34 +357,32 @@ FMCPResponse Tool_SetPostProcessVolumeProperty(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return RND_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_PPV_SetProperty", "MCP: set post-process property"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString VolumePath;
 	if (!Request.Args->TryGetStringField(TEXT("volume_actor_path"), VolumePath) || VolumePath.IsEmpty())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams,
 			TEXT("missing required string field 'volume_actor_path'"));
 	}
 
 	FString PropertyPath;
 	if (!Request.Args->TryGetStringField(TEXT("property_path"), PropertyPath) || PropertyPath.IsEmpty())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams,
 			TEXT("missing required string field 'property_path'"));
 	}
 
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return RND_MakeError(Request, kRNDErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kRNDErrorInvalidParams,
 			TEXT("missing required field 'value'"));
 	}
 
@@ -427,13 +397,13 @@ FMCPResponse Tool_SetPostProcessVolumeProperty(const FMCPRequest& Request)
 		const FString Msg = bAmbiguous
 			? FString::Printf(TEXT("actor '%s' ambiguous: %s"), *VolumePath, *AmbiguityHint)
 			: FString::Printf(TEXT("actor '%s' not found: %s"), *VolumePath, *ResolveErr);
-		return RND_MakeError(Request, kMCPErrorObjectNotFound, Msg);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, Msg);
 	}
 
 	APostProcessVolume* PPV = Cast<APostProcessVolume>(Actor);
 	if (!PPV)
 	{
-		return RND_MakeError(Request, kMCPErrorWrongClass,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 			FString::Printf(TEXT("actor '%s' is not an APostProcessVolume (got %s)"),
 				*VolumePath, *Actor->GetClass()->GetName()));
 	}
@@ -445,7 +415,7 @@ FMCPResponse Tool_SetPostProcessVolumeProperty(const FMCPRequest& Request)
 	FProperty* Prop = PPStruct->FindPropertyByName(FName(*FieldName));
 	if (!Prop)
 	{
-		return RND_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(
 				TEXT("property '%s' not found on FPostProcessSettings (accepted with or without "
 					 "'Settings.' prefix); use marshall.describe_struct on "
@@ -463,42 +433,36 @@ FMCPResponse Tool_SetPostProcessVolumeProperty(const FMCPRequest& Request)
 	// Snapshot prior value BEFORE the write so the response can carry the diff.
 	TSharedPtr<FJsonValue> PriorValue = RND_ReadPostProcessField(PPV->Settings, Prop);
 
-	// Mutation block — PreEditChange / Modify / FScopedTransaction in ctor, PostEditChange in dtor.
-	FString WriteError;
-	bool bWriteOk = false;
+	// Mutation — PreEditChange / Modify, then write, then PostEditChange. The surrounding
+	// FMCPMutatorScope holds the FScopedTransaction so undo/redo captures this entire block.
+	PPV->Modify();
+	PPV->PreEditChange(Prop);
+
+	// Force companion bOverride_<X> = true so the volume actually applies the override. Without
+	// this the FPostProcessSettings field is ignored at evaluation time.
+	if (OverrideBool)
 	{
-		// ``PreEditChange`` on the volume itself (not the inner struct field) so the editor
-		// notifications wired to the actor's Details panel fire. ``Modify()`` registers the
-		// transaction. ``FScopedTransaction`` lifetime ends when the block exits, dirtying the
-		// transaction buffer.
-		FScopedTransaction Transaction(LOCTEXT("MCP_PPV_SetProperty", "MCP: set post-process property"));
-		PPV->Modify();
-		PPV->PreEditChange(Prop);
-
-		// Force companion bOverride_<X> = true so the volume actually applies the override. Without
-		// this the FPostProcessSettings field is ignored at evaluation time.
-		if (OverrideBool)
-		{
-			OverrideBool->SetPropertyValue_InContainer(&PPV->Settings, true);
-		}
-
-		// Write the actual value via the universal reflection helper. ``OwnerObject = PPV`` is
-		// forwarded to ImportText for text-fallback path (some inner FStructProperty unmarshallers
-		// need an outer to resolve relative refs).
-		void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(&PPV->Settings);
-		bWriteOk = FMCPReflection::WritePropertyValueAt(Prop, ValuePtr, ValueField, PPV, WriteError);
-
-		// PostEditChangeProperty MUST fire whether or not the write succeeded — Pre/Post pair is
-		// non-negotiable per the FProperty edit contract. The PropertyChangedEvent carries the
-		// inner Settings field so any Edit-time delegates (PostProcessComponent rebuild, etc.) get
-		// notified.
-		FPropertyChangedEvent ChangeEvent(Prop);
-		PPV->PostEditChangeProperty(ChangeEvent);
+		OverrideBool->SetPropertyValue_InContainer(&PPV->Settings, true);
 	}
+
+	// Write the actual value via the universal reflection helper. ``OwnerObject = PPV`` is
+	// forwarded to ImportText for text-fallback path (some inner FStructProperty unmarshallers
+	// need an outer to resolve relative refs).
+	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(&PPV->Settings);
+	FString WriteError;
+	const bool bWriteOk = FMCPReflection::WritePropertyValueAt(Prop, ValuePtr, ValueField, PPV, WriteError);
+
+	// PostEditChangeProperty MUST fire whether or not the write succeeded — Pre/Post pair is
+	// non-negotiable per the FProperty edit contract. The PropertyChangedEvent carries the
+	// inner Settings field so any Edit-time delegates (PostProcessComponent rebuild, etc.) get
+	// notified.
+	FPropertyChangedEvent ChangeEvent(Prop);
+	PPV->PostEditChangeProperty(ChangeEvent);
 
 	if (!bWriteOk)
 	{
-		return RND_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("write rejected for '%s': %s"), *FieldName, *WriteError));
 	}
 
@@ -512,10 +476,7 @@ FMCPResponse Tool_SetPostProcessVolumeProperty(const FMCPRequest& Request)
 	{
 		DirtyPkg = PPV->GetOutermost();
 	}
-	if (DirtyPkg)
-	{
-		DirtyPkg->MarkPackageDirty();
-	}
+	Scope.DirtyPackage(DirtyPkg);
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("volume_actor_path"), PPV->GetPathName());
@@ -523,7 +484,7 @@ FMCPResponse Tool_SetPostProcessVolumeProperty(const FMCPRequest& Request)
 	Out->SetField(TEXT("prior_value"), PriorValue);
 	Out->SetField(TEXT("new_value"), NewValue);
 	Out->SetBoolField(TEXT("bOverride_set"), bHasOverrideCompanion);
-	return RND_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

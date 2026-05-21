@@ -3,6 +3,8 @@
 #include "ActorTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPPageCursor.h"
@@ -20,6 +22,7 @@
 #include "Selection.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
+#include "Internationalization/Text.h"
 #include "Math/Quat.h"
 #include "Math/Rotator.h"
 #include "Math/Transform.h"
@@ -37,41 +40,12 @@
 
 namespace
 {
-	// ACT_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
-	constexpr int32 kACTErrorInvalidParams = -32602;
-	constexpr int32 kACTErrorInternal      = -32603;
-
-	void ACT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse ACT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		ACT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse ACT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		ACT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	/** Frozen PIE-mutator refusal (per D10 — smoke asserts both "Phase 5" and "pie." substrings). */
-	FMCPResponse ACT_MakePIEError(const FMCPRequest& Request)
-	{
-		return ACT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	// ACT_ prefix per the unity-build symbol-collision pattern. XX_StampIds / XX_MakeError /
+	// XX_MakeSuccessObj / XX_MakePIEError removed in Phase 3 — use FMCPToolHelpers::Xxx and
+	// FMCPMutatorScope from MCPToolHelpers.h / MCPMutatorScope.h. kMCPErrorInvalidParams replaced
+	// by canonical kMCPErrorInvalidParams. Per-surface internal code retained for readability —
+	// same value as kMCPErrorInternal, distinct semantic naming.
+	constexpr int32 kACTErrorInternal = -32603;
 
 	// ─── arg parsing helpers ─────────────────────────────────────────────────────────────────────
 
@@ -124,22 +98,11 @@ namespace
 		return true;
 	}
 
-	/** Read ``args.actor_path`` field; emit kACTErrorInvalidParams on missing/empty. */
+	/** Read ``args.actor_path`` field; emit -32602 on missing/empty. */
 	bool ACT_RequireActorPath(const FMCPRequest& Request, FString& OutPath, FMCPResponse& OutError,
 		const TCHAR* FieldName = TEXT("actor_path"))
 	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = ACT_MakeError(Request, kACTErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutPath) || OutPath.IsEmpty())
-		{
-			OutError = ACT_MakeError(Request, kACTErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
+		return FMCPToolHelpers::RequireStringField(Request, FieldName, OutPath, OutError);
 	}
 
 	/**
@@ -163,7 +126,7 @@ namespace
 		AActor* Actor = FMCPActorPathUtils::ResolveActor(Path, bRejectPIE, bAmbig, AmbigHint, ResolveErr);
 		if (!Actor)
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, ResolveErr);
 			return nullptr;
 		}
 		if (bCheckSublevelVisible)
@@ -171,7 +134,7 @@ namespace
 			const ULevel* Level = Actor->GetLevel();
 			if (Level && !Level->bIsVisible)
 			{
-				OutError = ACT_MakeError(Request, kMCPErrorLevelNotFound,
+				OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 					FString::Printf(
 						TEXT("actor '%s' owning sublevel '%s' is loaded but not visible/loaded; cannot mutate"),
 						*Actor->GetName(),
@@ -379,7 +342,7 @@ namespace
 		// Syntactic shape: must start with '/', no backslashes.
 		if (ClassPath.IsEmpty() || ClassPath[0] != TEXT('/'))
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(
 					TEXT("class_path '%s' invalid — must start with '/' (e.g. '/Script/Engine.StaticMeshActor' or '/Game/Blueprints/BP_Foo.BP_Foo_C')"),
 					*ClassPath));
@@ -387,7 +350,7 @@ namespace
 		}
 		if (ClassPath.Contains(TEXT("\\")))
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorInvalidClassPath,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 				FString::Printf(TEXT("class_path '%s' contains backslash"), *ClassPath));
 			return nullptr;
 		}
@@ -406,7 +369,7 @@ namespace
 		}
 		if (!Class)
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorClassNotFound,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 				FString::Printf(
 					TEXT("class_path '%s' could not be resolved to a UClass (LoadObject returned null); ")
 					TEXT("for Blueprint paths try with trailing '_C', e.g. '/Game/BP_Foo.BP_Foo_C'"),
@@ -415,7 +378,7 @@ namespace
 		}
 		if (Class->HasAnyClassFlags(CLASS_Abstract))
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorClassAbstract,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorClassAbstract,
 				FString::Printf(
 					TEXT("class '%s' is abstract — pick a concrete subclass"),
 					*Class->GetPathName()));
@@ -423,7 +386,7 @@ namespace
 		}
 		if (!Class->IsChildOf(AActor::StaticClass()))
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorWrongClassFamily,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 				FString::Printf(
 					TEXT("class '%s' is not an AActor subclass (got base '%s')"),
 					*Class->GetPathName(),
@@ -537,13 +500,13 @@ namespace
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(TokenWire, OutCursor, DecodeErr))
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				FString::Printf(TEXT("page_token decode failed: %s"), *DecodeErr));
 			return false;
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(OutCursor, ExpectedFilterHash))
 		{
-			OutError = ACT_MakeError(Request, kMCPErrorStaleCursor,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("page_token filter_hash mismatch — caller mutated filter between pages; "
 					 "restart pagination with page_token=null"));
 			return false;
@@ -561,7 +524,7 @@ namespace
 		const FString& NextSentinel,
 		uint64 FilterHash)
 	{
-		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		TArray<TSharedPtr<FJsonValue>> Items;
 		Items.Reserve(PageActors.Num());
 		for (const AActor* A : PageActors)
@@ -583,7 +546,7 @@ namespace
 			Cursor.TotalKnownSnapshot = TotalKnown;
 			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(Cursor));
 		}
-		return ACT_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// ─── cycle detection (attach) ────────────────────────────────────────────────────────────────
@@ -664,20 +627,18 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorSpawn", "MCP: spawn actor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 
@@ -691,7 +652,7 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 	UWorld* World = FMCPWorldContext::GetEditorWorld();
 	if (!World)
 	{
-		return ACT_MakeError(Request, kMCPErrorLevelNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 			TEXT("no editor world available (GEditor missing)"));
 	}
 
@@ -742,12 +703,12 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 		ULevel* Sublevel = FMCPWorldContext::ResolveLevelOrNull(World, TargetLevel);
 		if (!Sublevel)
 		{
-			return ACT_MakeError(Request, kMCPErrorLevelNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				FString::Printf(TEXT("target_level '%s' is not a loaded sublevel"), *TargetLevel));
 		}
 		if (!Sublevel->bIsVisible)
 		{
-			return ACT_MakeError(Request, kMCPErrorLevelNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound,
 				FString::Printf(TEXT("target_level '%s' is loaded but not visible — cannot spawn into hidden sublevels"),
 					*TargetLevel));
 		}
@@ -766,14 +727,14 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 		if (!TemplateActor) { return ResolveErr; }
 		if (TemplateActor->GetWorld() != World)
 		{
-			return ACT_MakeError(Request, kMCPErrorLevelNotStreamingEntry,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotStreamingEntry,
 				FString::Printf(
 					TEXT("template_actor_path '%s' lives in a different world than the spawn target — cross-world template rejected"),
 					*TemplateActorPath));
 		}
 		if (!TemplateActor->IsA(Class))
 		{
-			return ACT_MakeError(Request, kMCPErrorWrongClassFamily,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 				FString::Printf(
 					TEXT("template_actor_path '%s' is a '%s' but class_path requested '%s' — template class must match"),
 					*TemplateActorPath, *TemplateActor->GetClass()->GetPathName(), *Class->GetPathName()));
@@ -791,7 +752,7 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 		if (!OwnerActor) { return ResolveErr; }
 		if (OwnerActor->GetWorld() != World)
 		{
-			return ACT_MakeError(Request, kMCPErrorLevelNotStreamingEntry,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotStreamingEntry,
 				FString::Printf(
 					TEXT("owner_path '%s' lives in a different world than the spawn target — cross-world owner rejected"),
 					*OwnerPath));
@@ -829,20 +790,18 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 		}
 		else
 		{
-			return ACT_MakeError(Request, kACTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("collision_handling '%s' unknown — expected Default / AlwaysSpawn / AdjustIfPossibleButAlwaysSpawn / AdjustIfPossibleButDontSpawnIfColliding / DontSpawnIfColliding"),
 					*CollisionStr));
 		}
 	}
 
-	// Spawn under transaction so undo restores cleanly.
-	const FScopedTransaction Transaction(LOCTEXT("ActorSpawn", "MCP: spawn actor"));
-
+	// Scope (declared at function entry) owns the transaction so undo restores cleanly.
 	const FTransform SpawnTransform(Rotation.Quaternion(), Location, bHasScale ? Scale : FVector::OneVector);
 	AActor* NewActor = World->SpawnActor(Class, &SpawnTransform, Params);
 	if (!NewActor)
 	{
-		return ACT_MakeError(Request, kACTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal,
 			FString::Printf(
 				TEXT("World->SpawnActor('%s') returned null — collision rejected? construction-script failed? see editor log"),
 				*Class->GetPathName()));
@@ -886,7 +845,7 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("map_path"), L->GetOutermost() ? L->GetOutermost()->GetName() : FString());
 	}
 	Out->SetObjectField(TEXT("transform"), ACT_TransformToJson(NewActor->GetActorTransform()));
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.destroy (mutator — PIE-guarded) ───────────────────────────────────────────────────
@@ -899,10 +858,8 @@ FMCPResponse Tool_Destroy(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorDestroy", "MCP: destroy actor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -915,7 +872,6 @@ FMCPResponse Tool_Destroy(const FMCPRequest& Request)
 
 	const FString CanonicalPath = FMCPActorPathUtils::BuildActorPath(Actor);
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorDestroy", "MCP: destroy actor"));
 	UWorld* World = Actor->GetWorld();
 	check(World);
 
@@ -926,10 +882,10 @@ FMCPResponse Tool_Destroy(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), CanonicalPath);
 	if (!bOk)
 	{
-		return ACT_MakeError(Request, kACTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal,
 			FString::Printf(TEXT("EditorDestroyActor('%s') returned false"), *CanonicalPath));
 	}
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.duplicate (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -947,10 +903,8 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorDuplicate", "MCP: duplicate actor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString SourcePath;
 	FMCPResponse PathErr;
@@ -985,8 +939,6 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	}
 #endif
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorDuplicate", "MCP: duplicate actor"));
-
 	const FTransform NewTransform(
 		Source->GetActorQuat(),
 		Source->GetActorLocation() + OffsetLoc,
@@ -995,7 +947,7 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	AActor* NewActor = World->SpawnActor(Source->GetClass(), &NewTransform, Params);
 	if (!NewActor)
 	{
-		return ACT_MakeError(Request, kACTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal,
 			FString::Printf(TEXT("SpawnActor for duplicate of '%s' returned null"), *SourcePath));
 	}
 
@@ -1016,7 +968,7 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("map_path"), L->GetOutermost() ? L->GetOutermost()->GetName() : FString());
 	}
 	Out->SetObjectField(TEXT("transform"), ACT_TransformToJson(NewActor->GetActorTransform()));
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.get (read-only — works in PIE) ────────────────────────────────────────────────────
@@ -1039,7 +991,7 @@ FMCPResponse Tool_Get(const FMCPRequest& Request)
 		Request, Path, /*bRejectPIE*/ false, /*bCheckSublevelVisible*/ false, ResolveErr);
 	if (!Actor) { return ResolveErr; }
 
-	return ACT_MakeSuccessObj(Request, ACT_BuildActorSnapshot(Actor));
+	return FMCPToolHelpers::MakeSuccessObj(Request, ACT_BuildActorSnapshot(Actor));
 }
 
 // ─── actor.set_transform (mutator — PIE-guarded) ─────────────────────────────────────────────
@@ -1053,10 +1005,8 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorSetTransform", "MCP: set actor transform"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1103,11 +1053,10 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 
 	if (!bAnyField)
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("actor.set_transform: at least one of location / rotation / scale must be provided"));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorSetTransform", "MCP: set actor transform"));
 	Actor->Modify();
 	Actor->SetActorTransform(NewT);
 
@@ -1115,7 +1064,7 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("ok"), true);
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetObjectField(TEXT("transform"), ACT_TransformToJson(Actor->GetActorTransform()));
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.set_location (mutator — PIE-guarded) ──────────────────────────────────────────────
@@ -1128,10 +1077,8 @@ FMCPResponse Tool_SetLocation(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorSetLocation", "MCP: set actor location"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1140,13 +1087,13 @@ FMCPResponse Tool_SetLocation(const FMCPRequest& Request)
 	const TSharedPtr<FJsonObject>* LocObj = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("location"), LocObj) || !LocObj || !LocObj->IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required object field 'location'"));
 	}
 	FVector NewLoc;
 	if (!ACT_ReadJsonVector(*LocObj, NewLoc))
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("'location' must contain at least one of x/y/z numeric fields"));
 	}
 
@@ -1155,7 +1102,6 @@ FMCPResponse Tool_SetLocation(const FMCPRequest& Request)
 		Request, Path, /*bRejectPIE*/ true, /*bCheckSublevelVisible*/ true, ResolveErr);
 	if (!Actor) { return ResolveErr; }
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorSetLocation", "MCP: set actor location"));
 	Actor->Modify();
 	Actor->SetActorLocation(NewLoc);
 
@@ -1163,7 +1109,7 @@ FMCPResponse Tool_SetLocation(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("ok"), true);
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetObjectField(TEXT("location"), ACT_VectorToJson(Actor->GetActorLocation()));
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.set_rotation (mutator — PIE-guarded) ──────────────────────────────────────────────
@@ -1174,10 +1120,8 @@ FMCPResponse Tool_SetRotation(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorSetRotation", "MCP: set actor rotation"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1186,13 +1130,13 @@ FMCPResponse Tool_SetRotation(const FMCPRequest& Request)
 	const TSharedPtr<FJsonObject>* RotObj = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("rotation"), RotObj) || !RotObj || !RotObj->IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required object field 'rotation'"));
 	}
 	FRotator NewRot;
 	if (!ACT_ReadJsonRotator(*RotObj, NewRot))
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("'rotation' must contain at least one of pitch/yaw/roll numeric fields"));
 	}
 
@@ -1201,7 +1145,6 @@ FMCPResponse Tool_SetRotation(const FMCPRequest& Request)
 		Request, Path, /*bRejectPIE*/ true, /*bCheckSublevelVisible*/ true, ResolveErr);
 	if (!Actor) { return ResolveErr; }
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorSetRotation", "MCP: set actor rotation"));
 	Actor->Modify();
 	Actor->SetActorRotation(NewRot);
 
@@ -1209,7 +1152,7 @@ FMCPResponse Tool_SetRotation(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("ok"), true);
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetObjectField(TEXT("rotation"), ACT_RotatorToJson(Actor->GetActorRotation()));
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.set_scale (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -1220,10 +1163,8 @@ FMCPResponse Tool_SetScale(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorSetScale", "MCP: set actor scale"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1232,13 +1173,13 @@ FMCPResponse Tool_SetScale(const FMCPRequest& Request)
 	const TSharedPtr<FJsonObject>* ScaleObj = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("scale"), ScaleObj) || !ScaleObj || !ScaleObj->IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required object field 'scale'"));
 	}
 	FVector NewScale;
 	if (!ACT_ReadJsonVector(*ScaleObj, NewScale))
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("'scale' must contain at least one of x/y/z numeric fields"));
 	}
 
@@ -1247,7 +1188,6 @@ FMCPResponse Tool_SetScale(const FMCPRequest& Request)
 		Request, Path, /*bRejectPIE*/ true, /*bCheckSublevelVisible*/ true, ResolveErr);
 	if (!Actor) { return ResolveErr; }
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorSetScale", "MCP: set actor scale"));
 	Actor->Modify();
 	Actor->SetActorScale3D(NewScale);
 
@@ -1255,7 +1195,7 @@ FMCPResponse Tool_SetScale(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("ok"), true);
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetObjectField(TEXT("scale"), ACT_VectorToJson(Actor->GetActorScale3D()));
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.set_label (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -1268,10 +1208,8 @@ FMCPResponse Tool_SetLabel(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorSetLabel", "MCP: set actor label"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1280,7 +1218,7 @@ FMCPResponse Tool_SetLabel(const FMCPRequest& Request)
 	FString NewLabel;
 	if (!Request.Args->TryGetStringField(TEXT("label"), NewLabel))
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'label'"));
 	}
 
@@ -1292,7 +1230,6 @@ FMCPResponse Tool_SetLabel(const FMCPRequest& Request)
 	const FString PrevLabel = Actor->GetActorLabel();
 
 #if WITH_EDITOR
-	const FScopedTransaction Transaction(LOCTEXT("ActorSetLabel", "MCP: set actor label"));
 	Actor->SetActorLabel(NewLabel);
 #endif
 
@@ -1301,7 +1238,7 @@ FMCPResponse Tool_SetLabel(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetStringField(TEXT("label"), Actor->GetActorLabel());
 	Out->SetStringField(TEXT("previous_label"), PrevLabel);
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.set_folder (mutator — PIE-guarded) ────────────────────────────────────────────────
@@ -1314,10 +1251,8 @@ FMCPResponse Tool_SetFolder(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorSetFolder", "MCP: set actor folder"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString Path;
 	FMCPResponse PathErr;
@@ -1326,7 +1261,7 @@ FMCPResponse Tool_SetFolder(const FMCPRequest& Request)
 	FString FolderPath;
 	if (!Request.Args->TryGetStringField(TEXT("folder_path"), FolderPath))
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'folder_path' (empty string OK to clear)"));
 	}
 
@@ -1337,7 +1272,6 @@ FMCPResponse Tool_SetFolder(const FMCPRequest& Request)
 
 	const FString PrevFolder = Actor->GetFolderPath().ToString();
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorSetFolder", "MCP: set actor folder"));
 	Actor->SetFolderPath(FName(*FolderPath));
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
@@ -1345,7 +1279,7 @@ FMCPResponse Tool_SetFolder(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetStringField(TEXT("folder_path"), Actor->GetFolderPath().ToString());
 	Out->SetStringField(TEXT("previous_folder_path"), PrevFolder);
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.attach (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -1369,10 +1303,8 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorAttach", "MCP: attach actor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ChildPath, ParentPath;
 	FMCPResponse PathErr;
@@ -1391,14 +1323,14 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 
 	if (Child == Parent)
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("child and parent are the same actor"));
 	}
 
 	// Cross-sublevel guard (M7).
 	if (Child->GetLevel() != Parent->GetLevel())
 	{
-		return ACT_MakeError(Request, kMCPErrorLevelNotStreamingEntry,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotStreamingEntry,
 			FString::Printf(
 				TEXT("cross-sublevel attach refused — child lives in '%s' but parent lives in '%s'; ")
 				TEXT("re-parent within a single sublevel to avoid dangling attachments on streaming-out"),
@@ -1412,12 +1344,12 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 	switch (ACT_AttachWouldCycle(Parent, Child))
 	{
 		case EACTCycleCheckResult::WouldCycle:
-			return ACT_MakeError(Request, kACTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(
 					TEXT("attach would create a cycle — '%s' (or its ancestor) is already attached under '%s'"),
 					*Parent->GetName(), *Child->GetName()));
 		case EACTCycleCheckResult::DepthExceeded:
-			return ACT_MakeError(Request, kACTErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kACTErrorInternal,
 				FString::Printf(
 					TEXT("attach hierarchy depth exceeded (%d ancestors walked from '%s'); possible cycle in existing parent chain"),
 					kACTMaxAttachDepth, *Parent->GetName()));
@@ -1456,7 +1388,7 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 		}
 		else
 		{
-			return ACT_MakeError(Request, kACTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("attachment_rule '%s' unknown — expected KeepRelative / KeepWorld / SnapToTarget / SnapToTargetIncludingScale"),
 					*RuleStr));
 		}
@@ -1464,7 +1396,6 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 
 	const AActor* PrevParent = Child->GetAttachParentActor();
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorAttach", "MCP: attach actor"));
 	Child->Modify();
 	Parent->Modify();
 	const bool bOk = Child->AttachToActor(Parent, Rules, SocketName);
@@ -1485,10 +1416,10 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 	}
 	if (!bOk)
 	{
-		return ACT_MakeError(Request, kACTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal,
 			TEXT("AttachToActor returned false (no RootComponent on child? socket name missing on parent mesh?)"));
 	}
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.detach (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -1504,10 +1435,8 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return ACT_MakePIEError(Request);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("ActorDetach", "MCP: detach actor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ChildPath;
 	FMCPResponse PathErr;
@@ -1532,7 +1461,7 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 		}
 		else
 		{
-			return ACT_MakeError(Request, kACTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("detachment_rule '%s' unknown — expected KeepRelative / KeepWorld"),
 					*RuleStr));
 		}
@@ -1540,7 +1469,6 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 
 	const AActor* PrevParent = Child->GetAttachParentActor();
 
-	const FScopedTransaction Transaction(LOCTEXT("ActorDetach", "MCP: detach actor"));
 	Child->Modify();
 	Child->DetachFromActor(Rules);
 
@@ -1555,7 +1483,7 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 	{
 		Out->SetField(TEXT("previous_parent_path"), MakeShared<FJsonValueNull>());
 	}
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.get_property (read-only — works in PIE) ───────────────────────────────────────────
@@ -1576,7 +1504,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	FString PropertyName;
 	if (!Request.Args->TryGetStringField(TEXT("property_name"), PropertyName) || PropertyName.IsEmpty())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'property_name'"));
 	}
 
@@ -1593,7 +1521,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	if (!FMCPReflection::ResolvePropertyPath(Actor, PropertyName, Container, LeafValuePtr, LeafProp,
 		ErrCode, ErrMsg))
 	{
-		return ACT_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	TSharedPtr<FJsonValue> Value = FMCPReflection::ReadPropertyValueAt(LeafProp, LeafValuePtr);
@@ -1603,7 +1531,7 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("property_path"), PropertyName);
 	Out->SetStringField(TEXT("type"),          FMCPReflection::DescribePropertyType(LeafProp));
 	Out->SetField(TEXT("value"), Value);
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.set_property (mutator — PIE-guarded) ──────────────────────────────────────────────
@@ -1619,9 +1547,11 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
+	// FMCPWritePropertyScope below owns the transaction — using FMCPMutatorScope here would open
+	// a second nested transaction. Keep the inline PIE guard.
 	if (FMCPWorldContext::IsPIEActive())
 	{
-		return ACT_MakePIEError(Request);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	FString Path;
@@ -1631,13 +1561,13 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	FString PropertyName;
 	if (!Request.Args->TryGetStringField(TEXT("property_name"), PropertyName) || PropertyName.IsEmpty())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'property_name'"));
 	}
 	const TSharedPtr<FJsonValue> ValueField = Request.Args->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required field 'value'"));
 	}
 
@@ -1654,7 +1584,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	if (!FMCPReflection::ResolvePropertyPath(Actor, PropertyName, Container, LeafValuePtr, LeafProp,
 		ErrCode, ErrMsg))
 	{
-		return ACT_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	// Step 1: edit-const gate FIRST (early return, no transaction). 2-flag set: CPF_EditConst
@@ -1670,7 +1600,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	const uint64 Flags = LeafProp->PropertyFlags;
 	if (!bBypassReadOnly && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{
-		return ACT_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(
 				TEXT("property '%s' is read-only (CPF flags=%llu); pass args.bypass_readonly=true to override"),
 				*LeafProp->GetName(), static_cast<unsigned long long>(Flags)));
@@ -1686,7 +1616,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	}
 	if (!bWriteOk)
 	{
-		return ACT_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("write rejected: %s"), *WriteErr));
 	}
 
@@ -1698,7 +1628,7 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"),    FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetStringField(TEXT("property_path"), PropertyName);
 	Out->SetField(TEXT("value"), EchoValue);
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.exists (read-only — works in PIE) ─────────────────────────────────────────────────
@@ -1722,7 +1652,7 @@ FMCPResponse Tool_Exists(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("exists"), Actor != nullptr);
 	Out->SetStringField(TEXT("actor_path"),
 		Actor ? FMCPActorPathUtils::BuildActorPath(Actor) : Path);
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.select_in_editor (works in PIE per D10 edge case) ─────────────────────────────────
@@ -1738,12 +1668,12 @@ FMCPResponse Tool_SelectInEditor(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 	const TArray<TSharedPtr<FJsonValue>>* PathsArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("actor_paths"), PathsArr) || !PathsArr)
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required array field 'actor_paths'"));
 	}
 	bool bAdditive = false;
@@ -1751,12 +1681,12 @@ FMCPResponse Tool_SelectInEditor(const FMCPRequest& Request)
 
 	if (!GEditor)
 	{
-		return ACT_MakeError(Request, kACTErrorInternal, TEXT("GEditor is null"));
+		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal, TEXT("GEditor is null"));
 	}
 	USelection* Selection = GEditor->GetSelectedActors();
 	if (!Selection)
 	{
-		return ACT_MakeError(Request, kACTErrorInternal, TEXT("GEditor->GetSelectedActors returned null"));
+		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal, TEXT("GEditor->GetSelectedActors returned null"));
 	}
 
 	TArray<AActor*> Resolved;
@@ -1806,7 +1736,7 @@ FMCPResponse Tool_SelectInEditor(const FMCPRequest& Request)
 		MissingJson.Add(MakeShared<FJsonValueString>(M));
 	}
 	Out->SetArrayField(TEXT("missing"), MissingJson);
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── actor.find_by_class (paginated read — works in PIE) ─────────────────────────────────────
@@ -1829,12 +1759,12 @@ FMCPResponse Tool_FindByClass(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString ClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("class_path"), ClassPath) || ClassPath.IsEmpty())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'class_path'"));
 	}
 
@@ -1842,7 +1772,7 @@ FMCPResponse Tool_FindByClass(const FMCPRequest& Request)
 	// Reproduce the resolver logic without the abstract/family gates to keep the surface friendly.
 	if (ClassPath[0] != TEXT('/'))
 	{
-		return ACT_MakeError(Request, kMCPErrorInvalidClassPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
 			FString::Printf(TEXT("class_path '%s' invalid — must start with '/'"), *ClassPath));
 	}
 	UClass* TargetClass = LoadObject<UClass>(nullptr, *ClassPath);
@@ -1853,12 +1783,12 @@ FMCPResponse Tool_FindByClass(const FMCPRequest& Request)
 	}
 	if (!TargetClass)
 	{
-		return ACT_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("class_path '%s' could not be resolved (LoadObject returned null)"), *ClassPath));
 	}
 	if (!TargetClass->IsChildOf(AActor::StaticClass()))
 	{
-		return ACT_MakeError(Request, kMCPErrorWrongClassFamily,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 			FString::Printf(TEXT("class '%s' is not an AActor subclass"), *TargetClass->GetPathName()));
 	}
 
@@ -1868,7 +1798,7 @@ FMCPResponse Tool_FindByClass(const FMCPRequest& Request)
 	UWorld* World = ACT_ResolveReadWorld();
 	if (!World)
 	{
-		return ACT_MakeError(Request, kMCPErrorLevelNotFound, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound, TEXT("no world available"));
 	}
 
 	// Gather all matching actors.
@@ -1919,17 +1849,17 @@ FMCPResponse Tool_FindByLabel(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString LabelSub;
 	if (!Request.Args->TryGetStringField(TEXT("label_substring"), LabelSub))
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'label_substring'"));
 	}
 	if (LabelSub.IsEmpty())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("'label_substring' must be non-empty"));
 	}
 	bool bExact = false;
@@ -1938,7 +1868,7 @@ FMCPResponse Tool_FindByLabel(const FMCPRequest& Request)
 	UWorld* World = ACT_ResolveReadWorld();
 	if (!World)
 	{
-		return ACT_MakeError(Request, kMCPErrorLevelNotFound, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound, TEXT("no world available"));
 	}
 
 	TArray<TWeakObjectPtr<AActor>> Matches;
@@ -1994,19 +1924,19 @@ FMCPResponse Tool_FindByTag(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString Tag;
 	if (!Request.Args->TryGetStringField(TEXT("tag"), Tag) || Tag.IsEmpty())
 	{
-		return ACT_MakeError(Request, kACTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required non-empty string field 'tag'"));
 	}
 
 	UWorld* World = ACT_ResolveReadWorld();
 	if (!World)
 	{
-		return ACT_MakeError(Request, kMCPErrorLevelNotFound, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorLevelNotFound, TEXT("no world available"));
 	}
 
 	const FName TargetTag(*Tag);
@@ -2076,7 +2006,7 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
 	Out->SetArrayField(TEXT("components"), CompArr);
 	Out->SetNumberField(TEXT("total"), static_cast<double>(Comps.Num()));
-	return ACT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

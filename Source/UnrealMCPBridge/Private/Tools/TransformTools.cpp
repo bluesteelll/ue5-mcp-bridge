@@ -3,6 +3,8 @@
 #include "TransformTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -12,7 +14,6 @@
 #include "Engine/HitResult.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
-#include "ScopedTransaction.h"
 #include "UObject/Package.h"
 #include "WorldCollision.h"
 
@@ -24,33 +25,7 @@
 namespace
 {
 	// TFM_ prefix per the unity-build symbol-collision convention.
-	constexpr int32 kTFMErrorInvalidParams = -32602;
-	constexpr int32 kTFMErrorInternal      = -32603;
-
-	void TFM_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse TFM_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		TFM_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse TFM_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		TFM_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	constexpr int32 kTFMErrorInternal = -32603;
 
 	// ─── arg parsing helpers ─────────────────────────────────────────────────────────────────────
 
@@ -172,20 +147,21 @@ namespace
 	// ─── shared post-write housekeeping ──────────────────────────────────────────────────────────
 
 	/**
-	 * Dirty the actor's package — handles WorldPartition's one-file-per-actor (external package)
-	 * AND the legacy in-level-package case (outermost). Mirrors the pattern from
-	 * WP_SetActorRuntimeGrid.
+	 * Queue dirty for the actor's package — handles WorldPartition's one-file-per-actor (external
+	 * package) AND the legacy in-level-package case (outermost). Mirrors the pattern from
+	 * WP_SetActorRuntimeGrid. Queues through the supplied FMCPMutatorScope so the bulk-dirty pass
+	 * happens once at scope-destruction (avoids per-actor MarkPackageDirty in a tight loop).
 	 */
-	void TFM_MarkActorPackageDirty(AActor* Actor)
+	void TFM_QueueActorPackageDirty(FMCPMutatorScope& Scope, AActor* Actor)
 	{
 		check(Actor);
 		if (UPackage* ExternalPkg = Actor->GetExternalPackage())
 		{
-			ExternalPkg->MarkPackageDirty();
+			Scope.DirtyPackage(ExternalPkg);
 		}
-		else if (UPackage* OuterPkg = Actor->GetOutermost())
+		else
 		{
-			OuterPkg->MarkPackageDirty();
+			Scope.DirtyPackage(Actor->GetOutermost());
 		}
 	}
 
@@ -263,49 +239,44 @@ FMCPResponse Tool_BatchSet(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return TFM_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_TransformBatchSet", "MCP: Batch Set Transform"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	TArray<FString> Paths;
 	FString ParseErr;
 	if (!TFM_ReadActorPaths(Request.Args, Paths, ParseErr))
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ParseErr);
 	}
 
 	FVector Loc, Rot, Scale;
 	bool bHaveLoc = false, bHaveRot = false, bHaveScale = false;
 	if (!TFM_ReadOptionalVec3(Request.Args, TEXT("location"), Loc, bHaveLoc, ParseErr))
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ParseErr);
 	}
 	if (!TFM_ReadOptionalVec3(Request.Args, TEXT("rotation"), Rot, bHaveRot, ParseErr))
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ParseErr);
 	}
 	if (!TFM_ReadOptionalVec3(Request.Args, TEXT("scale"), Scale, bHaveScale, ParseErr))
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ParseErr);
 	}
 
 	if (!bHaveLoc && !bHaveRot && !bHaveScale)
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("transform.batch_set: at least one of 'location' / 'rotation' / 'scale' is required"));
 	}
 
 	bool bRelative = false;
 	Request.Args->TryGetBoolField(TEXT("relative"), bRelative);
-
-	// Wrap the whole batch in ONE transaction so undo reverts every modified actor in one step.
-	FScopedTransaction Transaction(LOCTEXT("MCP_TransformBatchSet", "MCP: Batch Set Transform"));
 
 	int32 Updated = 0;
 	TArray<TSharedPtr<FJsonValue>> Failures;
@@ -359,15 +330,15 @@ FMCPResponse Tool_BatchSet(const FMCPRequest& Request)
 		const FTransform NewT(NewRot.Quaternion(), NewLoc, NewScale);
 		Actor->SetActorTransform(NewT);
 
-		TFM_MarkActorPackageDirty(Actor);
+		TFM_QueueActorPackageDirty(Scope, Actor);
 		++Updated;
 	}
 
 	// All resolution failures → top-level -32004. Otherwise partial success is fine.
 	if (Updated == 0)
 	{
-		Transaction.Cancel();
-		return TFM_MakeError(Request, kMCPErrorObjectNotFound,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("transform.batch_set: 0/%d actors resolved; first reason: %s"),
 				Paths.Num(),
 				Failures.Num() > 0 ? *Failures[0]->AsObject()->GetStringField(TEXT("reason")) : TEXT("(empty)")));
@@ -377,7 +348,7 @@ FMCPResponse Tool_BatchSet(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("updated"), Updated);
 	Out->SetNumberField(TEXT("failed"),  Failures.Num());
 	Out->SetArrayField(TEXT("failures"), Failures);
-	return TFM_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── transform.snap_to_floor ──────────────────────────────────────────────────────────────────
@@ -405,28 +376,26 @@ FMCPResponse Tool_SnapToFloor(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return TFM_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_TransformSnapToFloor", "MCP: Snap Actors To Floor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	TArray<FString> Paths;
 	FString ParseErr;
 	if (!TFM_ReadActorPaths(Request.Args, Paths, ParseErr))
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ParseErr);
 	}
 
 	double MaxDist = 100000.0;
 	Request.Args->TryGetNumberField(TEXT("max_trace_distance"), MaxDist);
 	if (MaxDist <= 0.0)
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("'max_trace_distance' must be > 0"));
 	}
 
@@ -435,7 +404,7 @@ FMCPResponse Tool_SnapToFloor(const FMCPRequest& Request)
 	ECollisionChannel Channel = ECC_Visibility;
 	if (!TFM_ParseTraceChannel(ChannelStr, Channel))
 	{
-		return TFM_MakeError(Request, kMCPErrorInvalidCollisionChannel,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidCollisionChannel,
 			FString::Printf(TEXT("trace_channel '%s' not recognised; accepted: ")
 				TEXT("Visibility, WorldStatic, WorldDynamic, Camera, Pawn, PhysicsBody"),
 				*ChannelStr));
@@ -444,11 +413,9 @@ FMCPResponse Tool_SnapToFloor(const FMCPRequest& Request)
 	UWorld* World = FMCPWorldContext::GetEditorWorld();
 	if (!World)
 	{
-		return TFM_MakeError(Request, kTFMErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kTFMErrorInternal,
 			TEXT("no editor world (GEditor missing or no level loaded)"));
 	}
-
-	FScopedTransaction Transaction(LOCTEXT("MCP_TransformSnapToFloor", "MCP: Snap Actors To Floor"));
 
 	int32 Snapped = 0;
 	int32 Missed  = 0;
@@ -506,7 +473,7 @@ FMCPResponse Tool_SnapToFloor(const FMCPRequest& Request)
 		{
 			Actor->Modify();
 			Actor->SetActorLocation(Hit.Location);
-			TFM_MarkActorPackageDirty(Actor);
+			TFM_QueueActorPackageDirty(Scope, Actor);
 
 			Entry->SetNumberField(TEXT("new_z"), Hit.Location.Z);
 			if (AActor* HitActor = Hit.GetActor())
@@ -532,8 +499,8 @@ FMCPResponse Tool_SnapToFloor(const FMCPRequest& Request)
 	// All paths failed to resolve (note: misses with successful resolution count as resolved).
 	if (ResolutionFailures == Paths.Num())
 	{
-		Transaction.Cancel();
-		return TFM_MakeError(Request, kMCPErrorObjectNotFound,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("transform.snap_to_floor: 0/%d actors resolved; first reason: %s"),
 				Paths.Num(),
 				FirstResolutionReason.IsEmpty() ? TEXT("(empty)") : *FirstResolutionReason));
@@ -543,7 +510,7 @@ FMCPResponse Tool_SnapToFloor(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("snapped"), Snapped);
 	Out->SetNumberField(TEXT("missed"),  Missed);
 	Out->SetArrayField(TEXT("results"),  Results);
-	return TFM_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── transform.align ──────────────────────────────────────────────────────────────────────────
@@ -573,27 +540,25 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return TFM_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_TransformAlign", "MCP: Align Actors"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	TArray<FString> Paths;
 	FString ParseErr;
 	if (!TFM_ReadActorPaths(Request.Args, Paths, ParseErr))
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams, ParseErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ParseErr);
 	}
 
 	FString AxisStr;
 	if (!Request.Args->TryGetStringField(TEXT("axis"), AxisStr) || AxisStr.IsEmpty())
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'axis' (expected 'X', 'Y', or 'Z')"));
 	}
 	int32 AxisIdx = -1;
@@ -602,14 +567,14 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 	else if (AxisStr.Equals(TEXT("Z"), ESearchCase::IgnoreCase)) { AxisIdx = 2; }
 	else
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("axis '%s' not recognised; expected one of 'X', 'Y', 'Z'"), *AxisStr));
 	}
 
 	FString ModeStr;
 	if (!Request.Args->TryGetStringField(TEXT("mode"), ModeStr) || ModeStr.IsEmpty())
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'mode' (expected 'set', 'min', 'max', or 'average')"));
 	}
 
@@ -621,7 +586,7 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 	else if (ModeStr.Equals(TEXT("average"), ESearchCase::IgnoreCase)) { Mode = EMode::Average; }
 	else
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("mode '%s' not recognised; expected one of 'set', 'min', 'max', 'average'"),
 				*ModeStr));
 	}
@@ -630,7 +595,7 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 	const bool bHaveValue = Request.Args->TryGetNumberField(TEXT("value"), SuppliedValue);
 	if (Mode == EMode::Set && !bHaveValue)
 	{
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("transform.align mode='set' requires numeric field 'value'"));
 	}
 
@@ -667,13 +632,14 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 
 	if (Resolved.Num() == 0)
 	{
+		Scope.Abort();
 		if (Mode == EMode::Set)
 		{
-			return TFM_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("transform.align: 0/%d actors resolved"), Paths.Num()));
 		}
 		// min/max/average: aggregating empty set is meaningless.
-		return TFM_MakeError(Request, kTFMErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(
 				TEXT("transform.align mode='%s': 0/%d actors resolved — cannot aggregate empty set"),
 				*ModeStr, Paths.Num()));
@@ -710,8 +676,6 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 	}
 
 	// Pass 3 — write to every resolved actor inside the single batch transaction.
-	FScopedTransaction Transaction(LOCTEXT("MCP_TransformAlign", "MCP: Align Actors"));
-
 	int32 Aligned = 0;
 	for (const FResolved& R : Resolved)
 	{
@@ -719,7 +683,7 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 		FVector Loc = R.Actor->GetActorLocation();
 		Loc.Component(AxisIdx) = FinalValue;
 		R.Actor->SetActorLocation(Loc);
-		TFM_MarkActorPackageDirty(R.Actor);
+		TFM_QueueActorPackageDirty(Scope, R.Actor);
 		++Aligned;
 	}
 
@@ -731,7 +695,7 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("value"),   FinalValue);
 	Out->SetStringField(TEXT("mode"),    ModeStr.ToLower());
 	Out->SetArrayField(TEXT("failures"), Failures);
-	return TFM_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

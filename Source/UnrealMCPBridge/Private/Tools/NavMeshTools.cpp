@@ -3,6 +3,7 @@
 #include "NavMeshTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -25,36 +26,13 @@
 
 namespace
 {
-	// NAV_ prefix per the unity-build symbol-collision convention.
+	// NAV_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d).
 	constexpr int32 kNAVErrorInvalidParams   = -32602;
 	constexpr int32 kNAVErrorInternal        = -32603;
 	constexpr int32 kNAVErrorObjectNotFound  = kMCPErrorObjectNotFound;  // -32004
 	constexpr int32 kNAVErrorPIEActive       = kMCPErrorPIEActive;       // -32027
-
-	void NAV_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse NAV_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		NAV_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse NAV_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		NAV_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	// ─── World resolution (PIE-first, editor-fallback) ───────────────────────────────────────────
 
@@ -213,14 +191,14 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	UWorld* World = NAV_ResolveWorld();
 	if (!World)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
 	UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(World);
 	if (!NavSys)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no UNavigationSystemV1 on the resolved world (navigation subsystem disabled?)"));
 	}
 
@@ -238,7 +216,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
 	Out->SetArrayField(TEXT("navmeshes"), NavMeshesArr);
-	return NAV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── navmesh.rebuild ───────────────────────────────────────────────────────────────────────────
@@ -279,20 +257,20 @@ FMCPResponse Tool_Rebuild(const FMCPRequest& Request)
 	// PIE guard FIRST — matches Phase 3 mutator convention. Frozen message text per MCPTypes.h.
 	if (FMCPWorldContext::IsPIEActive())
 	{
-		return NAV_MakeError(Request, kNAVErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	UWorld* World = NAV_ResolveWorld();
 	if (!World)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
 	UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(World);
 	if (!NavSys)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no UNavigationSystemV1 on the resolved world (navigation subsystem disabled?)"));
 	}
 
@@ -308,7 +286,7 @@ FMCPResponse Tool_Rebuild(const FMCPRequest& Request)
 		TargetRNM = NAV_ResolveRecastNavMesh(NavMeshPath, ResolveErr);
 		if (!TargetRNM)
 		{
-			return NAV_MakeError(Request, kNAVErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kNAVErrorObjectNotFound,
 				FString::Printf(TEXT("navmesh_actor_path '%s' did not resolve: %s"),
 					*NavMeshPath, *ResolveErr));
 		}
@@ -337,7 +315,7 @@ FMCPResponse Tool_Rebuild(const FMCPRequest& Request)
 	}
 	Out->SetNumberField(TEXT("duration_seconds"), DurationSec);
 	Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-	return NAV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── navmesh.find_path ─────────────────────────────────────────────────────────────────────────
@@ -380,18 +358,18 @@ FMCPResponse Tool_FindPath(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return NAV_MakeError(Request, kNAVErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FVector Start, End;
 	FString ArgErr;
 	if (!NAV_ParseVector3(Request.Args, TEXT("start"), Start, ArgErr))
 	{
-		return NAV_MakeError(Request, kNAVErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInvalidParams, ArgErr);
 	}
 	if (!NAV_ParseVector3(Request.Args, TEXT("end"), End, ArgErr))
 	{
-		return NAV_MakeError(Request, kNAVErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInvalidParams, ArgErr);
 	}
 
 	// agent_class / tolerance: accepted but not yet routed. Tolerated as silent no-ops.
@@ -403,14 +381,14 @@ FMCPResponse Tool_FindPath(const FMCPRequest& Request)
 	UWorld* World = NAV_ResolveWorld();
 	if (!World)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
 	UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(World);
 	if (!NavSys)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no UNavigationSystemV1 on the resolved world (navigation subsystem disabled?)"));
 	}
 
@@ -425,7 +403,7 @@ FMCPResponse Tool_FindPath(const FMCPRequest& Request)
 		Out->SetNumberField(TEXT("path_length"), 0.0);
 		Out->SetArrayField(TEXT("waypoints"), TArray<TSharedPtr<FJsonValue>>());
 		Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-		return NAV_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	FPathFindingQuery Query;
@@ -457,7 +435,7 @@ FMCPResponse Tool_FindPath(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("path_length"), static_cast<double>(PathLength));
 	Out->SetArrayField(TEXT("waypoints"), WaypointsArr);
 	Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-	return NAV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── navmesh.project_to_navmesh ────────────────────────────────────────────────────────────────
@@ -491,34 +469,34 @@ FMCPResponse Tool_ProjectToNavMesh(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return NAV_MakeError(Request, kNAVErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FVector Location;
 	FString ArgErr;
 	if (!NAV_ParseVector3(Request.Args, TEXT("location"), Location, ArgErr))
 	{
-		return NAV_MakeError(Request, kNAVErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInvalidParams, ArgErr);
 	}
 
 	FVector SearchExtent;
 	if (!NAV_ParseOptionalVector3(Request.Args, TEXT("search_extent"),
 			FVector(100.0, 100.0, 100.0), SearchExtent, ArgErr))
 	{
-		return NAV_MakeError(Request, kNAVErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInvalidParams, ArgErr);
 	}
 
 	UWorld* World = NAV_ResolveWorld();
 	if (!World)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
 	UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(World);
 	if (!NavSys)
 	{
-		return NAV_MakeError(Request, kNAVErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kNAVErrorInternal,
 			TEXT("no UNavigationSystemV1 on the resolved world (navigation subsystem disabled?)"));
 	}
 
@@ -536,7 +514,7 @@ FMCPResponse Tool_ProjectToNavMesh(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("projected"), bProjected);
 	Out->SetArrayField(TEXT("location"), NAV_VectorToArray(ReportedLoc));
 	Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-	return NAV_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

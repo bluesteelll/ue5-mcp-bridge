@@ -3,6 +3,8 @@
 #include "InputTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -33,94 +35,6 @@
 
 namespace
 {
-	// INP_ prefix per unity-build symbol-collision convention.
-	constexpr int32 kINPErrorInvalidParams = -32602;
-	constexpr int32 kINPErrorInternal      = -32603;
-
-	void INP_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse INP_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		INP_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse INP_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		INP_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool INP_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = INP_MakeError(Request, kINPErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = INP_MakeError(Request, kINPErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	/** Load a UInputMappingContext by path. */
-	UInputMappingContext* INP_LoadMappingContextByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("'%s' not loadable"), *Path);
-			return nullptr;
-		}
-		UInputMappingContext* IMC = Cast<UInputMappingContext>(Loaded);
-		if (!IMC)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(TEXT("'%s' is class '%s'; expected UInputMappingContext"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return IMC;
-	}
-
 	/**
 	 * Paginated asset enumeration helper. Mirrors AnimTools::Tool_ListSequences /
 	 * MeshTools::Tool_List shape so the wire contract is identical across surfaces — caller
@@ -174,12 +88,12 @@ namespace
 			FString DecodeErr;
 			if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 			{
-				return INP_MakeError(Request, kINPErrorInvalidParams,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 					FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 			}
 			if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 			{
-				return INP_MakeError(Request, kMCPErrorStaleCursor,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 					TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 			}
 			while (StartIdx < Assets.Num() &&
@@ -214,7 +128,7 @@ namespace
 			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 		}
 
-		return INP_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 } // namespace
 
@@ -258,15 +172,15 @@ FMCPResponse Tool_GetContextBindings(const FMCPRequest& Request)
 
 	FString MappingContextPath;
 	FMCPResponse Err;
-	if (!INP_RequireStringField(Request, TEXT("mapping_context_path"), MappingContextPath, Err))
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("mapping_context_path"), MappingContextPath, Err))
 	{
 		return Err;
 	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UInputMappingContext* IMC = INP_LoadMappingContextByPath(MappingContextPath, LoadErrCode, LoadErrMsg);
-	if (!IMC) { return INP_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UInputMappingContext* IMC = FMCPAssetLoader::Load<UInputMappingContext>(MappingContextPath, LoadErrCode, LoadErrMsg);
+	if (!IMC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const TArray<FEnhancedActionKeyMapping>& Mappings = IMC->GetMappings();
 
@@ -317,7 +231,7 @@ FMCPResponse Tool_GetContextBindings(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("mapping_context"), IMC->GetPathName());
 	Out->SetArrayField(TEXT("mappings"), MappingArr);
 	Out->SetNumberField(TEXT("mapping_count"), Mappings.Num());
-	return INP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── input.list_player_contexts ───────────────────────────────────────────────────────────────
@@ -357,13 +271,13 @@ FMCPResponse Tool_ListPlayerContexts(const FMCPRequest& Request)
 		AActor* Actor = FMCPActorPathUtils::ResolveActorOrNull(PCPath, /*bRejectPIE=*/ false);
 		if (!Actor)
 		{
-			return INP_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("player_controller_path '%s' not resolved"), *PCPath));
 		}
 		PC = Cast<APlayerController>(Actor);
 		if (!PC)
 		{
-			return INP_MakeError(Request, kMCPErrorWrongClass,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
 				FString::Printf(TEXT("'%s' is class '%s'; expected APlayerController"),
 					*PCPath, *Actor->GetClass()->GetPathName()));
 		}
@@ -409,7 +323,7 @@ FMCPResponse Tool_ListPlayerContexts(const FMCPRequest& Request)
 		Out->SetNumberField(TEXT("context_count"), 0);
 		Out->SetStringField(TEXT("hint"),
 			TEXT("no APlayerController in current world; start PIE or pass player_controller_path"));
-		return INP_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	Out->SetStringField(TEXT("player_controller"), PC->GetPathName());
@@ -423,7 +337,7 @@ FMCPResponse Tool_ListPlayerContexts(const FMCPRequest& Request)
 		Out->SetNumberField(TEXT("context_count"), 0);
 		Out->SetStringField(TEXT("hint"),
 			TEXT("APlayerController has no ULocalPlayer (likely remote/standalone controller)"));
-		return INP_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	UEnhancedInputLocalPlayerSubsystem* EISS = LP->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>();
@@ -435,7 +349,7 @@ FMCPResponse Tool_ListPlayerContexts(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("hint"),
 			TEXT("ULocalPlayer has no UEnhancedInputLocalPlayerSubsystem (Enhanced Input plugin "
 				 "may be disabled or subsystem not yet initialised)"));
-		return INP_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// 3) Probe-enumerate active contexts by asking HasMappingContext for every known IMC asset.
@@ -496,7 +410,7 @@ FMCPResponse Tool_ListPlayerContexts(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("hint"),
 		TEXT("contexts enumerated via HasMappingContext probe over loaded UInputMappingContext "
 			 "assets (UE 5.7 has no public bulk enumerator). Unloaded IMC assets are skipped."));
-	return INP_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

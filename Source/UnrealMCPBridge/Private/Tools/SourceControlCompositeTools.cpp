@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPathSandbox.h"
 
@@ -23,34 +24,11 @@
 
 namespace
 {
-	// SCC_ prefix per the unity-build symbol-collision pattern.
+	// SCC_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx
+	// from MCPToolHelpers.h.
 	constexpr int32 kSCCErrorInvalidParams = -32602;
 	constexpr int32 kSCCErrorInternal      = -32603;
-
-	void SCC_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse SCC_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		SCC_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse SCC_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		SCC_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	/**
 	 * Mirror of FSourceControlTools::SCT_ResolveSCPath — duplicated locally to avoid exporting an
@@ -148,14 +126,14 @@ FMCPResponse Tool_SubmitInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return SCC_MakeError(Request, kSCCErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kSCCErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// ─── Validate description ──────────────────────────────────────────────────────────────────
 	FString Description;
 	if (!Request.Args->TryGetStringField(TEXT("description"), Description) || Description.IsEmpty())
 	{
-		return SCC_MakeError(Request, kSCCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSCCErrorInvalidParams,
 			TEXT("missing required string field 'description' (commit message)"));
 	}
 
@@ -164,7 +142,7 @@ FMCPResponse Tool_SubmitInternal(const FMCPRequest& Request)
 	if (!Request.Args->TryGetArrayField(TEXT("file_paths"), PathsArr) || !PathsArr ||
 		PathsArr->Num() == 0)
 	{
-		return SCC_MakeError(Request, kSCCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSCCErrorInvalidParams,
 			TEXT("missing or empty required array field 'file_paths'"));
 	}
 
@@ -175,7 +153,7 @@ FMCPResponse Tool_SubmitInternal(const FMCPRequest& Request)
 		FString Raw;
 		if (!(*PathsArr)[i].IsValid() || !(*PathsArr)[i]->TryGetString(Raw) || Raw.IsEmpty())
 		{
-			return SCC_MakeError(Request, kSCCErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kSCCErrorInvalidParams,
 				FString::Printf(TEXT("'file_paths'[%d] is not a non-empty string"), i));
 		}
 		FString AbsPath;
@@ -183,7 +161,7 @@ FMCPResponse Tool_SubmitInternal(const FMCPRequest& Request)
 		int32 ResolveCode = 0;
 		if (!SCC_ResolveSCPath(Raw, AbsPath, ResolveErr, ResolveCode))
 		{
-			return SCC_MakeError(Request, ResolveCode,
+			return FMCPToolHelpers::MakeError(Request, ResolveCode,
 				FString::Printf(TEXT("'file_paths'[%d]='%s': %s"), i, *Raw, *ResolveErr));
 		}
 		ResolvedPaths.Add(MoveTemp(AbsPath));
@@ -194,13 +172,13 @@ FMCPResponse Tool_SubmitInternal(const FMCPRequest& Request)
 		ISourceControlModule& Module = ISourceControlModule::Get();
 		if (!Module.IsEnabled())
 		{
-			return SCC_MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
 				TEXT("source control provider not configured "
 					 "(ISourceControlModule::Get().IsEnabled() == false)"));
 		}
 		if (!Module.GetProvider().IsAvailable())
 		{
-			return SCC_MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
 				FString::Printf(TEXT("source control provider '%s' is enabled but not available"),
 					*Module.GetProvider().GetName().ToString()));
 		}
@@ -286,13 +264,13 @@ FMCPResponse Tool_SubmitInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return SCC_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return SCC_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

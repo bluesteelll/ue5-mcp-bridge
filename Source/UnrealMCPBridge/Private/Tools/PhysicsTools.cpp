@@ -3,6 +3,7 @@
 #include "PhysicsTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPComponentPathUtils.h"
@@ -29,36 +30,15 @@
 
 namespace
 {
-	// PHY_ prefix per the unity-build symbol-collision pattern.
-	constexpr int32 kPHYErrorInvalidParams    = -32602;
-	constexpr int32 kPHYErrorInternal         = -32603;
+	// PHY_ prefix per the unity-build symbol-collision pattern. StampIds / MakeError / MakeSuccessObj
+	// migrated to FMCPToolHelpers in Phase 3 (Group G3); only the surface-local error-code aliases
+	// live here. physics.* tools are deliberately PIE-friendly (line_trace/sweep_capsule/overlap_test
+	// are read-only; apply_impulse/set_simulation/set_velocity are runtime mutators that target the
+	// PIE world specifically) — no FMCPMutatorScope migration is required or wanted here.
+	constexpr int32 kPHYErrorInvalidParams    = kMCPErrorInvalidParams;   // -32602
+	constexpr int32 kPHYErrorInternal         = kMCPErrorInternal;        // -32603
 	constexpr int32 kPHYErrorObjectNotFound   = kMCPErrorObjectNotFound;  // -32004
 	constexpr int32 kPHYErrorWrongClass       = kMCPErrorWrongClass;      // -32011
-
-	void PHY_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse PHY_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		PHY_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse PHY_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		PHY_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	// ─── arg parsing helpers ─────────────────────────────────────────────────────────────────────
 
@@ -447,18 +427,18 @@ FMCPResponse Tool_LineTrace(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FVector Start, End;
 	FString ArgErr;
 	if (!PHY_ReadVectorArray(Request.Args, TEXT("start"), Start, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 	if (!PHY_ReadVectorArray(Request.Args, TEXT("end"), End, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 
 	FString ChannelStr;
@@ -466,7 +446,7 @@ FMCPResponse Tool_LineTrace(const FMCPRequest& Request)
 	ECollisionChannel Channel = ECC_Visibility;
 	if (!PHY_ParseCollisionChannel(ChannelStr, Channel))
 	{
-		return PHY_MakeError(Request, kMCPErrorInvalidCollisionChannel,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidCollisionChannel,
 			FString::Printf(TEXT("channel '%s' not recognised; accepted: %s"),
 				*ChannelStr, PHY_AcceptedChannelNames));
 	}
@@ -477,7 +457,7 @@ FMCPResponse Tool_LineTrace(const FMCPRequest& Request)
 	UWorld* World = PHY_ResolveTraceWorld();
 	if (!World)
 	{
-		return PHY_MakeError(Request, kPHYErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInternal,
 			TEXT("no world available for trace (GEditor missing OR no level loaded)"));
 	}
 
@@ -499,7 +479,7 @@ FMCPResponse Tool_LineTrace(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("ignored_count"), IgnoredCount);
 	Out->SetBoolField(TEXT("hit"), bAnyBlocking);
 	Out->SetArrayField(TEXT("hits"), HitsArr);
-	return PHY_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── physics.sweep_capsule ─────────────────────────────────────────────────────────────────────
@@ -529,36 +509,36 @@ FMCPResponse Tool_SweepCapsule(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FVector Start, End;
 	FString ArgErr;
 	if (!PHY_ReadVectorArray(Request.Args, TEXT("start"), Start, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 	if (!PHY_ReadVectorArray(Request.Args, TEXT("end"), End, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 
 	// radius / half_height must be >= 1.0 per plan §C-Physics inputSchema "minimum: 1.0".
 	double Radius = 0.0;
 	if (!PHY_ReadClampedNumber(Request.Args, TEXT("radius"), 1.0, 100000.0, Radius, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 	double HalfHeight = 0.0;
 	if (!PHY_ReadClampedNumber(Request.Args, TEXT("half_height"), 1.0, 100000.0, HalfHeight, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 
 	FVector RotationVec = FVector::ZeroVector;
 	if (!PHY_ReadOptionalVectorArray(Request.Args, TEXT("rotation"), FVector::ZeroVector, RotationVec, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 	const FRotator Rotation(RotationVec.X, RotationVec.Y, RotationVec.Z); // pitch, yaw, roll
 	const FQuat RotationQuat = Rotation.Quaternion();
@@ -568,7 +548,7 @@ FMCPResponse Tool_SweepCapsule(const FMCPRequest& Request)
 	ECollisionChannel Channel = ECC_Visibility;
 	if (!PHY_ParseCollisionChannel(ChannelStr, Channel))
 	{
-		return PHY_MakeError(Request, kMCPErrorInvalidCollisionChannel,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidCollisionChannel,
 			FString::Printf(TEXT("channel '%s' not recognised; accepted: %s"),
 				*ChannelStr, PHY_AcceptedChannelNames));
 	}
@@ -579,7 +559,7 @@ FMCPResponse Tool_SweepCapsule(const FMCPRequest& Request)
 	UWorld* World = PHY_ResolveTraceWorld();
 	if (!World)
 	{
-		return PHY_MakeError(Request, kPHYErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInternal,
 			TEXT("no world available for sweep (GEditor missing OR no level loaded)"));
 	}
 
@@ -605,7 +585,7 @@ FMCPResponse Tool_SweepCapsule(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("ignored_count"), IgnoredCount);
 	Out->SetBoolField(TEXT("hit"), bAnyBlocking);
 	Out->SetArrayField(TEXT("hits"), HitsArr);
-	return PHY_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── physics.apply_impulse ─────────────────────────────────────────────────────────────────────
@@ -646,20 +626,20 @@ FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ActorPath;
 	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
 	}
 
 	FVector ImpulseVec;
 	FString ArgErr;
 	if (!PHY_ReadVectorArray(Request.Args, TEXT("impulse"), ImpulseVec, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 
 	FString WorldOrLocal = TEXT("world");
@@ -667,7 +647,7 @@ FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
 	if (!WorldOrLocal.Equals(TEXT("world"), ESearchCase::IgnoreCase)
 		&& !WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams,
 			FString::Printf(TEXT("'world_or_local' must be 'world' or 'local' (got '%s')"), *WorldOrLocal));
 	}
 	const bool bLocal = WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase);
@@ -681,7 +661,7 @@ FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
 	UWorld* World = PHY_ResolveTraceWorld();
 	if (!World)
 	{
-		return PHY_MakeError(Request, kPHYErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
@@ -691,7 +671,7 @@ FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
 		ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -701,11 +681,11 @@ FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
 	{
 		if (bWrongClass)
 		{
-			return PHY_MakeError(Request, kPHYErrorWrongClass,
+			return FMCPToolHelpers::MakeError(Request, kPHYErrorWrongClass,
 				FString::Printf(TEXT("component '%s' on actor '%s' is not a UPrimitiveComponent"),
 					*CompName, *ActorPath));
 		}
-		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorObjectNotFound,
 			CompName.IsEmpty()
 				? FString::Printf(TEXT("actor '%s' has no UPrimitiveComponent root"), *ActorPath)
 				: FString::Printf(TEXT("component '%s' not found on actor '%s'"), *CompName, *ActorPath));
@@ -726,7 +706,7 @@ FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
 	Out->SetBoolField(TEXT("velocity_change"), bVelocityChange);
 	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
 	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	return PHY_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── physics.set_simulation ────────────────────────────────────────────────────────────────────
@@ -768,19 +748,19 @@ FMCPResponse Tool_SetSimulation(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ActorPath;
 	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
 	}
 
 	bool bSimulate = false;
 	if (!Request.Args->TryGetBoolField(TEXT("simulate"), bSimulate))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required bool field 'simulate'"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required bool field 'simulate'"));
 	}
 
 	bool bRecurse = false;
@@ -792,7 +772,7 @@ FMCPResponse Tool_SetSimulation(const FMCPRequest& Request)
 	UWorld* World = PHY_ResolveTraceWorld();
 	if (!World)
 	{
-		return PHY_MakeError(Request, kPHYErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
@@ -802,7 +782,7 @@ FMCPResponse Tool_SetSimulation(const FMCPRequest& Request)
 		ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -838,11 +818,11 @@ FMCPResponse Tool_SetSimulation(const FMCPRequest& Request)
 		{
 			if (bWrongClass)
 			{
-				return PHY_MakeError(Request, kPHYErrorWrongClass,
+				return FMCPToolHelpers::MakeError(Request, kPHYErrorWrongClass,
 					FString::Printf(TEXT("component '%s' on actor '%s' is not a UPrimitiveComponent"),
 						*CompName, *ActorPath));
 			}
-			return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kPHYErrorObjectNotFound,
 				CompName.IsEmpty()
 					? FString::Printf(TEXT("actor '%s' has no UPrimitiveComponent root"), *ActorPath)
 					: FString::Printf(TEXT("component '%s' not found on actor '%s'"), *CompName, *ActorPath));
@@ -860,7 +840,7 @@ FMCPResponse Tool_SetSimulation(const FMCPRequest& Request)
 
 	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
 	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	return PHY_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── physics.set_velocity ──────────────────────────────────────────────────────────────────────
@@ -891,20 +871,20 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ActorPath;
 	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing required string field 'actor_path'"));
 	}
 
 	const bool bHasLinear  = Request.Args->HasField(TEXT("linear"));
 	const bool bHasAngular = Request.Args->HasField(TEXT("angular"));
 	if (!bHasLinear && !bHasAngular)
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams,
 			TEXT("at least one of 'linear' or 'angular' must be supplied"));
 	}
 
@@ -915,14 +895,14 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 	{
 		if (!PHY_ReadVectorArray(Request.Args, TEXT("linear"), LinearVec, ArgErr))
 		{
-			return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+			return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 		}
 	}
 	if (bHasAngular)
 	{
 		if (!PHY_ReadVectorArray(Request.Args, TEXT("angular"), AngularVec, ArgErr))
 		{
-			return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+			return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 		}
 	}
 
@@ -931,7 +911,7 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 	if (!WorldOrLocal.Equals(TEXT("world"), ESearchCase::IgnoreCase)
 		&& !WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams,
 			FString::Printf(TEXT("'world_or_local' must be 'world' or 'local' (got '%s')"), *WorldOrLocal));
 	}
 	const bool bLocal = WorldOrLocal.Equals(TEXT("local"), ESearchCase::IgnoreCase);
@@ -942,7 +922,7 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 	UWorld* World = PHY_ResolveTraceWorld();
 	if (!World)
 	{
-		return PHY_MakeError(Request, kPHYErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
@@ -952,7 +932,7 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 		ActorPath, /*bRejectPIE*/ false, bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -962,11 +942,11 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 	{
 		if (bWrongClass)
 		{
-			return PHY_MakeError(Request, kPHYErrorWrongClass,
+			return FMCPToolHelpers::MakeError(Request, kPHYErrorWrongClass,
 				FString::Printf(TEXT("component '%s' on actor '%s' is not a UPrimitiveComponent"),
 					*CompName, *ActorPath));
 		}
-		return PHY_MakeError(Request, kPHYErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorObjectNotFound,
 			CompName.IsEmpty()
 				? FString::Printf(TEXT("actor '%s' has no UPrimitiveComponent root"), *ActorPath)
 				: FString::Printf(TEXT("component '%s' not found on actor '%s'"), *CompName, *ActorPath));
@@ -1003,7 +983,7 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("new_angular"),   PHY_VectorToArray(NewAng));
 	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
 	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	return PHY_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── physics.overlap_test ──────────────────────────────────────────────────────────────────────
@@ -1044,20 +1024,20 @@ FMCPResponse Tool_OverlapTest(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FVector Location;
 	FString ArgErr;
 	if (!PHY_ReadVectorArray(Request.Args, TEXT("location"), Location, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 
 	double Radius = 0.0;
 	if (!PHY_ReadClampedNumber(Request.Args, TEXT("radius"), 0.001, 1000000.0, Radius, ArgErr))
 	{
-		return PHY_MakeError(Request, kPHYErrorInvalidParams, ArgErr);
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInvalidParams, ArgErr);
 	}
 
 	// Channel default = "WorldStatic" (NOT Visibility — see header comment). Empty string also OK,
@@ -1068,7 +1048,7 @@ FMCPResponse Tool_OverlapTest(const FMCPRequest& Request)
 	ECollisionChannel Channel = ECC_WorldStatic;
 	if (!PHY_ParseCollisionChannel(ChannelStr, Channel))
 	{
-		return PHY_MakeError(Request, kMCPErrorInvalidCollisionChannel,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidCollisionChannel,
 			FString::Printf(TEXT("channel '%s' not recognised; accepted: %s"),
 				*ChannelStr, PHY_AcceptedChannelNames));
 	}
@@ -1076,7 +1056,7 @@ FMCPResponse Tool_OverlapTest(const FMCPRequest& Request)
 	UWorld* World = PHY_ResolveTraceWorld();
 	if (!World)
 	{
-		return PHY_MakeError(Request, kPHYErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kPHYErrorInternal,
 			TEXT("no world available (GEditor missing OR no level loaded)"));
 	}
 
@@ -1133,7 +1113,7 @@ FMCPResponse Tool_OverlapTest(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("ignored_count"), IgnoredCount);
 	Out->SetNumberField(TEXT("hit_count"), HitsArr.Num());
 	Out->SetArrayField(TEXT("hits"), HitsArr);
-	return PHY_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

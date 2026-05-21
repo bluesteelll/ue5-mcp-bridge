@@ -3,6 +3,8 @@
 #include "GameplayTagTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
+#include "MCPMutatorScope.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -12,7 +14,6 @@
 #include "GameplayTagContainer.h"
 #include "GameplayTagAssetInterface.h"
 #include "GameplayTagsManager.h"
-#include "ScopedTransaction.h"
 #include "UObject/Package.h"
 #include "UObject/UnrealType.h"
 
@@ -23,48 +24,6 @@
 
 namespace
 {
-	constexpr int32 kGTErrorInvalidParams = -32602;
-	constexpr int32 kGTErrorInternal      = -32603;
-
-	void GT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse GT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		GT_StampIds(Request, R);
-		R.bIsError = true; R.ErrorCode = Code; R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse GT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		GT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool GT_RequireString(const FMCPRequest& Request, const TCHAR* Field, FString& OutValue, FMCPResponse& OutErr)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutErr = GT_MakeError(Request, kGTErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(Field, OutValue) || OutValue.IsEmpty())
-		{
-			OutErr = GT_MakeError(Request, kGTErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), Field));
-			return false;
-		}
-		return true;
-	}
-
 	/**
 	 * Find an FGameplayTagContainer-typed UPROPERTY by name on an UObject (actor or component).
 	 * Returns the StructProperty + valuePtr pair on success; null on failure.
@@ -205,7 +164,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	{
 		Resp->SetStringField(TEXT("next_page_token"), Filtered[EndIdx - 1].ToString());
 	}
-	return GT_MakeSuccessObj(Request, Resp);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Resp);
 }
 
 // ─── gameplaytag.query_actor ──────────────────────────────────────────────────────────────────
@@ -221,7 +180,7 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 
 	FString ActorPath;
 	FMCPResponse Err;
-	if (!GT_RequireString(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
 
 	bool bAmbiguous = false;
 	FString AmbiguityHint, ResolveErr;
@@ -229,7 +188,7 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return GT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -248,7 +207,7 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 			IFace->GetOwnedGameplayTags(Tags);
 			Out->SetStringField(TEXT("source"), TEXT("interface"));
 			Out->SetField(TEXT("tags"), GT_ContainerToJson(Tags));
-			return GT_MakeSuccessObj(Request, Out);
+			return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 		}
 		// Also scan components for the interface.
 		for (UActorComponent* Comp : Actor->GetComponents())
@@ -260,7 +219,7 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 				Out->SetStringField(TEXT("source"), TEXT("interface"));
 				Out->SetStringField(TEXT("interface_holder"), Comp->GetPathName());
 				Out->SetField(TEXT("tags"), GT_ContainerToJson(Tags));
-				return GT_MakeSuccessObj(Request, Out);
+				return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 			}
 		}
 	}
@@ -273,7 +232,7 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 		FStructProperty* StructProp = GT_LocateTagContainer(Actor, PropertyName, Holder, ValuePtr);
 		if (!StructProp || !ValuePtr)
 		{
-			return GT_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(
 					TEXT("no FGameplayTagContainer property named '%s' on actor '%s' or any component"),
 					*PropertyName, *ActorPath));
@@ -283,7 +242,7 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("property_holder"), Holder->GetPathName());
 		Out->SetStringField(TEXT("property_name"), PropertyName);
 		Out->SetField(TEXT("tags"), GT_ContainerToJson(Container));
-		return GT_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	// No source available.
@@ -292,7 +251,7 @@ FMCPResponse Tool_QueryActor(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("tags"), EmptyTags);
 	Out->SetStringField(TEXT("hint"), TEXT("Actor doesn't implement IGameplayTagAssetInterface. "
 		"Pass property_name to read a specific FGameplayTagContainer UPROPERTY."));
-	return GT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── gameplaytag.add_to_container ─────────────────────────────────────────────────────────────
@@ -303,16 +262,14 @@ FMCPResponse Tool_AddToContainer(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return GT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_GameplayTag_Add", "Add Gameplay Tag"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ActorPath, PropertyName, TagStr;
 	FMCPResponse Err;
-	if (!GT_RequireString(Request, TEXT("actor_path"),    ActorPath,    Err)) { return Err; }
-	if (!GT_RequireString(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
-	if (!GT_RequireString(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"),    ActorPath,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
 
 	bool bAmbiguous = false;
 	FString AmbiguityHint, ResolveErr;
@@ -320,7 +277,7 @@ FMCPResponse Tool_AddToContainer(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return GT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -329,7 +286,7 @@ FMCPResponse Tool_AddToContainer(const FMCPRequest& Request)
 	FStructProperty* StructProp = GT_LocateTagContainer(Actor, PropertyName, Holder, ValuePtr);
 	if (!StructProp || !ValuePtr)
 	{
-		return GT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no FGameplayTagContainer property '%s' on actor '%s'"),
 				*PropertyName, *ActorPath));
 	}
@@ -337,13 +294,12 @@ FMCPResponse Tool_AddToContainer(const FMCPRequest& Request)
 	const FGameplayTag Tag = UGameplayTagsManager::Get().RequestGameplayTag(FName(*TagStr), /*ErrorIfNotFound*/ false);
 	if (!Tag.IsValid())
 	{
-		return GT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("gameplay tag '%s' is not registered (check Project Settings -> GameplayTags)"), *TagStr));
 	}
 
 	FGameplayTagContainer* Container = static_cast<FGameplayTagContainer*>(ValuePtr);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_GameplayTag_Add", "Add Gameplay Tag"));
 	Holder->Modify();
 
 	const bool bWasPresent = Container->HasTagExact(Tag);
@@ -352,14 +308,14 @@ FMCPResponse Tool_AddToContainer(const FMCPRequest& Request)
 		Container->AddTag(Tag);
 	}
 
-	if (UPackage* Pkg = Holder->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Holder->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("added"), !bWasPresent);
 	Out->SetBoolField(TEXT("was_already_present"), bWasPresent);
 	Out->SetNumberField(TEXT("new_count"), Container->Num());
 	Out->SetStringField(TEXT("holder"), Holder->GetPathName());
-	return GT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── gameplaytag.remove_from_container ────────────────────────────────────────────────────────
@@ -370,16 +326,14 @@ FMCPResponse Tool_RemoveFromContainer(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return GT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_GameplayTag_Remove", "Remove Gameplay Tag"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ActorPath, PropertyName, TagStr;
 	FMCPResponse Err;
-	if (!GT_RequireString(Request, TEXT("actor_path"),    ActorPath,    Err)) { return Err; }
-	if (!GT_RequireString(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
-	if (!GT_RequireString(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"),    ActorPath,    Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_name"), PropertyName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("tag"),           TagStr,       Err)) { return Err; }
 
 	bool bAmbiguous = false;
 	FString AmbiguityHint, ResolveErr;
@@ -387,7 +341,7 @@ FMCPResponse Tool_RemoveFromContainer(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return GT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -396,7 +350,7 @@ FMCPResponse Tool_RemoveFromContainer(const FMCPRequest& Request)
 	FStructProperty* StructProp = GT_LocateTagContainer(Actor, PropertyName, Holder, ValuePtr);
 	if (!StructProp || !ValuePtr)
 	{
-		return GT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no FGameplayTagContainer property '%s' on actor '%s'"),
 				*PropertyName, *ActorPath));
 	}
@@ -404,13 +358,12 @@ FMCPResponse Tool_RemoveFromContainer(const FMCPRequest& Request)
 	const FGameplayTag Tag = UGameplayTagsManager::Get().RequestGameplayTag(FName(*TagStr), /*ErrorIfNotFound*/ false);
 	if (!Tag.IsValid())
 	{
-		return GT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("gameplay tag '%s' is not registered"), *TagStr));
 	}
 
 	FGameplayTagContainer* Container = static_cast<FGameplayTagContainer*>(ValuePtr);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_GameplayTag_Remove", "Remove Gameplay Tag"));
 	Holder->Modify();
 
 	const bool bWasPresent = Container->HasTagExact(Tag);
@@ -419,14 +372,14 @@ FMCPResponse Tool_RemoveFromContainer(const FMCPRequest& Request)
 		Container->RemoveTag(Tag);
 	}
 
-	if (UPackage* Pkg = Holder->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Holder->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("removed"), bWasPresent);
 	Out->SetBoolField(TEXT("was_present"), bWasPresent);
 	Out->SetNumberField(TEXT("new_count"), Container->Num());
 	Out->SetStringField(TEXT("holder"), Holder->GetPathName());
-	return GT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

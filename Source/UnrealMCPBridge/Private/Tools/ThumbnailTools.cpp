@@ -3,6 +3,8 @@
 #include "ThumbnailTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPathSandbox.h"
@@ -20,7 +22,6 @@
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
 #include "ObjectTools.h"
-#include "ScopedTransaction.h"
 #include "ThumbnailRendering/ThumbnailManager.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
@@ -35,7 +36,9 @@
 
 namespace
 {
-	// THUMB_ prefix per the unity-build symbol-collision convention.
+	// THUMB_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d).
 	constexpr int32 kTHUMBErrorInvalidParams = -32602;
 	constexpr int32 kTHUMBErrorInternal      = -32603;
 
@@ -47,31 +50,6 @@ namespace
 	// Hard cap on the asset_paths array per call. 256 keeps a single round-trip bounded against
 	// an accidental project-wide thumbnail-rebuild (each Render is ~5-50 ms on a typical asset).
 	constexpr int32 kTHUMBMaxBatchAssets = 256;
-
-	void THUMB_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse THUMB_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		THUMB_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse THUMB_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		THUMB_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	/**
 	 * Resolve a single asset path argument to a loaded UObject*. Returns nullptr on any failure
@@ -177,24 +155,24 @@ FMCPResponse Tool_ThumbnailBatchGenerate(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// asset_paths[] — required, non-empty, bounded by kTHUMBMaxBatchAssets.
 	const TArray<TSharedPtr<FJsonValue>>* PathsArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("asset_paths"), PathsArr) || !PathsArr)
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			TEXT("missing required array field 'asset_paths'"));
 	}
 	if (PathsArr->Num() == 0)
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			TEXT("'asset_paths' must contain at least one entry"));
 	}
 	if (PathsArr->Num() > kTHUMBMaxBatchAssets)
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			FString::Printf(TEXT("'asset_paths' length %d exceeds cap %d"),
 				PathsArr->Num(), kTHUMBMaxBatchAssets));
 	}
@@ -203,14 +181,14 @@ FMCPResponse Tool_ThumbnailBatchGenerate(const FMCPRequest& Request)
 	FString OutDirRaw;
 	if (!Request.Args->TryGetStringField(TEXT("output_directory"), OutDirRaw) || OutDirRaw.IsEmpty())
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			TEXT("missing required string field 'output_directory'"));
 	}
 	FString OutDirAbs;
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(OutDirRaw, OutDirAbs, SandboxErr))
 	{
-		return THUMB_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 
 	// size — optional, [kTHUMBSizeMin, kTHUMBSizeMax].
@@ -218,7 +196,7 @@ FMCPResponse Tool_ThumbnailBatchGenerate(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("size"), Size);
 	if (Size < kTHUMBSizeMin || Size > kTHUMBSizeMax)
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			FString::Printf(TEXT("size %d outside [%d, %d]"), Size, kTHUMBSizeMin, kTHUMBSizeMax));
 	}
 
@@ -229,7 +207,7 @@ FMCPResponse Tool_ThumbnailBatchGenerate(const FMCPRequest& Request)
 		|| Format.Equals(TEXT("jpeg"), ESearchCase::IgnoreCase);
 	if (!bJpg && !Format.Equals(TEXT("png"), ESearchCase::IgnoreCase))
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			FString::Printf(TEXT("format '%s' not in {png, jpg, jpeg}"), *Format));
 	}
 	const TCHAR* Ext = bJpg ? TEXT("jpg") : TEXT("png");
@@ -242,7 +220,7 @@ FMCPResponse Tool_ThumbnailBatchGenerate(const FMCPRequest& Request)
 		// We re-check via DirectoryExists to distinguish.
 		if (!IFileManager::Get().DirectoryExists(*OutDirAbs))
 		{
-			return THUMB_MakeError(Request, kTHUMBErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInternal,
 				FString::Printf(TEXT("could not create output directory '%s'"), *OutDirAbs));
 		}
 	}
@@ -344,12 +322,12 @@ FMCPResponse Tool_ThumbnailBatchGenerate(const FMCPRequest& Request)
 		FilesOut.Add(MakeShared<FJsonValueObject>(Ok));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetNumberField(TEXT("generated"), FilesOut.Num());
 	Out->SetNumberField(TEXT("failed"), FailuresOut.Num());
 	Out->SetArrayField(TEXT("files"), FilesOut);
 	Out->SetArrayField(TEXT("failures"), FailuresOut);
-	return THUMB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── thumbnail.clear_cache ──────────────────────────────────────────────────────────────────────
@@ -377,7 +355,7 @@ FMCPResponse Tool_ThumbnailClearCache(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	bool bForceRegenerate = false;
@@ -466,10 +444,10 @@ FMCPResponse Tool_ThumbnailClearCache(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetNumberField(TEXT("cleared_count"), ClearedCount);
 	Out->SetNumberField(TEXT("regenerated_count"), RegeneratedCount);
-	return THUMB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── thumbnail.set_custom ───────────────────────────────────────────────────────────────────────
@@ -485,51 +463,49 @@ FMCPResponse Tool_ThumbnailClearCache(const FMCPRequest& Request)
 //                                      for supplying an appropriately-sized image, typical 256x256)
 //
 // Lane A. PIE-guarded (mutates the asset's package — marks dirty for next SaveLoadedAsset).
-// FScopedTransaction for undo. MarkPackageDirty.
+// FMCPMutatorScope wraps PIE-guard + transaction + dirty-flush.
 FMCPResponse Tool_ThumbnailSetCustom(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (GEditor && GEditor->PlayWorld != nullptr)
-	{
-		return THUMB_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCPThumbnailSetCustom", "MCP: set custom thumbnail"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// asset_path — required, must resolve to a loaded UObject.
 	FString AssetPathIn;
 	if (!Request.Args->TryGetStringField(TEXT("asset_path"), AssetPathIn) || AssetPathIn.IsEmpty())
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			TEXT("missing required string field 'asset_path'"));
 	}
 	FString AssetFailReason;
 	UObject* Asset = THUMB_ResolveAssetForRender(AssetPathIn, AssetFailReason);
 	if (Asset == nullptr)
 	{
-		return THUMB_MakeError(Request, kMCPErrorObjectNotFound, AssetFailReason);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, AssetFailReason);
 	}
 
 	// image_path — required, sandbox-resolved.
 	FString ImagePathRaw;
 	if (!Request.Args->TryGetStringField(TEXT("image_path"), ImagePathRaw) || ImagePathRaw.IsEmpty())
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInvalidParams,
 			TEXT("missing required string field 'image_path'"));
 	}
 	FString ImagePathAbs;
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(ImagePathRaw, ImagePathAbs, SandboxErr))
 	{
-		return THUMB_MakeError(Request, kMCPErrorPathEscape, SandboxErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape, SandboxErr);
 	}
 	if (!IFileManager::Get().FileExists(*ImagePathAbs))
 	{
-		return THUMB_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("image file '%s' does not exist"), *ImagePathAbs));
 	}
 
@@ -537,7 +513,7 @@ FMCPResponse Tool_ThumbnailSetCustom(const FMCPRequest& Request)
 	TArray<uint8> CompressedBytes;
 	if (!FFileHelper::LoadFileToArray(CompressedBytes, *ImagePathAbs) || CompressedBytes.Num() == 0)
 	{
-		return THUMB_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("could not read image file '%s'"), *ImagePathAbs));
 	}
 
@@ -547,7 +523,7 @@ FMCPResponse Tool_ThumbnailSetCustom(const FMCPRequest& Request)
 	FImage Decoded;
 	if (!IWM.DecompressImage(CompressedBytes.GetData(), CompressedBytes.Num(), Decoded))
 	{
-		return THUMB_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("ImageWrapper failed to decode '%s' "
 				"(not a recognised PNG/JPG/EXR/HDR/TGA/BMP format?)"), *ImagePathAbs));
 	}
@@ -560,7 +536,7 @@ FMCPResponse Tool_ThumbnailSetCustom(const FMCPRequest& Request)
 	const int32 Height = Decoded.SizeY;
 	if (Width <= 0 || Height <= 0)
 	{
-		return THUMB_MakeError(Request, kMCPErrorThumbnailRenderFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("decoded image '%s' has zero dimensions"), *ImagePathAbs));
 	}
 
@@ -577,11 +553,11 @@ FMCPResponse Tool_ThumbnailSetCustom(const FMCPRequest& Request)
 	UPackage* Pkg = Asset->GetOutermost();
 	if (Pkg == nullptr)
 	{
-		return THUMB_MakeError(Request, kTHUMBErrorInternal,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInternal,
 			FString::Printf(TEXT("asset '%s' has no outer package"), *Asset->GetFullName()));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("MCPThumbnailSetCustom", "MCP: set custom thumbnail"));
 	Pkg->Modify(); // transact the package so undo restores the previous thumbnail (if any).
 
 	const FString ObjectFullName = Asset->GetFullName();
@@ -591,20 +567,21 @@ FMCPResponse Tool_ThumbnailSetCustom(const FMCPRequest& Request)
 	{
 		// Should not happen — CacheThumbnail only returns nullptr when ObjectFullName is empty
 		// or Package is nullptr, both of which we've already validated.
-		return THUMB_MakeError(Request, kTHUMBErrorInternal,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kTHUMBErrorInternal,
 			FString::Printf(TEXT("ThumbnailTools::CacheThumbnail returned null for '%s'"),
 				*ObjectFullName));
 	}
 
-	Pkg->MarkPackageDirty();
+	Scope.DirtyPackage(Pkg);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("set"), true);
 	TArray<TSharedPtr<FJsonValue>> ResolutionArr;
 	ResolutionArr.Add(MakeShared<FJsonValueNumber>(Width));
 	ResolutionArr.Add(MakeShared<FJsonValueNumber>(Height));
 	Out->SetArrayField(TEXT("image_resolution"), ResolutionArr);
-	return THUMB_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ───────────────────────────────────────────────────────────────────────────────

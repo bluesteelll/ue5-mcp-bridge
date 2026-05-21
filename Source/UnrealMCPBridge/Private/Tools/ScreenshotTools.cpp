@@ -3,6 +3,7 @@
 #include "ScreenshotTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPPathSandbox.h"
@@ -32,7 +33,9 @@
 
 namespace
 {
-	// SHOT_ prefix per the unity-build symbol-collision convention.
+	// SHOT_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d).
 	constexpr int32 kSHOTErrorInvalidParams = -32602;
 	constexpr int32 kSHOTErrorInternal      = -32603;
 
@@ -55,31 +58,6 @@ namespace
 	// pixels = "identical". Per-channel noise tolerance defaults to 5 (JPEG artefact slack).
 	constexpr float kSHOTDiffThresholdDefault = 0.05f;
 	constexpr int32 kSHOTDiffChannelTolerance = 5;
-
-	void SHOT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse SHOT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		SHOT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse SHOT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		SHOT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	// ─── Viewport resolution helpers (mirror of EditorTools/ViewportTools) ─────────────────────
 
@@ -153,7 +131,7 @@ namespace
 
 		if (!GEditor)
 		{
-			OutErr = SHOT_MakeError(Request, kSHOTErrorInternal,
+			OutErr = FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 				TEXT("GEditor unavailable (commandlet?)"));
 			return nullptr;
 		}
@@ -168,13 +146,13 @@ namespace
 			const TArray<FLevelEditorViewportClient*>& Clients = GEditor->GetLevelViewportClients();
 			if (Clients.Num() == 0)
 			{
-				OutErr = SHOT_MakeError(Request, kSHOTErrorInternal,
+				OutErr = FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 					TEXT("no level viewports available (open a level editor tab first)"));
 				return nullptr;
 			}
 			if (Index < 0 || Index >= Clients.Num())
 			{
-				OutErr = SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+				OutErr = FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 					FString::Printf(
 						TEXT("viewport_index %d out of range [0, %d)"), Index, Clients.Num()));
 				return nullptr;
@@ -182,7 +160,7 @@ namespace
 			FLevelEditorViewportClient* VC = Clients[Index];
 			if (!VC || !VC->Viewport)
 			{
-				OutErr = SHOT_MakeError(Request, kSHOTErrorInternal,
+				OutErr = FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 					FString::Printf(TEXT("level viewport client at index %d is null/uninit"), Index));
 				return nullptr;
 			}
@@ -193,7 +171,7 @@ namespace
 		FLevelEditorViewportClient* VC = SHOT_FindBestDefaultViewport();
 		if (!VC || !VC->Viewport)
 		{
-			OutErr = SHOT_MakeError(Request, kSHOTErrorInternal,
+			OutErr = FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 				TEXT("no active level viewport (NO_VIEWPORT) — open a level editor tab first"));
 			return nullptr;
 		}
@@ -455,7 +433,7 @@ FMCPResponse Tool_HighResolution(const FMCPRequest& Request)
 	}
 	if (Multiplier < kSHOTHighResMultiplierMin || Multiplier > kSHOTHighResMultiplierMax)
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 			FString::Printf(
 				TEXT("resolution_multiplier %g out of [%g, %g]"),
 				Multiplier, kSHOTHighResMultiplierMin, kSHOTHighResMultiplierMax));
@@ -468,7 +446,7 @@ FMCPResponse Tool_HighResolution(const FMCPRequest& Request)
 	if (!SHOT_ResolveOutputPath(Request.Args, TEXT("png"), TEXT("hires"),
 		AbsPath, PathErrCode, PathErrMsg))
 	{
-		return SHOT_MakeError(Request, PathErrCode, PathErrMsg);
+		return FMCPToolHelpers::MakeError(Request, PathErrCode, PathErrMsg);
 	}
 
 	// Resolve viewport (validates viewport_index).
@@ -480,7 +458,7 @@ FMCPResponse Tool_HighResolution(const FMCPRequest& Request)
 	const FIntPoint NativeSize = Viewport->GetSizeXY();
 	if (NativeSize.X <= 0 || NativeSize.Y <= 0)
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			FString::Printf(TEXT("viewport not realised (size=%dx%d)"), NativeSize.X, NativeSize.Y));
 	}
 
@@ -498,7 +476,7 @@ FMCPResponse Tool_HighResolution(const FMCPRequest& Request)
 	if (!FMCPScreenshotUtils::CaptureViewport(
 			Viewport, TargetW, TargetH, Pixels, OutW, OutH, CaptureErr))
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			FString::Printf(TEXT("high-res capture failed: %s"), *CaptureErr));
 	}
 
@@ -508,11 +486,11 @@ FMCPResponse Tool_HighResolution(const FMCPRequest& Request)
 	if (!FMCPScreenshotUtils::EncodeAndSaveToDisk(
 			Pixels, OutW, OutH, Format, /*JpegQuality*/ 90, AbsPath, BytesWritten, SaveErr))
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("saved_path"), AbsPath);
 	Out->SetNumberField(TEXT("width"), OutW);
 	Out->SetNumberField(TEXT("height"), OutH);
@@ -520,7 +498,7 @@ FMCPResponse Tool_HighResolution(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("multiplier"), Multiplier);
 	Out->SetNumberField(TEXT("native_width"), NativeSize.X);
 	Out->SetNumberField(TEXT("native_height"), NativeSize.Y);
-	return SHOT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── screenshot.region_capture ─────────────────────────────────────────────────────────────────
@@ -555,13 +533,13 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString ActorPath;
 	if (!Request.Args->TryGetStringField(TEXT("actor_path"), ActorPath) || ActorPath.IsEmpty())
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 			TEXT("missing required string field 'actor_path'"));
 	}
 
@@ -569,7 +547,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("padding"), PaddingRaw);
 	if (PaddingRaw < 0.0)
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 			FString::Printf(TEXT("padding %g must be ≥ 0"), PaddingRaw));
 	}
 	const float Padding = static_cast<float>(PaddingRaw);
@@ -582,7 +560,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 	{
 		if (ResArr->Num() != 2)
 		{
-			return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 				FString::Printf(
 					TEXT("'resolution' must be [w, h] (2 numbers); got %d entries"),
 					ResArr->Num()));
@@ -590,7 +568,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 		double W = 0.0, H = 0.0;
 		if (!(*ResArr)[0]->TryGetNumber(W) || !(*ResArr)[1]->TryGetNumber(H))
 		{
-			return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 				TEXT("'resolution' entries must both be numbers"));
 		}
 		ResW = static_cast<int32>(W);
@@ -598,7 +576,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 		if (ResW < kSHOTRegionMin || ResW > kSHOTRegionMax
 			|| ResH < kSHOTRegionMin || ResH > kSHOTRegionMax)
 		{
-			return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 				FString::Printf(
 					TEXT("'resolution' [%d, %d] outside [%d, %d]"),
 					ResW, ResH, kSHOTRegionMin, kSHOTRegionMax));
@@ -616,14 +594,14 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 		const FString Msg = bAmbig
 			? FString::Printf(TEXT("actor '%s' ambiguous: %s"), *ActorPath, *AmbigHint)
 			: FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErrMsg);
-		return SHOT_MakeError(Request, kMCPErrorObjectNotFound, Msg);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, Msg);
 	}
 
 	// Compute AABB. include nonColliding so visual-only meshes count (matches viewport.focus_on_actor).
 	FBox Bounds = Actor->GetComponentsBoundingBox(/*bNonColliding*/ true);
 	if (!Bounds.IsValid)
 	{
-		return SHOT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(
 				TEXT("actor '%s' has no valid bounding box (no registered components with bounds)"),
 				*ActorPath));
@@ -647,7 +625,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 	FViewport* Viewport = VC->Viewport;
 	if (!Viewport)
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			TEXT("viewport client has no realised FViewport"));
 	}
 
@@ -665,7 +643,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 	if (!SHOT_ResolveOutputPath(Request.Args, TEXT("png"), TEXT("region"),
 		AbsPath, PathErrCode, PathErrMsg))
 	{
-		return SHOT_MakeError(Request, PathErrCode, PathErrMsg);
+		return FMCPToolHelpers::MakeError(Request, PathErrCode, PathErrMsg);
 	}
 
 	// Focus + invalidate. bInstant=true skips the editor's smooth-camera-tween animation so
@@ -689,7 +667,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 		VC->SetViewRotation(PriorRotation);
 		VC->ViewFOV = PriorFOV;
 		VC->Invalidate();
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			FString::Printf(TEXT("region capture failed: %s"), *CaptureErr));
 	}
 
@@ -703,7 +681,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 		VC->SetViewRotation(PriorRotation);
 		VC->ViewFOV = PriorFOV;
 		VC->Invalidate();
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
 	}
 
@@ -730,7 +708,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 	ResArrOut.Add(MakeShared<FJsonValueNumber>(OutW));
 	ResArrOut.Add(MakeShared<FJsonValueNumber>(OutH));
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("saved_path"), AbsPath);
 	Out->SetNumberField(TEXT("width"), OutW);
 	Out->SetNumberField(TEXT("height"), OutH);
@@ -738,7 +716,7 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
 	Out->SetObjectField(TEXT("actor_bounds"), BoundsObj);
 	Out->SetArrayField(TEXT("captured_resolution"), ResArrOut);
-	return SHOT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── screenshot.diff ───────────────────────────────────────────────────────────────────────────
@@ -782,18 +760,18 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString PathARaw, PathBRaw;
 	if (!Request.Args->TryGetStringField(TEXT("image_a_path"), PathARaw) || PathARaw.IsEmpty())
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 			TEXT("missing required string field 'image_a_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("image_b_path"), PathBRaw) || PathBRaw.IsEmpty())
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 			TEXT("missing required string field 'image_b_path'"));
 	}
 
@@ -801,7 +779,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	Request.Args->TryGetNumberField(TEXT("threshold"), ThresholdRaw);
 	if (ThresholdRaw < 0.0 || ThresholdRaw > 1.0)
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
 			FString::Printf(TEXT("threshold %g out of [0.0, 1.0]"), ThresholdRaw));
 	}
 	const float Threshold = static_cast<float>(ThresholdRaw);
@@ -820,17 +798,17 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	FString SandboxErr;
 	if (!FMCPPathSandbox::Resolve(PathARaw, AbsA, SandboxErr))
 	{
-		return SHOT_MakeError(Request, kMCPErrorPathEscape,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
 			FString::Printf(TEXT("image_a_path: %s"), *SandboxErr));
 	}
 	if (!FMCPPathSandbox::Resolve(PathBRaw, AbsB, SandboxErr))
 	{
-		return SHOT_MakeError(Request, kMCPErrorPathEscape,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
 			FString::Printf(TEXT("image_b_path: %s"), *SandboxErr));
 	}
 	if (bWantOverlay && !FMCPPathSandbox::Resolve(DiffOutRaw, AbsDiffOut, SandboxErr))
 	{
-		return SHOT_MakeError(Request, kMCPErrorPathEscape,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
 			FString::Printf(TEXT("diff_output_path: %s"), *SandboxErr));
 	}
 
@@ -838,12 +816,12 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	// surface that callers expect for "file not found" vs ambiguous decode failure).
 	if (!FPaths::FileExists(AbsA))
 	{
-		return SHOT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("image_a_path file not found: '%s'"), *AbsA));
 	}
 	if (!FPaths::FileExists(AbsB))
 	{
-		return SHOT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("image_b_path file not found: '%s'"), *AbsB));
 	}
 
@@ -852,12 +830,12 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	FString DecodeErr;
 	if (!SHOT_LoadImageBGRA8(AbsA, ImageA, DecodeErr))
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			FString::Printf(TEXT("image_a decode: %s"), *DecodeErr));
 	}
 	if (!SHOT_LoadImageBGRA8(AbsB, ImageB, DecodeErr))
 	{
-		return SHOT_MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
 			FString::Printf(TEXT("image_b decode: %s"), *DecodeErr));
 	}
 
@@ -872,7 +850,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	// Dimension mismatch: well-defined "everything differs" result, not an error.
 	if (ImageA.SizeX != ImageB.SizeX || ImageA.SizeY != ImageB.SizeY)
 	{
-		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		Out->SetBoolField(TEXT("identical"), false);
 		Out->SetNumberField(TEXT("difference_pct"), 100.0);
 		Out->SetNumberField(TEXT("differing_pixels"), 0);
@@ -880,7 +858,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 		Out->SetObjectField(TEXT("image_a"), ASizeObj);
 		Out->SetObjectField(TEXT("image_b"), BSizeObj);
 		Out->SetStringField(TEXT("note"), TEXT("dimension mismatch — diff is 100% by definition"));
-		return SHOT_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
 	TArrayView64<const FColor> PixelsA = ImageA.AsBGRA8();
@@ -922,7 +900,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("identical"), bIdentical);
 	Out->SetNumberField(TEXT("difference_pct"), DiffPct);
 	Out->SetNumberField(TEXT("differing_pixels"), static_cast<double>(DiffCount));
@@ -934,7 +912,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	{
 		Out->SetStringField(TEXT("diff_image_path"), DiffWritePath);
 	}
-	return SHOT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

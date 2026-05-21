@@ -3,6 +3,9 @@
 #include "MeshTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
@@ -19,7 +22,6 @@
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "PerPlatformProperties.h"
-#include "ScopedTransaction.h"
 #include "StaticMeshResources.h"
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "UObject/Package.h"
@@ -33,134 +35,7 @@
 namespace
 {
 	// MSH_ prefix per unity-build symbol-collision convention.
-	constexpr int32 kMSHErrorInvalidParams = -32602;
-	constexpr int32 kMSHErrorInternal      = -32603;
-
-	void MSH_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse MSH_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		MSH_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse MSH_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		MSH_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool MSH_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = MSH_MakeError(Request, kMSHErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = MSH_MakeError(Request, kMSHErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	/** Load a UStaticMesh by path. Mirrors AnimTools' ANM_LoadSequenceByPath shape. */
-	UStaticMesh* MSH_LoadMeshByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("'%s' not loadable"), *Path);
-			return nullptr;
-		}
-		UStaticMesh* Mesh = Cast<UStaticMesh>(Loaded);
-		if (!Mesh)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(TEXT("'%s' is class '%s'; expected UStaticMesh"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return Mesh;
-	}
-
-	/** Load a UMaterialInterface by path. */
-	UMaterialInterface* MSH_LoadMaterialByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("'%s' not loadable"), *Path);
-			return nullptr;
-		}
-		UMaterialInterface* Mat = Cast<UMaterialInterface>(Loaded);
-		if (!Mat)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(TEXT("'%s' is class '%s'; expected UMaterialInterface"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return Mat;
-	}
+	constexpr int32 kMSHErrorInternal = -32603;
 
 	/** Convert FVector → 3-element JSON array of doubles. */
 	TSharedRef<FJsonValueArray> MSH_Vec3ToJson(const FVector& V)
@@ -224,12 +99,12 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return MSH_MakeError(Request, kMSHErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return MSH_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 		}
 		while (StartIdx < Assets.Num() &&
@@ -264,7 +139,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return MSH_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mesh.get_info ────────────────────────────────────────────────────────────────────────────
@@ -282,12 +157,12 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 
 	FString MeshPath;
 	FMCPResponse Err;
-	if (!MSH_RequireStringField(Request, TEXT("mesh_path"), MeshPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("mesh_path"), MeshPath, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UStaticMesh* Mesh = MSH_LoadMeshByPath(MeshPath, LoadErrCode, LoadErrMsg);
-	if (!Mesh) { return MSH_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UStaticMesh* Mesh = FMCPAssetLoader::Load<UStaticMesh>(MeshPath, LoadErrCode, LoadErrMsg);
+	if (!Mesh) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("asset_path"), Mesh->GetPathName());
@@ -339,7 +214,7 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 	}
 	Out->SetArrayField(TEXT("material_slots"), SlotArr);
 
-	return MSH_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mesh.list_lods ───────────────────────────────────────────────────────────────────────────
@@ -356,12 +231,12 @@ FMCPResponse Tool_ListLODs(const FMCPRequest& Request)
 
 	FString MeshPath;
 	FMCPResponse Err;
-	if (!MSH_RequireStringField(Request, TEXT("mesh_path"), MeshPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("mesh_path"), MeshPath, Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UStaticMesh* Mesh = MSH_LoadMeshByPath(MeshPath, LoadErrCode, LoadErrMsg);
-	if (!Mesh) { return MSH_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UStaticMesh* Mesh = FMCPAssetLoader::Load<UStaticMesh>(MeshPath, LoadErrCode, LoadErrMsg);
+	if (!Mesh) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("asset_path"), Mesh->GetPathName());
@@ -386,7 +261,7 @@ FMCPResponse Tool_ListLODs(const FMCPRequest& Request)
 	}
 	Out->SetArrayField(TEXT("lods"), LODArr);
 
-	return MSH_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mesh.set_material_slot ───────────────────────────────────────────────────────────────────
@@ -400,43 +275,41 @@ FMCPResponse Tool_SetMaterialSlot(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return MSH_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_Mesh_SetMaterialSlot", "Set StaticMesh Material Slot"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString MeshPath, MaterialPath;
 	FMCPResponse Err;
-	if (!MSH_RequireStringField(Request, TEXT("mesh_path"),     MeshPath,     Err)) { return Err; }
-	if (!MSH_RequireStringField(Request, TEXT("material_path"), MaterialPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("mesh_path"),     MeshPath,     Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("material_path"), MaterialPath, Err)) { return Err; }
 
 	int32 SlotIndex = -1;
 	if (!Request.Args->TryGetNumberField(TEXT("slot_index"), SlotIndex))
 	{
-		return MSH_MakeError(Request, kMSHErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("mesh.set_material_slot requires args.slot_index (integer, non-negative)"));
 	}
 	if (SlotIndex < 0)
 	{
-		return MSH_MakeError(Request, kMSHErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("slot_index %d must be >= 0"), SlotIndex));
 	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UStaticMesh* Mesh = MSH_LoadMeshByPath(MeshPath, LoadErrCode, LoadErrMsg);
-	if (!Mesh) { return MSH_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UStaticMesh* Mesh = FMCPAssetLoader::Load<UStaticMesh>(MeshPath, LoadErrCode, LoadErrMsg);
+	if (!Mesh) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const int32 SlotCount = Mesh->GetStaticMaterials().Num();
 	if (SlotIndex >= SlotCount)
 	{
-		return MSH_MakeError(Request, kMCPErrorPropertyIndexOOB,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyIndexOOB,
 			FString::Printf(TEXT("slot_index %d out of range; mesh '%s' has %d material slot(s)"),
 				SlotIndex, *MeshPath, SlotCount));
 	}
 
-	UMaterialInterface* NewMat = MSH_LoadMaterialByPath(MaterialPath, LoadErrCode, LoadErrMsg);
-	if (!NewMat) { return MSH_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UMaterialInterface* NewMat = FMCPAssetLoader::Load<UMaterialInterface>(MaterialPath, LoadErrCode, LoadErrMsg);
+	if (!NewMat) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	// Snapshot prior values for the response BEFORE mutation.
 	const FStaticMaterial& PriorSlot = Mesh->GetStaticMaterials()[SlotIndex];
@@ -444,11 +317,10 @@ FMCPResponse Tool_SetMaterialSlot(const FMCPRequest& Request)
 		? PriorSlot.MaterialInterface->GetPathName() : FString();
 	const FString SlotName = PriorSlot.MaterialSlotName.ToString();
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_Mesh_SetMaterialSlot", "Set StaticMesh Material Slot"));
 	Mesh->Modify();
 	Mesh->SetMaterial(SlotIndex, NewMat);
 
-	if (UPackage* Pkg = Mesh->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(Mesh->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetNumberField(TEXT("slot_index"),     SlotIndex);
@@ -456,7 +328,7 @@ FMCPResponse Tool_SetMaterialSlot(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("prior_material"), PriorMaterialPath);
 	Out->SetStringField(TEXT("new_material"),   NewMat->GetPathName());
 	Out->SetNumberField(TEXT("slot_count"),     SlotCount);
-	return MSH_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── mesh.duplicate ───────────────────────────────────────────────────────────────────────────
@@ -473,25 +345,23 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return MSH_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_Mesh_Duplicate", "Duplicate Static Mesh"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString SourceRaw, DestRaw;
 	FMCPResponse Err;
-	if (!MSH_RequireStringField(Request, TEXT("source_mesh_path"), SourceRaw, Err)) { return Err; }
-	if (!MSH_RequireStringField(Request, TEXT("dest_path"),        DestRaw,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("source_mesh_path"), SourceRaw, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("dest_path"),        DestRaw,   Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UStaticMesh* Source = MSH_LoadMeshByPath(SourceRaw, LoadErrCode, LoadErrMsg);
-	if (!Source) { return MSH_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UStaticMesh* Source = FMCPAssetLoader::Load<UStaticMesh>(SourceRaw, LoadErrCode, LoadErrMsg);
+	if (!Source) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const FString DestNorm = FMCPAssetPathUtils::Normalize(DestRaw);
 	if (DestNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestNorm))
 	{
-		return MSH_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' malformed or unknown mount"), *DestRaw));
 	}
 
@@ -503,7 +373,7 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	if (FPackageName::DoesPackageExist(DestNorm) ||
 	    FindObject<UObject>(nullptr, *(DestNorm + TEXT(".") + AssetName)) != nullptr)
 	{
-		return MSH_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists (on disk or in-memory)"), *DestNorm));
 	}
 
@@ -511,17 +381,15 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	UPackage* DestPkg = CreatePackage(*PackageName);
 	if (!DestPkg)
 	{
-		return MSH_MakeError(Request, kMSHErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kMSHErrorInternal,
 			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *PackageName));
 	}
 	DestPkg->FullyLoad();
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_Mesh_Duplicate", "Duplicate Static Mesh"));
-
 	UStaticMesh* NewMesh = DuplicateObject<UStaticMesh>(Source, DestPkg, *AssetName);
 	if (!NewMesh)
 	{
-		return MSH_MakeError(Request, kMSHErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kMSHErrorInternal,
 			FString::Printf(TEXT("DuplicateObject<UStaticMesh> returned null for '%s' -> '%s'"),
 				*SourceRaw, *DestNorm));
 	}
@@ -530,7 +398,7 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	NewMesh->SetFlags(RF_Public | RF_Standalone | RF_Transactional);
 
 	FAssetRegistryModule::AssetCreated(NewMesh);
-	DestPkg->MarkPackageDirty();
+	Scope.DirtyPackage(DestPkg);
 
 	bool bSaveRequested = false, bSavedOk = false;
 	Request.Args->TryGetBoolField(TEXT("save"), bSaveRequested);
@@ -547,7 +415,7 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("asset_path"), NewMesh->GetPathName());
 	Out->SetStringField(TEXT("source_path"), Source->GetPathName());
 	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return MSH_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

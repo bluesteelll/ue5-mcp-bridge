@@ -3,6 +3,7 @@
 #include "DebugTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPWorldContext.h"
 
@@ -20,31 +21,7 @@
 
 namespace
 {
-	constexpr int32 kDBGErrorInvalidParams = -32602;
-	constexpr int32 kDBGErrorInternal      = -32603;
-
-	void DBG_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse DBG_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		DBG_StampIds(Request, R);
-		R.bIsError = true; R.ErrorCode = Code; R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse DBG_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		DBG_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	constexpr int32 kDBGErrorInternal = -32603;
 
 	// ─── World resolution ────────────────────────────────────────────────────────────────────────
 	//
@@ -130,7 +107,7 @@ namespace
 		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		Out->SetBoolField(Verb, true);
 		Out->SetStringField(TEXT("world"), DBG_WorldKindName(World));
-		return DBG_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 } // namespace
 
@@ -150,13 +127,13 @@ FMCPResponse Tool_DrawLine(const FMCPRequest& Request)
 	UWorld* World = DBG_ResolveWorld();
 	if (!World)
 	{
-		return DBG_MakeError(Request, kDBGErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
+		return FMCPToolHelpers::MakeError(Request, kDBGErrorInternal, TEXT("no world available (GEditor missing — commandlet/cooker?)"));
 	}
 
 	FVector Start, End;
 	FString Err;
-	if (!DBG_ParseVector3(Request.Args, TEXT("start"), Start, Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
-	if (!DBG_ParseVector3(Request.Args, TEXT("end"),   End,   Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("start"), Start, Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("end"),   End,   Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
 
 	const FColor Color      = DBG_ParseColor(Request.Args).ToFColor(/*sRGB*/ true);
 	const float Thickness   = static_cast<float>(DBG_ReadNumberOr(Request.Args, TEXT("thickness"), 0.0));
@@ -179,17 +156,17 @@ FMCPResponse Tool_DrawSphere(const FMCPRequest& Request)
 	UWorld* World = DBG_ResolveWorld();
 	if (!World)
 	{
-		return DBG_MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
 	}
 
 	FVector Center;
 	FString Err;
-	if (!DBG_ParseVector3(Request.Args, TEXT("center"), Center, Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("center"), Center, Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
 
 	double RadiusD = 0.0;
 	if (!Request.Args.IsValid() || !Request.Args->TryGetNumberField(TEXT("radius"), RadiusD))
 	{
-		return DBG_MakeError(Request, kDBGErrorInvalidParams, TEXT("missing required number field 'radius'"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing required number field 'radius'"));
 	}
 
 	const float Radius      = static_cast<float>(RadiusD);
@@ -215,13 +192,13 @@ FMCPResponse Tool_DrawBox(const FMCPRequest& Request)
 	UWorld* World = DBG_ResolveWorld();
 	if (!World)
 	{
-		return DBG_MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
 	}
 
 	FVector Center, Extent;
 	FString Err;
-	if (!DBG_ParseVector3(Request.Args, TEXT("center"), Center, Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
-	if (!DBG_ParseVector3(Request.Args, TEXT("extent"), Extent, Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("center"), Center, Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("extent"), Extent, Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
 
 	// Rotation is optional — default to identity (axis-aligned box).
 	FQuat Rotation = FQuat::Identity;
@@ -230,7 +207,7 @@ FMCPResponse Tool_DrawBox(const FMCPRequest& Request)
 		FVector RotVec;
 		if (!DBG_ParseVector3(Request.Args, TEXT("rotation"), RotVec, Err))
 		{
-			return DBG_MakeError(Request, kDBGErrorInvalidParams, Err);
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err);
 		}
 		// [pitch, yaw, roll] degrees → FRotator.
 		Rotation = FRotator(static_cast<float>(RotVec.X), static_cast<float>(RotVec.Y), static_cast<float>(RotVec.Z)).Quaternion();
@@ -257,13 +234,13 @@ FMCPResponse Tool_DrawArrow(const FMCPRequest& Request)
 	UWorld* World = DBG_ResolveWorld();
 	if (!World)
 	{
-		return DBG_MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
 	}
 
 	FVector Start, End;
 	FString Err;
-	if (!DBG_ParseVector3(Request.Args, TEXT("start"), Start, Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
-	if (!DBG_ParseVector3(Request.Args, TEXT("end"),   End,   Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("start"), Start, Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("end"),   End,   Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
 
 	const float ArrowSize   = static_cast<float>(DBG_ReadNumberOr(Request.Args, TEXT("arrow_size"), 40.0));
 	const FColor Color      = DBG_ParseColor(Request.Args).ToFColor(/*sRGB*/ true);
@@ -291,17 +268,17 @@ FMCPResponse Tool_DrawText(const FMCPRequest& Request)
 	UWorld* World = DBG_ResolveWorld();
 	if (!World)
 	{
-		return DBG_MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
 	}
 
 	FVector Location;
 	FString Err;
-	if (!DBG_ParseVector3(Request.Args, TEXT("location"), Location, Err)) { return DBG_MakeError(Request, kDBGErrorInvalidParams, Err); }
+	if (!DBG_ParseVector3(Request.Args, TEXT("location"), Location, Err)) { return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, Err); }
 
 	FString Text;
 	if (!Request.Args.IsValid() || !Request.Args->TryGetStringField(TEXT("text"), Text))
 	{
-		return DBG_MakeError(Request, kDBGErrorInvalidParams, TEXT("missing required string field 'text'"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing required string field 'text'"));
 	}
 
 	const FColor Color      = DBG_ParseColor(Request.Args).ToFColor(/*sRGB*/ true);
@@ -329,7 +306,7 @@ FMCPResponse Tool_Clear(const FMCPRequest& Request)
 	UWorld* World = DBG_ResolveWorld();
 	if (!World)
 	{
-		return DBG_MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
+		return FMCPToolHelpers::MakeError(Request, kDBGErrorInternal, TEXT("no world available"));
 	}
 
 	FlushPersistentDebugLines(World);

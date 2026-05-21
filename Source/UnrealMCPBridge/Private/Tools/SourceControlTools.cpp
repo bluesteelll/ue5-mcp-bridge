@@ -3,6 +3,7 @@
 #include "SourceControlTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPathSandbox.h"
 
@@ -26,8 +27,10 @@
 
 namespace
 {
-	// SCT_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
+	// SCT_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx
+	// from MCPToolHelpers.h. Source-control ops don't use FScopedTransaction (they go through
+	// ISourceControlProvider::Execute), so no FMCPMutatorScope migration here.
 	constexpr int32 kSCTErrorInvalidParams = -32602;
 	constexpr int32 kSCTErrorInternal      = -32603;
 
@@ -40,31 +43,6 @@ namespace
 	// any NUL bytes, while a UAsset would have hundreds.
 	constexpr int32 kSCTTextDetectScanBytes = 8 * 1024;
 
-	void SCT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse SCT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		SCT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse SCT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		SCT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
 	/**
 	 * Verify SC is enabled + available; return a populated error response (and set bOk=false) on
 	 * failure. Caller passes through the response on bOk=false. Echoes the provider name in the
@@ -76,7 +54,7 @@ namespace
 		ISourceControlModule& Module = ISourceControlModule::Get();
 		if (!Module.IsEnabled())
 		{
-			OutError = SCT_MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
 				TEXT("source control provider not configured (ISourceControlModule::Get().IsEnabled() "
 					 "== false) — open Editor → Source Control to set up Git/Perforce/etc."));
 			return false;
@@ -84,7 +62,7 @@ namespace
 		ISourceControlProvider& Provider = Module.GetProvider();
 		if (!Provider.IsAvailable())
 		{
-			OutError = SCT_MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorSourceControlProviderUnavailable,
 				FString::Printf(TEXT("source control provider '%s' is enabled but not available "
 					"(IsAvailable()=false) — check workspace connectivity (e.g. Perforce server "
 					"reachable, Git workspace not locked)."),
@@ -197,7 +175,7 @@ namespace
 			{
 				return true;
 			}
-			OutError = SCT_MakeError(Request, kSCTErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams,
 				FString::Printf(TEXT("missing required array field '%s'"), FieldName));
 			return false;
 		}
@@ -210,13 +188,13 @@ namespace
 			{
 				return true;
 			}
-			OutError = SCT_MakeError(Request, kSCTErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams,
 				FString::Printf(TEXT("missing required array field '%s'"), FieldName));
 			return false;
 		}
 		if (Arr->Num() == 0 && !bAllowEmpty)
 		{
-			OutError = SCT_MakeError(Request, kSCTErrorInvalidParams,
+			OutError = FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams,
 				FString::Printf(TEXT("'%s' must contain at least one non-empty path string"),
 					FieldName));
 			return false;
@@ -228,7 +206,7 @@ namespace
 			FString Raw;
 			if (!(*Arr)[i].IsValid() || !(*Arr)[i]->TryGetString(Raw) || Raw.IsEmpty())
 			{
-				OutError = SCT_MakeError(Request, kSCTErrorInvalidParams,
+				OutError = FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams,
 					FString::Printf(TEXT("'%s'[%d] is not a non-empty string"), FieldName, i));
 				return false;
 			}
@@ -238,7 +216,7 @@ namespace
 			int32 ResolveCode = 0;
 			if (!SCT_ResolveSCPath(Raw, AbsPath, ResolveErr, ResolveCode))
 			{
-				OutError = SCT_MakeError(Request, ResolveCode,
+				OutError = FMCPToolHelpers::MakeError(Request, ResolveCode,
 					FString::Printf(TEXT("'%s'[%d]='%s': %s"),
 						FieldName, i, *Raw, *ResolveErr));
 				return false;
@@ -594,7 +572,7 @@ FMCPResponse Tool_Status(const FMCPRequest& Request)
 			StatusOp, Paths, EConcurrency::Synchronous);
 		if (ExecResult == ECommandResult::Failed)
 		{
-			return SCT_MakeError(Request, kSCTErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kSCTErrorInternal,
 				FString::Printf(TEXT("ISourceControlProvider::Execute(FUpdateStatus) returned Failed "
 					"on provider '%s' for %d file(s)"),
 					*Provider.GetName().ToString(), Paths.Num()));
@@ -620,7 +598,7 @@ FMCPResponse Tool_Status(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("files"), FilesArr);
 	Out->SetStringField(TEXT("provider"), Provider.GetName().ToString());
-	return SCT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── sc.checkout ──────────────────────────────────────────────────────────────────────────────
@@ -722,7 +700,7 @@ FMCPResponse Tool_Checkout(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("failed"),      FailedArr);
 	Out->SetStringField(TEXT("provider"),   Provider.GetName().ToString());
 	Out->SetBoolField(TEXT("batch_ok"),     ExecResult == ECommandResult::Succeeded);
-	return SCT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── sc.diff ──────────────────────────────────────────────────────────────────────────────────
@@ -749,12 +727,12 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SCT_MakeError(Request, kSCTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString RawPath;
 	if (!Request.Args->TryGetStringField(TEXT("file_path"), RawPath) || RawPath.IsEmpty())
 	{
-		return SCT_MakeError(Request, kSCTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams,
 			TEXT("missing required string field 'file_path'"));
 	}
 
@@ -763,7 +741,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	int32 ResolveCode = 0;
 	if (!SCT_ResolveSCPath(RawPath, AbsPath, ResolveErr, ResolveCode))
 	{
-		return SCT_MakeError(Request, ResolveCode, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, ResolveCode, ResolveErr);
 	}
 
 	// revision_a default: head; revision_b default: working
@@ -787,7 +765,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	const FSourceControlStatePtr StatePtr = Provider.GetState(AbsPath, EStateCacheUsage::Use);
 	if (!StatePtr.IsValid())
 	{
-		return SCT_MakeError(Request, kSCTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInternal,
 			FString::Printf(TEXT("provider returned no state for '%s'"), *AbsPath));
 	}
 
@@ -796,12 +774,12 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	FString LoadErr;
 	if (!SCT_LoadRevisionBytes(AbsPath, RevA, *StatePtr, BytesA, LoadErr))
 	{
-		return SCT_MakeError(Request, kSCTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInternal,
 			FString::Printf(TEXT("revision_a load failed: %s"), *LoadErr));
 	}
 	if (!SCT_LoadRevisionBytes(AbsPath, RevB, *StatePtr, BytesB, LoadErr))
 	{
-		return SCT_MakeError(Request, kSCTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInternal,
 			FString::Printf(TEXT("revision_b load failed: %s"), *LoadErr));
 	}
 
@@ -826,7 +804,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 		if (BytesA.Num() > kSCTBinaryDiffMaxBytesPerSide ||
 			BytesB.Num() > kSCTBinaryDiffMaxBytesPerSide)
 		{
-			return SCT_MakeError(Request, kMCPErrorInputTooLarge,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorInputTooLarge,
 				FString::Printf(
 					TEXT("binary diff exceeds cap (%lld bytes/side): a=%d b=%d. "
 						 "Use cb.export for large binaries."),
@@ -838,7 +816,7 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("base64_b"),
 			FBase64::Encode(BytesB.GetData(), BytesB.Num()));
 	}
-	return SCT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── sc.diff_binary ──────────────────────────────────────────────────────────────────────────
@@ -857,12 +835,12 @@ FMCPResponse Tool_DiffBinary(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SCT_MakeError(Request, kSCTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams, TEXT("missing args object"));
 	}
 	FString RawPath;
 	if (!Request.Args->TryGetStringField(TEXT("file_path"), RawPath) || RawPath.IsEmpty())
 	{
-		return SCT_MakeError(Request, kSCTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams,
 			TEXT("missing required string field 'file_path'"));
 	}
 
@@ -871,7 +849,7 @@ FMCPResponse Tool_DiffBinary(const FMCPRequest& Request)
 	int32 ResolveCode = 0;
 	if (!SCT_ResolveSCPath(RawPath, AbsPath, ResolveErr, ResolveCode))
 	{
-		return SCT_MakeError(Request, ResolveCode, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, ResolveCode, ResolveErr);
 	}
 
 	FString RevA;
@@ -893,7 +871,7 @@ FMCPResponse Tool_DiffBinary(const FMCPRequest& Request)
 	const FSourceControlStatePtr StatePtr = Provider.GetState(AbsPath, EStateCacheUsage::Use);
 	if (!StatePtr.IsValid())
 	{
-		return SCT_MakeError(Request, kSCTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInternal,
 			FString::Printf(TEXT("provider returned no state for '%s'"), *AbsPath));
 	}
 
@@ -902,19 +880,19 @@ FMCPResponse Tool_DiffBinary(const FMCPRequest& Request)
 	FString LoadErr;
 	if (!SCT_LoadRevisionBytes(AbsPath, RevA, *StatePtr, BytesA, LoadErr))
 	{
-		return SCT_MakeError(Request, kSCTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInternal,
 			FString::Printf(TEXT("revision_a load failed: %s"), *LoadErr));
 	}
 	if (!SCT_LoadRevisionBytes(AbsPath, RevB, *StatePtr, BytesB, LoadErr))
 	{
-		return SCT_MakeError(Request, kSCTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInternal,
 			FString::Printf(TEXT("revision_b load failed: %s"), *LoadErr));
 	}
 
 	if (BytesA.Num() > kSCTBinaryDiffMaxBytesPerSide ||
 		BytesB.Num() > kSCTBinaryDiffMaxBytesPerSide)
 	{
-		return SCT_MakeError(Request, kMCPErrorInputTooLarge,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInputTooLarge,
 			FString::Printf(
 				TEXT("binary diff exceeds cap (%lld bytes/side): a=%d b=%d. "
 					 "Use cb.export for large binaries."),
@@ -932,7 +910,7 @@ FMCPResponse Tool_DiffBinary(const FMCPRequest& Request)
 		FBase64::Encode(BytesA.GetData(), BytesA.Num()));
 	Out->SetStringField(TEXT("base64_b"),
 		FBase64::Encode(BytesB.GetData(), BytesB.Num()));
-	return SCT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── sc.revert ────────────────────────────────────────────────────────────────────────────────
@@ -958,14 +936,14 @@ FMCPResponse Tool_Revert(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return SCT_MakeError(Request, kSCTErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kSCTErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	// Destructive-confirm gate FIRST so we don't even resolve paths if caller is unaware.
 	bool bConfirm = false;
 	if (!Request.Args->TryGetBoolField(TEXT("confirm_destructive"), bConfirm) || !bConfirm)
 	{
-		return SCT_MakeError(Request, kMCPErrorReparentUnsafe,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorReparentUnsafe,
 			TEXT("sc.revert is destructive (local changes LOST); pass confirm_destructive=true to proceed"));
 	}
 
@@ -1036,7 +1014,7 @@ FMCPResponse Tool_Revert(const FMCPRequest& Request)
 	Out->SetArrayField(TEXT("failed"),    FailedArr);
 	Out->SetStringField(TEXT("provider"), Provider.GetName().ToString());
 	Out->SetBoolField(TEXT("batch_ok"),   ExecResult == ECommandResult::Succeeded);
-	return SCT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

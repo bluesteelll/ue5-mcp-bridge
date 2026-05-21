@@ -3,11 +3,12 @@
 #include "DataTableTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
-#include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPPageCursor.h"
 #include "Utils/MCPReflection.h"
-#include "Utils/MCPWorldContext.h"
 
 #include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetData.h"
@@ -16,7 +17,6 @@
 #include "DataTableEditorUtils.h"
 #include "Engine/DataTable.h"
 #include "HAL/UnrealMemory.h"
-#include "ScopedTransaction.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UnrealType.h"
@@ -28,93 +28,12 @@
 
 namespace
 {
-	// DT_ prefix per the unity-build symbol-collision convention.
+	// DT_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireStringField) and the per-surface asset
+	// loader live in FMCPToolHelpers / FMCPAssetLoader — see Phase 1 helper extraction
+	// (commits b2fd19d + 8e5384c).
 	constexpr int32 kDTErrorInvalidParams = -32602;
 	constexpr int32 kDTErrorInternal      = -32603;
-
-	void DT_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse DT_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		DT_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse DT_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		DT_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool DT_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = DT_MakeError(Request, kDTErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = DT_MakeError(Request, kDTErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
-	/** Load a UDataTable by path. Mirrors AnimTools' ANM_LoadSequenceByPath shape. */
-	UDataTable* DT_LoadDataTableByPath(const FString& Path, int32& OutErrorCode, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("path is empty");
-			return nullptr;
-		}
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(TEXT("path '%s' malformed or unknown mount"), *Path);
-			return nullptr;
-		}
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjPath.IsEmpty() && ObjPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(TEXT("'%s' not loadable"), *Path);
-			return nullptr;
-		}
-		UDataTable* Table = Cast<UDataTable>(Loaded);
-		if (!Table)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(TEXT("'%s' is class '%s'; expected UDataTable"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return Table;
-	}
 
 	/**
 	 * Build a JSON object holding every UPROPERTY on ``RowStruct`` read from the row memory at
@@ -196,12 +115,12 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		FString DecodeErr;
 		if (!FMCPPageCursorUtils::Decode(PageToken, InCursor, DecodeErr))
 		{
-			return DT_MakeError(Request, kDTErrorInvalidParams,
+			return FMCPToolHelpers::MakeError(Request, kDTErrorInvalidParams,
 				FString::Printf(TEXT("invalid page_token: %s"), *DecodeErr));
 		}
 		if (!FMCPPageCursorUtils::ValidateAgainstFilter(InCursor, FilterHash))
 		{
-			return DT_MakeError(Request, kMCPErrorStaleCursor,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorStaleCursor,
 				TEXT("filter mutated between pages (path_prefix changed); restart pagination"));
 		}
 		while (StartIdx < Assets.Num() &&
@@ -263,7 +182,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
 	}
 
-	return DT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── data_table.get_rows ──────────────────────────────────────────────────────────────────────
@@ -281,7 +200,7 @@ FMCPResponse Tool_GetRows(const FMCPRequest& Request)
 
 	FString DataTablePath;
 	FMCPResponse Err;
-	if (!DT_RequireStringField(Request, TEXT("data_table_path"), DataTablePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("data_table_path"), DataTablePath, Err)) { return Err; }
 
 	FString RowNameFilter;
 	if (Request.Args.IsValid())
@@ -298,13 +217,13 @@ FMCPResponse Tool_GetRows(const FMCPRequest& Request)
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UDataTable* DT = DT_LoadDataTableByPath(DataTablePath, LoadErrCode, LoadErrMsg);
-	if (!DT) { return DT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UDataTable* DT = FMCPAssetLoader::Load<UDataTable>(DataTablePath, LoadErrCode, LoadErrMsg);
+	if (!DT) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const UScriptStruct* RowStruct = DT->GetRowStruct();
 	if (!RowStruct)
 	{
-		return DT_MakeError(Request, kDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kDTErrorInternal,
 			FString::Printf(TEXT("DataTable '%s' has no row struct (mis-configured asset)"),
 				*DataTablePath));
 	}
@@ -361,7 +280,7 @@ FMCPResponse Tool_GetRows(const FMCPRequest& Request)
 	{
 		Out->SetStringField(TEXT("next_page_token"), RowNames[EndIdx - 1].ToString());
 	}
-	return DT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── data_table.set_row ───────────────────────────────────────────────────────────────────────
@@ -371,7 +290,7 @@ FMCPResponse Tool_GetRows(const FMCPRequest& Request)
 // Result:  { written: bool, was_created: bool, fields_updated: int, fields_skipped: int,
 //            row_name, row_struct_path }
 //
-// PIE-guarded mutator. FScopedTransaction wraps the mutation. Per the standard 4-step contract
+// PIE-guarded mutator. FMCPMutatorScope wraps PIE-guard + transaction. Per the standard 4-step contract
 // for property edits, but we DON'T use FMCPWritePropertyScope here because the target is row
 // memory inside the table (not a UPROPERTY ON the UDataTable UObject) — Pre/PostEditChangeProperty
 // don't fire usefully for row internals. We use UDataTable::Modify + HandleDataTableChanged
@@ -384,20 +303,18 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return DT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_DataTable_SetRow", "Set DataTable Row"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString DataTablePath, RowNameStr;
 	FMCPResponse Err;
-	if (!DT_RequireStringField(Request, TEXT("data_table_path"), DataTablePath, Err)) { return Err; }
-	if (!DT_RequireStringField(Request, TEXT("row_name"),        RowNameStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("data_table_path"), DataTablePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("row_name"),        RowNameStr,   Err)) { return Err; }
 
 	const TSharedPtr<FJsonObject>* ValuesObjPtr = nullptr;
 	if (!Request.Args->TryGetObjectField(TEXT("values"), ValuesObjPtr) || !ValuesObjPtr || !ValuesObjPtr->IsValid())
 	{
-		return DT_MakeError(Request, kDTErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kDTErrorInvalidParams,
 			TEXT("data_table.set_row requires args.values (object of field_name -> JSON value)"));
 	}
 	const TSharedPtr<FJsonObject>& ValuesObj = *ValuesObjPtr;
@@ -407,13 +324,13 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UDataTable* DT = DT_LoadDataTableByPath(DataTablePath, LoadErrCode, LoadErrMsg);
-	if (!DT) { return DT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UDataTable* DT = FMCPAssetLoader::Load<UDataTable>(DataTablePath, LoadErrCode, LoadErrMsg);
+	if (!DT) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	UScriptStruct* RowStruct = const_cast<UScriptStruct*>(DT->GetRowStruct());
 	if (!RowStruct)
 	{
-		return DT_MakeError(Request, kDTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kDTErrorInternal,
 			FString::Printf(TEXT("DataTable '%s' has no row struct (mis-configured asset)"),
 				*DataTablePath));
 	}
@@ -424,12 +341,11 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 
 	if (!bRowExists && !bCreateIfMissing)
 	{
-		return DT_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("row '%s' not found on DataTable '%s'; pass create_if_missing=true to create"),
 				*RowNameStr, *DataTablePath));
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_DataTable_SetRow", "Set DataTable Row"));
 	DT->Modify();
 
 	uint8* RowData = nullptr;
@@ -449,7 +365,8 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 		RowData = FDataTableEditorUtils::AddRow(DT, RowName);
 		if (!RowData)
 		{
-			return DT_MakeError(Request, kDTErrorInternal,
+			Scope.Abort();
+			return FMCPToolHelpers::MakeError(Request, kDTErrorInternal,
 				FString::Printf(TEXT("FDataTableEditorUtils::AddRow returned null for row '%s' on '%s'"),
 					*RowNameStr, *DataTablePath));
 		}
@@ -488,7 +405,7 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 	// systems re-cache. Pass the specific row name so per-row listeners can target updates.
 	DT->HandleDataTableChanged(RowName);
 
-	if (UPackage* Pkg = DT->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(DT->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("written"), true);
@@ -497,7 +414,7 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("fields_skipped"), FieldsSkipped);
 	Out->SetStringField(TEXT("row_name"), RowNameStr);
 	Out->SetStringField(TEXT("row_struct_path"), RowStruct->GetPathName());
-	return DT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── data_table.delete_row ────────────────────────────────────────────────────────────────────
@@ -511,35 +428,33 @@ FMCPResponse Tool_DeleteRow(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return DT_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_DataTable_DeleteRow", "Delete DataTable Row"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString DataTablePath, RowNameStr;
 	FMCPResponse Err;
-	if (!DT_RequireStringField(Request, TEXT("data_table_path"), DataTablePath, Err)) { return Err; }
-	if (!DT_RequireStringField(Request, TEXT("row_name"),        RowNameStr,   Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("data_table_path"), DataTablePath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("row_name"),        RowNameStr,   Err)) { return Err; }
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
-	UDataTable* DT = DT_LoadDataTableByPath(DataTablePath, LoadErrCode, LoadErrMsg);
-	if (!DT) { return DT_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UDataTable* DT = FMCPAssetLoader::Load<UDataTable>(DataTablePath, LoadErrCode, LoadErrMsg);
+	if (!DT) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	const FName RowName(*RowNameStr);
 	const bool bRowExisted = (DT->GetRowMap().Find(RowName) != nullptr);
 
 	if (!bRowExisted)
 	{
+		// Idempotent no-op — abort the transaction so undo history isn't littered with empty ops.
+		Scope.Abort();
 		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		Out->SetBoolField(TEXT("deleted"), false);
 		Out->SetBoolField(TEXT("row_existed"), false);
 		Out->SetStringField(TEXT("row_name"), RowNameStr);
 		Out->SetNumberField(TEXT("remaining_row_count"), DT->GetRowMap().Num());
-		return DT_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
-
-	FScopedTransaction Transaction(LOCTEXT("MCP_DataTable_DeleteRow", "Delete DataTable Row"));
 
 	// FDataTableEditorUtils::RemoveRow handles its own nested FScopedTransaction +
 	// BroadcastPreChange + DataTable->Modify + DestroyStruct + FMemory::Free +
@@ -551,14 +466,14 @@ FMCPResponse Tool_DeleteRow(const FMCPRequest& Request)
 	// HandleDataTableChanged hook that downstream caches listen on. Pair with MarkPackageDirty.
 	if (bRemoved) { DT->HandleDataTableChanged(RowName); }
 
-	if (UPackage* Pkg = DT->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	Scope.DirtyPackage(DT->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("deleted"), bRemoved);
 	Out->SetBoolField(TEXT("row_existed"), true);
 	Out->SetStringField(TEXT("row_name"), RowNameStr);
 	Out->SetNumberField(TEXT("remaining_row_count"), DT->GetRowMap().Num());
-	return DT_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

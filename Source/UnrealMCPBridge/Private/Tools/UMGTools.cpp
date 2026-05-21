@@ -3,6 +3,9 @@
 #include "UMGTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPAssetLoader.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPReflection.h"
@@ -25,7 +28,6 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
-#include "ScopedTransaction.h"
 #include "Subsystems/EditorAssetSubsystem.h"
 
 #include "Dom/JsonObject.h"
@@ -35,122 +37,34 @@
 
 namespace
 {
-	// UMG_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates AND between sibling tool TUs in the unity build).
+	// UMG_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj/RequireStringField removed in Phase 3 — use
+	// FMCPToolHelpers::Xxx from MCPToolHelpers.h. PIE+FScopedTransaction mutator pairs in
+	// Tool_AddWidget / RemoveWidget / SetWidgetProperty migrated to FMCPMutatorScope.
+	// Tool_CreateWidgetBlueprint and Tool_BindWidgetEvent are PIE-guarded but use no
+	// FScopedTransaction so they keep inline PIE checks (no FMCPMutatorScope migration).
+	// Tool_AddToViewport / RemoveFromViewport / ListRootWidgets REQUIRE PIE active — these MUST
+	// NOT be wrapped in FMCPMutatorScope.
 	constexpr int32 kUMGErrorInvalidParams = -32602;
 	constexpr int32 kUMGErrorInternal      = -32603;
 
 	/** Cap on the number of widget-name hints listed in the -32039 message body. */
 	constexpr int32 kUMGWidgetHintCap = 16;
 
-	void UMG_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse UMG_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		UMG_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse UMG_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		UMG_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	// ─── arg parsing helpers ─────────────────────────────────────────────────────────────────────
-
-	bool UMG_RequireStringField(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = UMG_MakeError(Request, kUMGErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = UMG_MakeError(Request, kUMGErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
 	// ─── WidgetBlueprint resolution ──────────────────────────────────────────────────────────────
 
 	/**
 	 * Load a UWidgetBlueprint by path. Returns nullptr + populated error code/message on failure.
-	 *
-	 * Error map:
-	 *   -32010 InvalidPath          — empty path, backslashes, unknown mount
-	 *   -32004 ObjectNotFound       — LoadObject returned null
-	 *   -32011 WrongClass           — loaded asset isn't a UWidgetBlueprint
-	 *
-	 * Path normalisation mirrors FMCPMaterialUtils::LoadMaterialInterfaceByPath — try package-name
-	 * form first, then object-path form, so callers can pass either ``/Game/Foo/WBP_Foo`` or
-	 * ``/Game/Foo/WBP_Foo.WBP_Foo``.
+	 * Thin wrapper over FMCPAssetLoader::Load<UWidgetBlueprint> (Phase 3 — was anonymous loader).
+	 * Kept as a per-surface alias because Tool_GetWidgetProperty / Tool_ListWidgets each call it
+	 * once and the alias preserves the existing wire-error wording.
 	 */
 	UWidgetBlueprint* UMG_LoadWidgetBlueprintByPath(
 		const FString& Path,
 		int32& OutErrorCode,
 		FString& OutError)
 	{
-		if (Path.IsEmpty())
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = TEXT("widget_bp_path is empty");
-			return nullptr;
-		}
-
-		const FString Normalised = FMCPAssetPathUtils::Normalize(Path);
-		if (Normalised.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(Normalised))
-		{
-			OutErrorCode = kMCPErrorInvalidPath;
-			OutError = FString::Printf(
-				TEXT("widget_bp_path '%s' is malformed or references an unknown mount point"),
-				*Path);
-			return nullptr;
-		}
-
-		UObject* Loaded = LoadObject<UObject>(nullptr, *Normalised);
-		if (!Loaded)
-		{
-			const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(Normalised);
-			if (!ObjectPath.IsEmpty() && ObjectPath != Normalised)
-			{
-				Loaded = LoadObject<UObject>(nullptr, *ObjectPath);
-			}
-		}
-		if (!Loaded)
-		{
-			OutErrorCode = kMCPErrorObjectNotFound;
-			OutError = FString::Printf(
-				TEXT("widget_bp_path '%s' could not be loaded (no asset found)"),
-				*Path);
-			return nullptr;
-		}
-
-		UWidgetBlueprint* WBP = Cast<UWidgetBlueprint>(Loaded);
-		if (!WBP)
-		{
-			OutErrorCode = kMCPErrorWrongClass;
-			OutError = FString::Printf(
-				TEXT("widget_bp_path '%s' is class '%s'; expected UWidgetBlueprint"),
-				*Path, *Loaded->GetClass()->GetPathName());
-			return nullptr;
-		}
-		return WBP;
+		return FMCPAssetLoader::Load<UWidgetBlueprint>(Path, OutErrorCode, OutError);
 	}
 
 	// ─── WidgetTree enumeration ──────────────────────────────────────────────────────────────────
@@ -213,17 +127,17 @@ FMCPResponse Tool_ListWidgets(const FMCPRequest& Request)
 
 	FString Path;
 	FMCPResponse Err;
-	if (!UMG_RequireStringField(Request, TEXT("widget_bp_path"), Path, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("widget_bp_path"), Path, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UWidgetBlueprint* WBP = UMG_LoadWidgetBlueprintByPath(Path, ErrCode, ErrMsg);
-	if (!WBP) { return UMG_MakeError(Request, ErrCode, ErrMsg); }
+	if (!WBP) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	UWidgetTree* Tree = WBP->WidgetTree;
 	if (!Tree)
 	{
-		return UMG_MakeError(Request, kUMGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
 			FString::Printf(TEXT("WidgetBlueprint '%s' has no WidgetTree (corrupted asset?)"), *Path));
 	}
 
@@ -255,7 +169,7 @@ FMCPResponse Tool_ListWidgets(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("widgets"), WidgetsArr);
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.get_widget_property ───────────────────────────────────────────────────────────────────
@@ -285,19 +199,19 @@ FMCPResponse Tool_GetWidgetProperty(const FMCPRequest& Request)
 
 	FString Path, WidgetName, PropertyPath;
 	FMCPResponse Err;
-	if (!UMG_RequireStringField(Request, TEXT("widget_bp_path"), Path, Err))      { return Err; }
-	if (!UMG_RequireStringField(Request, TEXT("widget_name"), WidgetName, Err))   { return Err; }
-	if (!UMG_RequireStringField(Request, TEXT("property_path"), PropertyPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("widget_bp_path"), Path, Err))      { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("widget_name"), WidgetName, Err))   { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("property_path"), PropertyPath, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UWidgetBlueprint* WBP = UMG_LoadWidgetBlueprintByPath(Path, ErrCode, ErrMsg);
-	if (!WBP) { return UMG_MakeError(Request, ErrCode, ErrMsg); }
+	if (!WBP) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	UWidgetTree* Tree = WBP->WidgetTree;
 	if (!Tree)
 	{
-		return UMG_MakeError(Request, kUMGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
 			FString::Printf(TEXT("WidgetBlueprint '%s' has no WidgetTree"), *Path));
 	}
 
@@ -308,7 +222,7 @@ FMCPResponse Tool_GetWidgetProperty(const FMCPRequest& Request)
 		TArray<UWidget*> AllWidgets;
 		UMG_GatherAllWidgets(Tree, AllWidgets);
 		const FString Hint = UMG_BuildWidgetNameHint(AllWidgets);
-		return UMG_MakeError(Request, kMCPErrorWidgetNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWidgetNotFound,
 			FString::Printf(
 				TEXT("widget '%s' not found in WidgetTree of '%s'; available: %s"),
 				*WidgetName, *Path, *Hint));
@@ -326,7 +240,7 @@ FMCPResponse Tool_GetWidgetProperty(const FMCPRequest& Request)
 			OutContainer, OutContainerPtr, OutLeafProp,
 			ResolveErrCode, ResolveErr))
 	{
-		return UMG_MakeError(Request, ResolveErrCode, ResolveErr);
+		return FMCPToolHelpers::MakeError(Request, ResolveErrCode, ResolveErr);
 	}
 	check(OutLeafProp != nullptr);
 	check(OutContainerPtr != nullptr);
@@ -337,7 +251,7 @@ FMCPResponse Tool_GetWidgetProperty(const FMCPRequest& Request)
 		// ReadPropertyValueAt is documented to NEVER return null (unsupported types emit a wrapped
 		// {"_kind":"Unsupported", ...} payload). A null here would indicate an internal contract
 		// break — surface as -32603.
-		return UMG_MakeError(Request, kUMGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
 			FString::Printf(TEXT("ReadPropertyValueAt returned null for property '%s' on widget '%s'"),
 				*PropertyPath, *WidgetName));
 	}
@@ -345,7 +259,7 @@ FMCPResponse Tool_GetWidgetProperty(const FMCPRequest& Request)
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetField(TEXT("value"), ValueJson);
 	Out->SetStringField(TEXT("type"), FMCPReflection::DescribePropertyType(OutLeafProp));
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.create_widget_blueprint — create new UWidgetBlueprint with optional parent class ───
@@ -364,19 +278,19 @@ FMCPResponse Tool_CreateWidgetBlueprint(const FMCPRequest& Request)
 
 	if (GEditor && GEditor->PlayWorld != nullptr)
 	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	if (!Request.Args.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("umg.create_widget_blueprint requires args.dest_path"));
 	}
 
 	FString DestPathRaw, ParentClassPath;
 	if (!Request.Args->TryGetStringField(TEXT("dest_path"), DestPathRaw) || DestPathRaw.IsEmpty())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing required string field 'dest_path'"));
 	}
 	Request.Args->TryGetStringField(TEXT("parent_widget_class_path"), ParentClassPath);
@@ -392,12 +306,12 @@ FMCPResponse Tool_CreateWidgetBlueprint(const FMCPRequest& Request)
 		}
 		if (!ParentClass)
 		{
-			return UMG_MakeError(Request, kMCPErrorClassNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 				FString::Printf(TEXT("could not load parent_widget_class_path '%s'"), *ParentClassPath));
 		}
 		if (!ParentClass->IsChildOf(UUserWidget::StaticClass()))
 		{
-			return UMG_MakeError(Request, kMCPErrorWrongClassFamily,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 				FString::Printf(TEXT("parent_widget_class_path '%s' is not a UUserWidget subclass"),
 					*ParentClass->GetPathName()));
 		}
@@ -410,12 +324,12 @@ FMCPResponse Tool_CreateWidgetBlueprint(const FMCPRequest& Request)
 	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
 	if (DestPathNorm.IsEmpty())
 	{
-		return UMG_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed path"), *DestPathRaw));
 	}
 	if (FPackageName::DoesPackageExist(DestPathNorm))
 	{
-		return UMG_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
 	}
 
@@ -429,7 +343,7 @@ FMCPResponse Tool_CreateWidgetBlueprint(const FMCPRequest& Request)
 	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, UWidgetBlueprint::StaticClass(), Factory);
 	if (!NewAsset)
 	{
-		return UMG_MakeError(Request, kUMGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
 			FString::Printf(TEXT("UWidgetBlueprintFactory failed for parent '%s' at '%s'"),
 				*ParentClass->GetPathName(), *DestPathNorm));
 	}
@@ -454,7 +368,7 @@ FMCPResponse Tool_CreateWidgetBlueprint(const FMCPRequest& Request)
 		WBP && WBP->GeneratedClass ? WBP->GeneratedClass->GetPathName() : FString());
 	Out->SetStringField(TEXT("parent_class"), ParentClass->GetPathName());
 	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.add_widget — instantiate a UWidget into the BP's WidgetTree ────────────────────────
@@ -471,14 +385,12 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (GEditor && GEditor->PlayWorld != nullptr)
-	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("UMGAddWidget", "MCP: add widget"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("umg.add_widget requires widget_bp_path + widget_class_path + widget_name"));
 	}
 
@@ -487,7 +399,7 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 		!Request.Args->TryGetStringField(TEXT("widget_class_path"), WidgetClassPath) || WidgetClassPath.IsEmpty() ||
 		!Request.Args->TryGetStringField(TEXT("widget_name"), WidgetName) || WidgetName.IsEmpty())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing widget_bp_path / widget_class_path / widget_name"));
 	}
 	Request.Args->TryGetStringField(TEXT("parent_widget_name"), ParentName);
@@ -495,7 +407,7 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);
 	if (!WBP || !WBP->WidgetTree)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not load WidgetBlueprint '%s'"), *WBPPath));
 	}
 
@@ -507,30 +419,30 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 	}
 	if (!WidgetClass || !WidgetClass->IsChildOf(UWidget::StaticClass()))
 	{
-		return UMG_MakeError(Request, kMCPErrorClassNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassNotFound,
 			FString::Printf(TEXT("'%s' is not a UWidget subclass"), *WidgetClassPath));
 	}
 	if (WidgetClass->HasAnyClassFlags(CLASS_Abstract))
 	{
-		return UMG_MakeError(Request, kMCPErrorClassAbstract,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorClassAbstract,
 			FString::Printf(TEXT("widget class '%s' is abstract"), *WidgetClass->GetPathName()));
 	}
 
 	const FName WidgetFName(*WidgetName);
 	if (WBP->WidgetTree->FindWidget(WidgetFName))
 	{
-		return UMG_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("widget '%s' already exists in tree"), *WidgetName));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("UMGAddWidget", "MCP: add widget"));
+	// FMCPMutatorScope at function-top owns the FScopedTransaction lifetime.
 	WBP->Modify();
 	WBP->WidgetTree->Modify();
 
 	UWidget* NewWidget = WBP->WidgetTree->ConstructWidget<UWidget>(WidgetClass, WidgetFName);
 	if (!NewWidget)
 	{
-		return UMG_MakeError(Request, kUMGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
 			FString::Printf(TEXT("WidgetTree::ConstructWidget returned null for class '%s'"),
 				*WidgetClass->GetPathName()));
 	}
@@ -545,13 +457,13 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 		ParentWidget = WBP->WidgetTree->FindWidget(FName(*ParentName));
 		if (!ParentWidget)
 		{
-			return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("parent_widget_name '%s' not found in tree"), *ParentName));
 		}
 		ParentPanel = Cast<UPanelWidget>(ParentWidget);
 		if (!ParentPanel)
 		{
-			return UMG_MakeError(Request, kMCPErrorWrongClassFamily,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 				FString::Printf(TEXT("parent '%s' is class '%s' which is not a UPanelWidget — cannot have children"),
 					*ParentName, *ParentWidget->GetClass()->GetPathName()));
 		}
@@ -570,7 +482,7 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 			ParentPanel = Cast<UPanelWidget>(WBP->WidgetTree->RootWidget);
 			if (!ParentPanel)
 			{
-				return UMG_MakeError(Request, kMCPErrorWrongClassFamily,
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 					FString::Printf(TEXT("root widget '%s' (class '%s') is not a UPanelWidget; "
 						"pass parent_widget_name explicitly to specify a panel parent"),
 						*WBP->WidgetTree->RootWidget->GetName(),
@@ -590,7 +502,7 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("parent_widget_name"), ParentResolved);
 	Out->SetStringField(TEXT("parent_widget_class"),
 		ParentPanel ? ParentPanel->GetClass()->GetPathName() : FString(TEXT("<root>")));
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.remove_widget — remove widget from BP's WidgetTree ─────────────────────────────────
@@ -598,14 +510,12 @@ FMCPResponse Tool_RemoveWidget(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (GEditor && GEditor->PlayWorld != nullptr)
-	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("UMGRemoveWidget", "MCP: remove widget"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("umg.remove_widget requires widget_bp_path + widget_name"));
 	}
 
@@ -613,14 +523,14 @@ FMCPResponse Tool_RemoveWidget(const FMCPRequest& Request)
 	if (!Request.Args->TryGetStringField(TEXT("widget_bp_path"), WBPPath) ||
 		!Request.Args->TryGetStringField(TEXT("widget_name"), WidgetName))
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing widget_bp_path or widget_name"));
 	}
 
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);
 	if (!WBP || !WBP->WidgetTree)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not load WidgetBlueprint '%s'"), *WBPPath));
 	}
 
@@ -630,10 +540,10 @@ FMCPResponse Tool_RemoveWidget(const FMCPRequest& Request)
 		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 		Out->SetBoolField(TEXT("removed"), false);
 		Out->SetBoolField(TEXT("was_present"), false);
-		return UMG_MakeSuccessObj(Request, Out);
+		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("UMGRemoveWidget", "MCP: remove widget"));
+	// FMCPMutatorScope at function-top owns the FScopedTransaction lifetime.
 	WBP->Modify();
 	WBP->WidgetTree->Modify();
 	const bool bRemoved = WBP->WidgetTree->RemoveWidget(W);
@@ -642,7 +552,7 @@ FMCPResponse Tool_RemoveWidget(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("removed"), bRemoved);
 	Out->SetBoolField(TEXT("was_present"), true);
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.set_widget_property — write any UPROPERTY on a widget in the BP's tree ────────────
@@ -650,14 +560,12 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (GEditor && GEditor->PlayWorld != nullptr)
-	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("UMGSetWidgetProp", "MCP: set widget property"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("umg.set_widget_property requires widget_bp_path + widget_name + property_path + value"));
 	}
 
@@ -668,20 +576,20 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 		!Request.Args->TryGetStringField(TEXT("property_path"), PropertyPath) ||
 		!ValueField.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing widget_bp_path / widget_name / property_path / value"));
 	}
 
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);
 	if (!WBP || !WBP->WidgetTree)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not load WidgetBlueprint '%s'"), *WBPPath));
 	}
 	UWidget* W = WBP->WidgetTree->FindWidget(FName(*WidgetName));
 	if (!W)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("widget '%s' not found in tree"), *WidgetName));
 	}
 
@@ -692,7 +600,7 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 	FString ErrMsg;
 	if (!FMCPReflection::ResolvePropertyPath(W, PropertyPath, Container, ValuePtr, Prop, ErrCode, ErrMsg))
 	{
-		return UMG_MakeError(Request, ErrCode, ErrMsg);
+		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
 	const bool bBypass = Request.Args->HasField(TEXT("bypass_readonly")) &&
@@ -700,18 +608,18 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 	const uint64 Flags = Prop->PropertyFlags;
 	if (!bBypass && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{
-		return UMG_MakeError(Request, kMCPErrorPropertyAccessDenied,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyAccessDenied,
 			FString::Printf(TEXT("property '%s' is read-only; pass bypass_readonly=true to override"),
 				*Prop->GetName()));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("UMGSetWidgetProp", "MCP: set widget property"));
+	// FMCPMutatorScope at function-top owns the FScopedTransaction lifetime.
 	W->Modify();
 	WBP->Modify();
 	FString WriteErr;
 	if (!FMCPReflection::WritePropertyValueAt(Prop, ValuePtr, ValueField, Container, WriteErr))
 	{
-		return UMG_MakeError(Request, kMCPErrorPropertyTypeMismatch,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyTypeMismatch,
 			FString::Printf(TEXT("write rejected: %s"), *WriteErr));
 	}
 	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
@@ -719,7 +627,7 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("applied"), true);
 	Out->SetStringField(TEXT("property"), Prop->GetName());
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.bind_widget_event — bind multicast delegate event on a widget to a UFUNCTION ──────
@@ -741,12 +649,12 @@ FMCPResponse Tool_BindWidgetEvent(const FMCPRequest& Request)
 
 	if (GEditor && GEditor->PlayWorld != nullptr)
 	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
 	}
 
 	if (!Request.Args.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("umg.bind_widget_event requires widget_bp_path + widget_name + event_name + function_name"));
 	}
 
@@ -756,20 +664,20 @@ FMCPResponse Tool_BindWidgetEvent(const FMCPRequest& Request)
 		!Request.Args->TryGetStringField(TEXT("event_name"),     EventName) ||
 		!Request.Args->TryGetStringField(TEXT("function_name"),  FunctionName))
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("missing widget_bp_path / widget_name / event_name / function_name"));
 	}
 
 	UWidgetBlueprint* WBP = LoadObject<UWidgetBlueprint>(nullptr, *WBPPath);
 	if (!WBP || !WBP->WidgetTree)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not load WidgetBlueprint '%s'"), *WBPPath));
 	}
 	UWidget* W = WBP->WidgetTree->FindWidget(FName(*WidgetName));
 	if (!W)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("widget '%s' not found"), *WidgetName));
 	}
 
@@ -777,7 +685,7 @@ FMCPResponse Tool_BindWidgetEvent(const FMCPRequest& Request)
 	FProperty* DelegateProp = W->GetClass()->FindPropertyByName(FName(*EventName));
 	if (!DelegateProp || !DelegateProp->IsA<FMulticastDelegateProperty>())
 	{
-		return UMG_MakeError(Request, kMCPErrorPropertyNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 			FString::Printf(TEXT("event '%s' is not a multicast delegate UPROPERTY on '%s'"),
 				*EventName, *W->GetClass()->GetPathName()));
 	}
@@ -795,7 +703,7 @@ FMCPResponse Tool_BindWidgetEvent(const FMCPRequest& Request)
 	{
 		if (!bCreateIfMissing)
 		{
-			return UMG_MakeError(Request, kMCPErrorPropertyNotFound,
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorPropertyNotFound,
 				FString::Printf(TEXT("function '%s' not found on '%s'; pass create_function_if_missing=true to auto-create"),
 					*FunctionName, *WBPPath));
 		}
@@ -826,7 +734,7 @@ FMCPResponse Tool_BindWidgetEvent(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("event_name"), EventName);
 	Out->SetStringField(TEXT("function_name"), FunctionName);
 	Out->SetStringField(TEXT("widget_name"), WidgetName);
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.add_to_viewport — instantiate widget at runtime and add to viewport (PIE only) ─────
@@ -836,20 +744,20 @@ FMCPResponse Tool_AddToViewport(const FMCPRequest& Request)
 
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
 			TEXT("umg.add_to_viewport requires PIE running (GEditor->PlayWorld != null)"));
 	}
 
 	if (!Request.Args.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			TEXT("umg.add_to_viewport requires widget_bp_path"));
 	}
 
 	FString WBPPath;
 	if (!Request.Args->TryGetStringField(TEXT("widget_bp_path"), WBPPath))
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_bp_path"));
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_bp_path"));
 	}
 	int32 ZOrder = 0;
 	if (Request.Args->HasField(TEXT("z_order")))
@@ -861,12 +769,12 @@ FMCPResponse Tool_AddToViewport(const FMCPRequest& Request)
 	UBlueprint* BP = LoadObject<UBlueprint>(nullptr, *WBPPath);
 	if (!BP || !BP->GeneratedClass)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not load WidgetBlueprint '%s' (or no GeneratedClass)"), *WBPPath));
 	}
 	if (!BP->GeneratedClass->IsChildOf(UUserWidget::StaticClass()))
 	{
-		return UMG_MakeError(Request, kMCPErrorWrongClassFamily,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClassFamily,
 			FString::Printf(TEXT("class '%s' is not a UUserWidget"), *BP->GeneratedClass->GetPathName()));
 	}
 
@@ -876,7 +784,7 @@ FMCPResponse Tool_AddToViewport(const FMCPRequest& Request)
 	UUserWidget* W = NewObject<UUserWidget>(PIEWorld, BP->GeneratedClass);
 	if (!W)
 	{
-		return UMG_MakeError(Request, kUMGErrorInternal, TEXT("NewObject returned null for UserWidget"));
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal, TEXT("NewObject returned null for UserWidget"));
 	}
 	W->Initialize();
 	W->AddToViewport(ZOrder);
@@ -886,7 +794,7 @@ FMCPResponse Tool_AddToViewport(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("widget_path"), W->GetPathName());
 	Out->SetStringField(TEXT("class_path"), BP->GeneratedClass->GetPathName());
 	Out->SetNumberField(TEXT("z_order"), static_cast<double>(ZOrder));
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.remove_from_viewport — remove a runtime widget instance from viewport (PIE only) ──
@@ -896,25 +804,25 @@ FMCPResponse Tool_RemoveFromViewport(const FMCPRequest& Request)
 
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
 			TEXT("umg.remove_from_viewport requires PIE running"));
 	}
 
 	if (!Request.Args.IsValid())
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams, TEXT("requires widget_path"));
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("requires widget_path"));
 	}
 
 	FString WidgetPath;
 	if (!Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath))
 	{
-		return UMG_MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
 	}
 
 	UUserWidget* W = LoadObject<UUserWidget>(nullptr, *WidgetPath);
 	if (!W)
 	{
-		return UMG_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("widget '%s' not found"), *WidgetPath));
 	}
 	const bool bWasInViewport = W->IsInViewport();
@@ -923,7 +831,7 @@ FMCPResponse Tool_RemoveFromViewport(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("removed"), true);
 	Out->SetBoolField(TEXT("was_in_viewport"), bWasInViewport);
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── umg.list_root_widgets — enumerate widgets currently in viewport (PIE only) ────────────
@@ -933,7 +841,7 @@ FMCPResponse Tool_ListRootWidgets(const FMCPRequest& Request)
 
 	if (!GEditor || !GEditor->PlayWorld)
 	{
-		return UMG_MakeError(Request, kMCPErrorPIEActive,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
 			TEXT("umg.list_root_widgets requires PIE running"));
 	}
 
@@ -954,7 +862,7 @@ FMCPResponse Tool_ListRootWidgets(const FMCPRequest& Request)
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetArrayField(TEXT("widgets"), Widgets);
 	Out->SetNumberField(TEXT("count"), static_cast<double>(Widgets.Num()));
-	return UMG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

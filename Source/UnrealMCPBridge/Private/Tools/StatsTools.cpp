@@ -3,6 +3,7 @@
 #include "StatsTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 
 #include "Engine/Engine.h"
@@ -16,29 +17,7 @@
 extern ENGINE_API float GAverageFPS;
 extern ENGINE_API float GAverageMS;
 
-namespace
-{
-	FMCPResponse STA_MakeError(const FMCPRequest& Req, int32 Code, const FString& Msg)
-	{
-		FMCPResponse R;
-		R.RequestId = Req.RequestId;
-		R.OriginalIdString = Req.OriginalIdString;
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Msg;
-		return R;
-	}
-
-	FMCPResponse STA_MakeSuccessObj(const FMCPRequest& Req, TSharedPtr<FJsonObject> Obj)
-	{
-		FMCPResponse R;
-		R.RequestId = Req.RequestId;
-		R.OriginalIdString = Req.OriginalIdString;
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Obj));
-		return R;
-	}
-}
+// STA_MakeError / STA_MakeSuccessObj removed in Phase 3 — see FMCPToolHelpers in MCPToolHelpers.h.
 
 namespace FStatsTools
 {
@@ -64,7 +43,7 @@ FMCPResponse Tool_GetEngine(const FMCPRequest& Request)
 		Out->SetBoolField(TEXT("smooth_frame_rate"), GEngine->bSmoothFrameRate);
 	}
 
-	return STA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── stats.get_memory — FPlatformMemory + UE allocator breakdown ────────────────────────────
@@ -100,7 +79,7 @@ FMCPResponse Tool_GetMemory(const FMCPRequest& Request)
 		Out->SetStringField(TEXT("allocator_name"), GMalloc->GetDescriptiveName());
 	}
 
-	return STA_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

@@ -3,13 +3,14 @@
 #include "HierarchyTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
 
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
-#include "ScopedTransaction.h"
 #include "UObject/Package.h"
 
 #include "Dom/JsonObject.h"
@@ -19,49 +20,6 @@
 
 namespace
 {
-	// HRC_ prefix per unity-build convention (avoids ODR collisions in shared compile units).
-	constexpr int32 kHRCErrorInvalidParams = -32602;
-
-	void HRC_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse HRC_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		HRC_StampIds(Request, R);
-		R.bIsError = true; R.ErrorCode = Code; R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse HRC_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		HRC_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool HRC_RequireString(const FMCPRequest& Request, const TCHAR* FieldName,
-		FString& OutValue, FMCPResponse& OutError)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutError = HRC_MakeError(Request, kHRCErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(FieldName, OutValue) || OutValue.IsEmpty())
-		{
-			OutError = HRC_MakeError(Request, kHRCErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), FieldName));
-			return false;
-		}
-		return true;
-	}
-
 	/**
 	 * Parse a wire rule string into EAttachmentRule. SnapToTarget is permitted.
 	 * Returns false + populates OutError on unknown string. Empty input → KeepRelative (caller
@@ -95,17 +53,17 @@ namespace
 		return false;
 	}
 
-	/** Mark the actor's package dirty (external-package-aware: WorldPartition one-file-per-actor). */
-	void HRC_MarkActorDirty(AActor* Actor)
+	/** Queue dirty for the actor's package (external-package-aware: WorldPartition one-file-per-actor). */
+	void HRC_QueueActorDirty(FMCPMutatorScope& Scope, AActor* Actor)
 	{
 		check(Actor);
 		if (UPackage* ExternalPkg = Actor->GetExternalPackage())
 		{
-			ExternalPkg->MarkPackageDirty();
+			Scope.DirtyPackage(ExternalPkg);
 		}
-		else if (UPackage* OuterPkg = Actor->GetOutermost())
+		else
 		{
-			OuterPkg->MarkPackageDirty();
+			Scope.DirtyPackage(Actor->GetOutermost());
 		}
 	}
 
@@ -139,15 +97,13 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return HRC_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_HierarchyAttach", "Attach Actor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ChildPath, ParentPath;
 	FMCPResponse Err;
-	if (!HRC_RequireString(Request, TEXT("child_actor"),  ChildPath,  Err)) { return Err; }
-	if (!HRC_RequireString(Request, TEXT("parent_actor"), ParentPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("child_actor"),  ChildPath,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("parent_actor"), ParentPath, Err)) { return Err; }
 
 	// Resolve both actors. Both mutate-side semantically (the attach edge is on the child but the
 	// parent's attach-children list also gains an entry) — reject PIE on both to be safe.
@@ -157,7 +113,7 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Child)
 	{
-		return HRC_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("child actor '%s' not found: %s"), *ChildPath, *ResolveErr));
 	}
 
@@ -165,13 +121,13 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Parent)
 	{
-		return HRC_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("parent actor '%s' not found: %s"), *ParentPath, *ResolveErr));
 	}
 
 	if (Child == Parent)
 	{
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("cannot attach an actor to itself"));
 	}
 
@@ -180,17 +136,17 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 	FString ParseErr;
 	if (!HRC_ParseAttachRule(HRC_GetOptionalString(Request, TEXT("location_rule")), LocRule, ParseErr))
 	{
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("location_rule: %s"), *ParseErr));
 	}
 	if (!HRC_ParseAttachRule(HRC_GetOptionalString(Request, TEXT("rotation_rule")), RotRule, ParseErr))
 	{
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("rotation_rule: %s"), *ParseErr));
 	}
 	if (!HRC_ParseAttachRule(HRC_GetOptionalString(Request, TEXT("scale_rule")), ScaleRule, ParseErr))
 	{
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("scale_rule: %s"), *ParseErr));
 	}
 
@@ -205,24 +161,23 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 
 	const FAttachmentTransformRules Rules(LocRule, RotRule, ScaleRule, bWeldSimulatedBodies);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_HierarchyAttach", "Attach Actor"));
 	Child->Modify();
 	const bool bAttached = Child->AttachToActor(Parent, Rules, SocketFName);
 
 	if (!bAttached)
 	{
 		// AttachToActor returns false when the child has no RootComponent OR an internal
-		// USceneComponent::AttachToComponent cycle/permission check fails. Cancel the transaction
+		// USceneComponent::AttachToComponent cycle/permission check fails. Abort the transaction
 		// so Ctrl-Z doesn't replay a no-op.
-		Transaction.Cancel();
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		Scope.Abort();
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(
 				TEXT("AttachToActor refused for child '%s' to parent '%s' (root component missing, ")
 				TEXT("cycle detected, or unsupported root type)"),
 				*Child->GetPathName(), *Parent->GetPathName()));
 	}
 
-	HRC_MarkActorDirty(Child);
+	HRC_QueueActorDirty(Scope, Child);
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("child"),  Child->GetPathName());
@@ -231,7 +186,7 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 	if (PriorParent) { Out->SetStringField(TEXT("prior_parent"), PriorParent->GetPathName()); }
 	Out->SetStringField(TEXT("world_path"),
 		Child->GetWorld() ? Child->GetWorld()->GetPathName() : FString());
-	return HRC_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── hierarchy.detach ─────────────────────────────────────────────────────────────────────────
@@ -249,14 +204,12 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return HRC_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_HierarchyDetach", "Detach Actor"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ChildPath;
 	FMCPResponse Err;
-	if (!HRC_RequireString(Request, TEXT("child_actor"), ChildPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("child_actor"), ChildPath, Err)) { return Err; }
 
 	bool bAmbiguous = false;
 	FString AmbiguityHint, ResolveErr;
@@ -264,7 +217,7 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Child)
 	{
-		return HRC_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("child actor '%s' not found: %s"), *ChildPath, *ResolveErr));
 	}
 
@@ -273,17 +226,17 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 	FString ParseErr;
 	if (!HRC_ParseDetachRule(HRC_GetOptionalString(Request, TEXT("location_rule")), LocRule, ParseErr))
 	{
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("location_rule: %s"), *ParseErr));
 	}
 	if (!HRC_ParseDetachRule(HRC_GetOptionalString(Request, TEXT("rotation_rule")), RotRule, ParseErr))
 	{
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("rotation_rule: %s"), *ParseErr));
 	}
 	if (!HRC_ParseDetachRule(HRC_GetOptionalString(Request, TEXT("scale_rule")), ScaleRule, ParseErr))
 	{
-		return HRC_MakeError(Request, kHRCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			FString::Printf(TEXT("scale_rule: %s"), *ParseErr));
 	}
 
@@ -292,11 +245,10 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 
 	const FDetachmentTransformRules Rules(LocRule, RotRule, ScaleRule, /*bCallModify*/ true);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_HierarchyDetach", "Detach Actor"));
 	Child->Modify();
 	Child->DetachFromActor(Rules);
 
-	HRC_MarkActorDirty(Child);
+	HRC_QueueActorDirty(Scope, Child);
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("child"), Child->GetPathName());
@@ -307,7 +259,7 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 	}
 	Out->SetStringField(TEXT("world_path"),
 		Child->GetWorld() ? Child->GetWorld()->GetPathName() : FString());
-	return HRC_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── hierarchy.list_children ──────────────────────────────────────────────────────────────────
@@ -325,7 +277,7 @@ FMCPResponse Tool_ListChildren(const FMCPRequest& Request)
 
 	FString ActorPath;
 	FMCPResponse Err;
-	if (!HRC_RequireString(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
 
 	bool bRecursive = false;
 	if (Request.Args.IsValid()) { Request.Args->TryGetBoolField(TEXT("recursive"), bRecursive); }
@@ -336,7 +288,7 @@ FMCPResponse Tool_ListChildren(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return HRC_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
@@ -367,7 +319,7 @@ FMCPResponse Tool_ListChildren(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("world_path"),
 		Actor->GetWorld() ? Actor->GetWorld()->GetPathName() : FString());
 	Out->SetArrayField (TEXT("children"),  ChildArray);
-	return HRC_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

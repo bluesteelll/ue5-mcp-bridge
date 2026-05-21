@@ -3,6 +3,8 @@
 #include "FolderTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -12,7 +14,6 @@
 #include "EngineUtils.h"             // FActorIterator
 #include "Folder.h"
 #include "GameFramework/Actor.h"
-#include "ScopedTransaction.h"
 #include "UObject/Package.h"
 
 #include "Dom/JsonObject.h"
@@ -23,47 +24,7 @@
 namespace
 {
 	// FLDR_ prefix per unity-build convention (avoids ODR collisions in shared compile units).
-	constexpr int32 kFLDRErrorInvalidParams = -32602;
-	constexpr int32 kFLDRErrorInternal      = -32603;
-
-	void FLDR_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse FLDR_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		FLDR_StampIds(Request, R);
-		R.bIsError = true; R.ErrorCode = Code; R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse FLDR_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		FLDR_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
-
-	bool FLDR_RequireString(const FMCPRequest& Request, const TCHAR* Field, FString& OutValue, FMCPResponse& OutErr)
-	{
-		if (!Request.Args.IsValid())
-		{
-			OutErr = FLDR_MakeError(Request, kFLDRErrorInvalidParams, TEXT("missing args object"));
-			return false;
-		}
-		if (!Request.Args->TryGetStringField(Field, OutValue) || OutValue.IsEmpty())
-		{
-			OutErr = FLDR_MakeError(Request, kFLDRErrorInvalidParams,
-				FString::Printf(TEXT("missing required string field '%s'"), Field));
-			return false;
-		}
-		return true;
-	}
+	constexpr int32 kFLDRErrorInternal = -32603;
 
 	/**
 	 * Resolve the editor world for folder ops. Returns nullptr + populates Out* on failure.
@@ -123,7 +84,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UWorld* World = FLDR_GetEditorWorldOrFail(ErrCode, ErrMsg);
-	if (!World) { return FLDR_MakeError(Request, ErrCode, ErrMsg); }
+	if (!World) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	TArray<FString> Paths;
 	FActorFolders::Get().ForEachFolder(*World, [&Paths](const FFolder& Folder)
@@ -161,7 +122,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	Resp->SetArrayField(TEXT("folders"), Out);
 	Resp->SetNumberField(TEXT("total_known"), Paths.Num());
 	Resp->SetStringField(TEXT("world_path"), World->GetPathName());
-	return FLDR_MakeSuccessObj(Request, Resp);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Resp);
 }
 
 // ─── folder.create ────────────────────────────────────────────────────────────────────────────
@@ -172,37 +133,31 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return FLDR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_CreateFolder", "Create Folder"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString FolderPath;
 	FMCPResponse Err;
-	if (!FLDR_RequireString(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
 
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UWorld* World = FLDR_GetEditorWorldOrFail(ErrCode, ErrMsg);
-	if (!World) { return FLDR_MakeError(Request, ErrCode, ErrMsg); }
+	if (!World) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	const FFolder Folder = FLDR_MakeWorldFolder(World, FolderPath);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_CreateFolder", "Create Folder"));
 	const bool bCreated = FActorFolders::Get().CreateFolder(*World, Folder);
 
 	// World folders state isn't an asset, but mark the persistent level package so undo works
 	// + the World can be re-saved with updated outliner state if the user wants persistence.
-	if (UPackage* Pkg = World->PersistentLevel ? World->PersistentLevel->GetOutermost() : World->GetOutermost())
-	{
-		Pkg->MarkPackageDirty();
-	}
+	Scope.DirtyPackage(World->PersistentLevel ? World->PersistentLevel->GetOutermost() : World->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("created"), bCreated);
 	Out->SetStringField(TEXT("folder_path"), Folder.ToString());
 	Out->SetStringField(TEXT("world_path"), World->GetPathName());
-	return FLDR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── folder.delete ────────────────────────────────────────────────────────────────────────────
@@ -218,14 +173,12 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return FLDR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_DeleteFolder", "Delete Folder"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString FolderPath;
 	FMCPResponse Err;
-	if (!FLDR_RequireString(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("folder_path"), FolderPath, Err)) { return Err; }
 
 	bool bMoveChildrenToParent = true;
 	if (Request.Args.IsValid())
@@ -236,18 +189,16 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	int32 ErrCode = 0;
 	FString ErrMsg;
 	UWorld* World = FLDR_GetEditorWorldOrFail(ErrCode, ErrMsg);
-	if (!World) { return FLDR_MakeError(Request, ErrCode, ErrMsg); }
+	if (!World) { return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg); }
 
 	const FFolder Folder = FLDR_MakeWorldFolder(World, FolderPath);
 
 	if (!FActorFolders::Get().ContainsFolder(*World, Folder))
 	{
-		return FLDR_MakeError(Request, kMCPErrorFolderNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorFolderNotFound,
 			FString::Printf(TEXT("folder '%s' does not exist in world '%s'"),
 				*FolderPath, *World->GetPathName()));
 	}
-
-	FScopedTransaction Transaction(LOCTEXT("MCP_DeleteFolder", "Delete Folder"));
 
 	int32 MovedChildren = 0;
 	const FString ParentPath = FLDR_GetParentPath(FolderPath);
@@ -290,10 +241,7 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 			Actor->SetFolderPath(New.IsEmpty() ? NAME_None : FName(*New));
 			++MovedChildren;
 
-			if (UPackage* ExternalPkg = Actor->GetExternalPackage())
-			{
-				ExternalPkg->MarkPackageDirty();
-			}
+			Scope.DirtyPackage(Actor->GetExternalPackage());
 		}
 	}
 
@@ -303,10 +251,7 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 
 	const bool bStillExists = FActorFolders::Get().ContainsFolder(*World, Folder);
 
-	if (UPackage* Pkg = World->PersistentLevel ? World->PersistentLevel->GetOutermost() : World->GetOutermost())
-	{
-		Pkg->MarkPackageDirty();
-	}
+	Scope.DirtyPackage(World->PersistentLevel ? World->PersistentLevel->GetOutermost() : World->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("deleted"), !bStillExists);
@@ -314,7 +259,7 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("folder_path"), FolderPath);
 	Out->SetStringField(TEXT("parent_path"), ParentPath);
 	Out->SetStringField(TEXT("world_path"), World->GetPathName());
-	return FLDR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── folder.set_actor ─────────────────────────────────────────────────────────────────────────
@@ -329,21 +274,19 @@ FMCPResponse Tool_SetActor(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return FLDR_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_SetActorFolder", "Set Actor Folder"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	FString ActorPath;
 	FMCPResponse Err;
-	if (!FLDR_RequireString(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("actor_path"), ActorPath, Err)) { return Err; }
 
 	// folder_path is REQUIRED (caller must pass it explicitly — empty string = root, missing field
 	// = invalid params, mirroring wp.set_actor_runtime_grid). Allow empty here.
 	FString FolderPath;
 	if (!Request.Args.IsValid() || !Request.Args->TryGetStringField(TEXT("folder_path"), FolderPath))
 	{
-		return FLDR_MakeError(Request, kFLDRErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("folder.set_actor requires args.folder_path (string; empty to move to root)"));
 	}
 
@@ -353,24 +296,24 @@ FMCPResponse Tool_SetActor(const FMCPRequest& Request)
 		bAmbiguous, AmbiguityHint, ResolveErr);
 	if (!Actor)
 	{
-		return FLDR_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
 	const FName Prior = Actor->GetFolderPath();
 	const FName Desired = FolderPath.IsEmpty() ? NAME_None : FName(*FolderPath);
 
-	FScopedTransaction Transaction(LOCTEXT("MCP_SetActorFolder", "Set Actor Folder"));
 	Actor->Modify();
 	Actor->SetFolderPath(Desired);
 
+	// Prefer external package (WorldPartition one-file-per-actor); fallback to outermost.
 	if (UPackage* ExternalPkg = Actor->GetExternalPackage())
 	{
-		ExternalPkg->MarkPackageDirty();
+		Scope.DirtyPackage(ExternalPkg);
 	}
-	else if (UPackage* OuterPkg = Actor->GetOutermost())
+	else
 	{
-		OuterPkg->MarkPackageDirty();
+		Scope.DirtyPackage(Actor->GetOutermost());
 	}
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
@@ -378,7 +321,7 @@ FMCPResponse Tool_SetActor(const FMCPRequest& Request)
 	Out->SetStringField(TEXT("prior_folder"), Prior.ToString());
 	Out->SetStringField(TEXT("new_folder"),   Desired.ToString());
 	Out->SetStringField(TEXT("world_path"),   Actor->GetWorld() ? Actor->GetWorld()->GetPathName() : FString());
-	return FLDR_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

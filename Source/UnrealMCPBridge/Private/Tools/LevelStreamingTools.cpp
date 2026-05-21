@@ -3,6 +3,8 @@
 #include "LevelStreamingTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPMutatorScope.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPWorldContext.h"
@@ -27,31 +29,7 @@
 namespace
 {
 	// LS_ prefix per surface convention.
-	constexpr int32 kLSErrorInvalidParams = -32602;
-	constexpr int32 kLSErrorInternal      = -32603;
-
-	void LS_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse LS_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		LS_StampIds(Request, R);
-		R.bIsError = true; R.ErrorCode = Code; R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse LS_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		LS_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
+	constexpr int32 kLSErrorInternal = -32603;
 
 	/**
 	 * Resolve a persistent UWorld by path, OR return the current editor world when ``Path`` is
@@ -245,7 +223,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UWorld* World = LS_ResolvePersistentWorld(PersistentPath, LoadErrCode, LoadErrMsg);
-	if (!World) { return LS_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!World) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("persistent"),
@@ -263,7 +241,7 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	}
 	Out->SetArrayField(TEXT("streaming"), Arr);
 	Out->SetNumberField(TEXT("count"), Arr.Num());
-	return LS_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level_streaming.add (mutator — PIE-guarded) ─────────────────────────────────────────────
@@ -280,27 +258,25 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LS_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelStreamingAdd", "MCP: add streaming level"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString PersistentPath, SublevelPath;
 	if (!Request.Args->TryGetStringField(TEXT("persistent_level_path"), PersistentPath)
 		|| PersistentPath.IsEmpty())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'persistent_level_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("sublevel_asset_path"), SublevelPath)
 		|| SublevelPath.IsEmpty())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'sublevel_asset_path'"));
 	}
 
@@ -308,26 +284,26 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 	FString TransformErr;
 	if (!LS_ReadTransformObj(Request.Args, Transform, TransformErr))
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams, TransformErr);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TransformErr);
 	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UWorld* PersistentWorld = LS_ResolvePersistentWorld(PersistentPath, LoadErrCode, LoadErrMsg);
-	if (!PersistentWorld) { return LS_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!PersistentWorld) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	// Normalise the sublevel path to package-name form expected by AddLevelToWorld.
 	const FString SublevelNorm = FMCPAssetPathUtils::Normalize(SublevelPath);
 	if (SublevelNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(SublevelNorm))
 	{
-		return LS_MakeError(Request, kMCPErrorInvalidPath,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("sublevel_asset_path '%s' malformed or unknown mount"), *SublevelPath));
 	}
 
 	// Verify the asset actually exists on disk before AddLevelToWorld silently no-ops on a typo.
 	if (!FPackageName::DoesPackageExist(SublevelNorm))
 	{
-		return LS_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("sublevel package '%s' does not exist on disk"), *SublevelNorm));
 	}
 
@@ -336,12 +312,11 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 	// can detect the no-op deterministically).
 	if (LS_FindStreamingEntry(PersistentWorld, SublevelNorm))
 	{
-		return LS_MakeError(Request, kMCPErrorPathInUse,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
 			FString::Printf(TEXT("sublevel '%s' is already in the streaming list of '%s'"),
 				*SublevelNorm, *PersistentWorld->GetPathName()));
 	}
 
-	const FScopedTransaction Transaction(LOCTEXT("LevelStreamingAdd", "MCP: add streaming level"));
 	ULevelStreaming* NewStreaming = UEditorLevelUtils::AddLevelToWorld(
 		PersistentWorld,
 		*SublevelNorm,
@@ -350,24 +325,21 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 
 	if (!NewStreaming)
 	{
-		return LS_MakeError(Request, kLSErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLSErrorInternal,
 			FString::Printf(TEXT("UEditorLevelUtils::AddLevelToWorld returned null for sublevel '%s'"),
 				*SublevelNorm));
 	}
 
-	if (UPackage* Pkg = PersistentWorld->PersistentLevel
+	Scope.DirtyPackage(PersistentWorld->PersistentLevel
 		? PersistentWorld->PersistentLevel->GetOutermost()
-		: PersistentWorld->GetOutermost())
-	{
-		Pkg->MarkPackageDirty();
-	}
+		: PersistentWorld->GetOutermost());
 
 	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField  (TEXT("added"),         true);
 	Out->SetStringField(TEXT("sublevel_path"), NewStreaming->GetWorldAssetPackageName());
 	Out->SetStringField(TEXT("package_name"),  NewStreaming->GetWorldAssetPackageName());
 	Out->SetStringField(TEXT("level_class"),   NewStreaming->GetClass()->GetPathName());
-	return LS_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level_streaming.remove (mutator — PIE-guarded) ──────────────────────────────────────────
@@ -381,39 +353,37 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
 
-	if (FMCPWorldContext::IsPIEActive())
-	{
-		return LS_MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
-	}
+	FMCPMutatorScope Scope(Request, LOCTEXT("LevelStreamingRemove", "MCP: remove streaming level"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
 
 	if (!Request.Args.IsValid())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString PersistentPath, SublevelPath;
 	if (!Request.Args->TryGetStringField(TEXT("persistent_level_path"), PersistentPath)
 		|| PersistentPath.IsEmpty())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'persistent_level_path'"));
 	}
 	if (!Request.Args->TryGetStringField(TEXT("sublevel_asset_path"), SublevelPath)
 		|| SublevelPath.IsEmpty())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'sublevel_asset_path'"));
 	}
 
 	int32 LoadErrCode = 0;
 	FString LoadErrMsg;
 	UWorld* PersistentWorld = LS_ResolvePersistentWorld(PersistentPath, LoadErrCode, LoadErrMsg);
-	if (!PersistentWorld) { return LS_MakeError(Request, LoadErrCode, LoadErrMsg); }
+	if (!PersistentWorld) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
 	ULevelStreaming* Streaming = LS_FindStreamingEntry(PersistentWorld, SublevelPath);
 	if (!Streaming)
 	{
-		return LS_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("sublevel '%s' is not in the streaming list of '%s'"),
 				*SublevelPath, *PersistentWorld->GetPathName()));
 	}
@@ -428,12 +398,11 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 	{
 		// Sublevel entry exists but its ULevel isn't loaded — RemoveInvalidLevelFromWorld is the
 		// right path. Treat as removable for caller convenience.
-		const FScopedTransaction Transaction(LOCTEXT("LevelStreamingRemoveInvalid", "MCP: remove invalid streaming level"));
 		const bool bOk = UEditorLevelUtils::RemoveInvalidLevelFromWorld(Streaming);
 		Out->SetBoolField(TEXT("removed"), bOk);
 		if (!bOk)
 		{
-			return LS_MakeError(Request, kLSErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kLSErrorInternal,
 				FString::Printf(
 					TEXT("RemoveInvalidLevelFromWorld returned false for sublevel '%s'"),
 					*ResolvedPath));
@@ -441,25 +410,21 @@ FMCPResponse Tool_Remove(const FMCPRequest& Request)
 	}
 	else
 	{
-		const FScopedTransaction Transaction(LOCTEXT("LevelStreamingRemove", "MCP: remove streaming level"));
 		const bool bOk = UEditorLevelUtils::RemoveLevelFromWorld(Level);
 		Out->SetBoolField(TEXT("removed"), bOk);
 		if (!bOk)
 		{
-			return LS_MakeError(Request, kLSErrorInternal,
+			return FMCPToolHelpers::MakeError(Request, kLSErrorInternal,
 				FString::Printf(TEXT("RemoveLevelFromWorld returned false for sublevel '%s'"),
 					*ResolvedPath));
 		}
 	}
 
-	if (UPackage* Pkg = PersistentWorld->PersistentLevel
+	Scope.DirtyPackage(PersistentWorld->PersistentLevel
 		? PersistentWorld->PersistentLevel->GetOutermost()
-		: PersistentWorld->GetOutermost())
-	{
-		Pkg->MarkPackageDirty();
-	}
+		: PersistentWorld->GetOutermost());
 
-	return LS_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── level_streaming.set_loaded (PIE-safe — no guard) ────────────────────────────────────────
@@ -476,19 +441,19 @@ FMCPResponse Tool_SetLoaded(const FMCPRequest& Request)
 
 	if (!Request.Args.IsValid())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	FString SublevelPath;
 	if (!Request.Args->TryGetStringField(TEXT("sublevel_path"), SublevelPath) || SublevelPath.IsEmpty())
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'sublevel_path'"));
 	}
 	bool bLoaded = false;
 	if (!Request.Args->TryGetBoolField(TEXT("loaded"), bLoaded))
 	{
-		return LS_MakeError(Request, kLSErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required bool field 'loaded'"));
 	}
 	bool bVisible = bLoaded;  // default: track loaded
@@ -497,14 +462,14 @@ FMCPResponse Tool_SetLoaded(const FMCPRequest& Request)
 	UWorld* World = LS_ResolveActiveWorld();
 	if (!World)
 	{
-		return LS_MakeError(Request, kLSErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kLSErrorInternal,
 			TEXT("no world available (GEditor missing)"));
 	}
 
 	ULevelStreaming* Streaming = LS_FindStreamingEntry(World, SublevelPath);
 	if (!Streaming)
 	{
-		return LS_MakeError(Request, kMCPErrorObjectNotFound,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("sublevel '%s' is not in the streaming list of world '%s'"),
 				*SublevelPath, *World->GetPathName()));
 	}
@@ -549,7 +514,7 @@ FMCPResponse Tool_SetLoaded(const FMCPRequest& Request)
 	Out->SetObjectField(TEXT("new"), New);
 
 	Out->SetBoolField(TEXT("flushed"), !bInPIE);
-	return LS_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

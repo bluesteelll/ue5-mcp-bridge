@@ -3,6 +3,7 @@
 #include "EngineTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPWorldContext.h"
 
@@ -25,33 +26,10 @@
 
 namespace
 {
-	// ENG_ prefix per the unity-build symbol-collision convention.
+	// ENG_ prefix per the unity-build symbol-collision convention. The four shared helpers
+	// (StampIds / MakeError / MakeSuccessObj / RequireXxxField) live in FMCPToolHelpers — see
+	// Phase 1 helper extraction (commit b2fd19d).
 	constexpr int32 kENGErrorInternal = -32603;
-
-	void ENG_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse ENG_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		ENG_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse ENG_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		ENG_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	/** Bytes → megabytes (1024-based) as a double. */
 	constexpr double ENG_BytesToMB(uint64 Bytes)
@@ -159,7 +137,7 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 		Out->SetField(TEXT("current_world"), MakeShared<FJsonValueNull>());
 	}
 
-	return ENG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── engine.gc_collect ─────────────────────────────────────────────────────────────────────────
@@ -194,7 +172,7 @@ FMCPResponse Tool_GCCollect(const FMCPRequest& Request)
 
 	if (!GEngine)
 	{
-		return ENG_MakeError(Request, kENGErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kENGErrorInternal,
 			TEXT("GEngine unavailable (commandlet / extremely-early init)"));
 	}
 
@@ -249,7 +227,7 @@ FMCPResponse Tool_GCCollect(const FMCPRequest& Request)
 	Out->SetNumberField(TEXT("freed_mb"),               FreedMB);
 	Out->SetNumberField(TEXT("duration_seconds"),       DurationSeconds);
 
-	return ENG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── engine.get_memory_snapshot ────────────────────────────────────────────────────────────────
@@ -323,7 +301,7 @@ FMCPResponse Tool_GetMemorySnapshot(const FMCPRequest& Request)
 		Out->SetObjectField(TEXT("breakdown"), BreakdownObj);
 	}
 
-	return ENG_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPWorldContext.h"
 
@@ -23,8 +24,9 @@
 
 namespace
 {
-	// BPC_ prefix per the unity-build symbol-collision pattern (MakeError/MakeSuccess clash with
-	// UE's global ValueOrError templates).
+	// BPC_ prefix per the unity-build symbol-collision pattern. Per-surface error constants kept;
+	// XX_StampIds/MakeError/MakeSuccessObj removed in Phase 3 — use FMCPToolHelpers::Xxx
+	// from MCPToolHelpers.h.
 	constexpr int32 kBPCErrorInvalidParams = -32602;
 	constexpr int32 kBPCErrorInternal      = -32603;
 
@@ -32,31 +34,6 @@ namespace
 	// the Phase 3 default 256 used for cheap per-actor mutators. Progress updates every 8 BPs.
 	constexpr int32 kBPCCancelCheckEvery   = 16;
 	constexpr int32 kBPCProgressUpdateEvery = 8;
-
-	void BPC_StampIds(const FMCPRequest& Request, FMCPResponse& Response)
-	{
-		Response.RequestId = Request.RequestId;
-		Response.OriginalIdString = Request.OriginalIdString;
-	}
-
-	FMCPResponse BPC_MakeError(const FMCPRequest& Request, int32 Code, const FString& Message)
-	{
-		FMCPResponse R;
-		BPC_StampIds(Request, R);
-		R.bIsError = true;
-		R.ErrorCode = Code;
-		R.ErrorMessage = Message;
-		return R;
-	}
-
-	FMCPResponse BPC_MakeSuccessObj(const FMCPRequest& Request, TSharedPtr<FJsonObject> Result)
-	{
-		FMCPResponse R;
-		BPC_StampIds(Request, R);
-		R.bIsError = false;
-		R.Result = MakeShared<FJsonValueObject>(MoveTemp(Result));
-		return R;
-	}
 
 	/**
 	 * Tokenise a per-BP compile FCompilerResultsLog into the errors[] array of a failure entry.
@@ -121,13 +98,13 @@ FMCPResponse Tool_CompileAllDirtyInternal(const FMCPRequest& Request)
 {
 	if (!Request.Args.IsValid())
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams, TEXT("missing args object"));
+		return FMCPToolHelpers::MakeError(Request, kBPCErrorInvalidParams, TEXT("missing args object"));
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* ScopesArr = nullptr;
 	if (!Request.Args->TryGetArrayField(TEXT("scope_paths"), ScopesArr) || !ScopesArr || ScopesArr->Num() == 0)
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBPCErrorInvalidParams,
 			TEXT("missing or empty required array field 'scope_paths' (e.g. ['/Game'])"));
 	}
 
@@ -144,7 +121,7 @@ FMCPResponse Tool_CompileAllDirtyInternal(const FMCPRequest& Request)
 	}
 	if (Scopes.Num() == 0)
 	{
-		return BPC_MakeError(Request, kBPCErrorInvalidParams,
+		return FMCPToolHelpers::MakeError(Request, kBPCErrorInvalidParams,
 			TEXT("scope_paths must contain at least one non-empty string"));
 	}
 
@@ -260,13 +237,13 @@ FMCPResponse Tool_CompileAllDirtyInternal(const FMCPRequest& Request)
 
 	if (!JobIdGuid.IsValid())
 	{
-		return BPC_MakeError(Request, kMCPErrorJobSubmitFailed,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorJobSubmitFailed,
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return BPC_MakeSuccessObj(Request, Out);
+	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────
