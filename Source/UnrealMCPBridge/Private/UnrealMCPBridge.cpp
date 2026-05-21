@@ -21,7 +21,6 @@
 #include "Tools/BlueprintCompositeTools.h"
 #include "Tools/BlueprintGraphTools.h"
 #include "Tools/BlueprintTools.h"
-#include "Tools/CollisionTools.h"
 #include "Tools/ComponentTools.h"
 #include "Tools/ConfigTools.h"
 #include "Tools/ContentBrowserTools.h"
@@ -36,26 +35,25 @@
 #include "Tools/GameplayTagTools.h"
 #include "Tools/HierarchyTools.h"
 #include "Tools/InputTools.h"
-#include "Tools/LandscapeTools.h"
 #include "Tools/LevelCompositeTools.h"
 #include "Tools/LevelStreamingTools.h"
 #include "Tools/LevelTools.h"
 #include "Tools/LiveCodingTools.h"
 #include "Tools/LogTools.h"
-#include "Tools/MaterialInstanceTools.h"
 #include "Tools/MaterialTools.h"
 #include "Tools/MeshTools.h"
 #include "Tools/NavMeshTools.h"
 #include "Tools/NiagaraTools.h"
-#include "Tools/PackageTools.h"
 #include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
 #include "Tools/RenderTools.h"
 #include "Tools/ScreenshotTools.h"
-#include "Tools/SequencerExtTools.h"
 #include "Tools/SequencerTools.h"
-#include "Tools/SoftRefTools.h"
 #include "Tools/SourceControlCompositeTools.h"
+
+// Wave I refactor 2026-05: auto-registration registry. Wave I+ surfaces use this
+// instead of being listed individually here.
+#include "MCPSurfaceRegistry.h"
 #include "Tools/SourceControlTools.h"
 #include "Tools/StatsTools.h"
 #include "Tools/SubsystemTools.h"
@@ -836,37 +834,14 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// DesktopPlatform private deps.
 	FCookTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
-	// Wave I 2026-05 — "Asset hygiene + pipeline polish" — 6 surfaces, +25 tools, all Lane A.
-	//   package.*       (5)  save / save_all / list_dirty / get_dependencies / get_referencers.
-	//                        SavePackage + IAssetRegistry dep/ref walk. Mutators PIE-guarded.
-	//   soft_ref.*      (4)  validate / resolve / find_redirectors / fix_redirectors. FSoftObjectPath
-	//                        + UObjectRedirector + IAssetTools::FixupReferencers. fix is PIE-guarded
-	//                        unless dry_run.
-	//   collision.*     (4)  list_channels / list_profiles / get_profile / set_profile_response.
-	//                        UCollisionProfile via reflective FArrayProperty access (the +Profiles
-	//                        UPROPERTY is private); re-derives serialised CustomResponses then
-	//                        TryUpdateDefaultConfigFile + LoadProfileConfig(true).
-	//   mat_inst.*      (5)  list / get_params / set_scalar_param / set_vector_param /
-	//                        set_texture_param. UMaterialEditingLibrary wrappers; setters PIE-guarded.
-	//                        Engine quirk: UMaterialEditingLibrary::SetXxxParameterValue returns
-	//                        false unconditionally in UE 5.7 — we infer success via prior-GetXxx
-	//                        existence check + map miss → -32005.
-	//   sequencer_ext.* (3)  add_possessable / add_track / add_section. ULevelSequence binding CRUD
-	//                        layered atop the existing sequencer.* keyframe surface (intentionally
-	//                        separate namespace to keep symbol surface clean — SEQX_ prefix). All
-	//                        mutators PIE-guarded.
-	//   landscape.*     (4)  list / get_info / get_height_at / get_layer_weights. ALandscape +
-	//                        ULandscapeInfo + FLandscapeEditDataInterface (editor-only) sparse-TMap
-	//                        height + per-layer-weight sampling. Read-only. Build.cs adds Landscape.
-	// No new error codes — all reuse -32004 / -32005 / -32010 / -32011 / -32012 / -32015 / -32027 /
-	// -32602 / -32603. Implementation done by 6 parallel code-developer agents (code-only mode);
-	// orchestrator merged + built + tested + committed.
-	FPackageTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
-	FSoftRefTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
-	FCollisionTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
-	FMaterialInstanceTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
-	FSequencerExtTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
-	FLandscapeTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+	// Wave I refactor 2026-05 — auto-registered surfaces via FMCPSurfaceRegistry.
+	// Surfaces declare themselves via MCP_REGISTER_SURFACE() at TU scope in their own .cpp
+	// (Wave I onward — package / soft_ref / collision / mat_inst / sequencer_ext / landscape
+	// + every future wave). This eliminates UnrealMCPBridge.cpp as the per-surface coordination
+	// bottleneck — parallel-agent waves can ship N surfaces concurrently without any conflict
+	// on this file. The registry iterates entries and forwards each surface's Register() with
+	// the shared dispatch queue + accumulator. See MCPSurfaceRegistry.h for the full rationale.
+	FMCPSurfaceRegistry::Get().RegisterAll(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")

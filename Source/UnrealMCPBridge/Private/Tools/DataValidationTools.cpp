@@ -151,11 +151,15 @@ namespace
 			}
 			const FString MessageStr = MessageText.ToString();
 
-			// EMessageSeverity::Type ordering (CriticalError < Error < PerformanceWarning < Warning
-			// < Info). Treat CriticalError + Error as "errors"; PerformanceWarning + Warning as
-			// warnings; Info dropped (not surface-relevant for the validator wire contract).
-			if (Issue.Severity == EMessageSeverity::Error ||
-				Issue.Severity == EMessageSeverity::CriticalError)
+			// EMessageSeverity::Type ordering: Error < PerformanceWarning < Warning < Info.
+			// Treat Error as "errors"; PerformanceWarning + Warning as warnings; Info dropped
+			// (not surface-relevant for the validator wire contract).
+			//
+			// UE 5.7 deprecated EMessageSeverity::CriticalError ("removed because it can't trigger
+			// an assert at the callsite — use checkf instead"). Validators no longer emit it, so
+			// the branch was unreachable in practice and removing it eliminates the deprecation
+			// warning that would otherwise become a hard error in a future UE release.
+			if (Issue.Severity == EMessageSeverity::Error)
 			{
 				OutErrorArr.Add(MakeShared<FJsonValueString>(MessageStr));
 			}

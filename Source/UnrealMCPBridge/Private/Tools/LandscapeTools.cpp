@@ -550,4 +550,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 
 } // namespace FLandscapeTools
 
+#include "MCPSurfaceRegistry.h"
+MCP_REGISTER_SURFACE(LandscapeTools, &FLandscapeTools::Register)
+
 #undef LOCTEXT_NAMESPACE

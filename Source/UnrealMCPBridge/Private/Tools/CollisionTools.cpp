@@ -505,4 +505,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 
 } // namespace FCollisionTools
 
+#include "MCPSurfaceRegistry.h"
+MCP_REGISTER_SURFACE(CollisionTools, &FCollisionTools::Register)
+
 #undef LOCTEXT_NAMESPACE

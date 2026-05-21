@@ -233,11 +233,17 @@ FMCPResponse Tool_Resolve(const FMCPRequest& Request)
 	// Not loaded (and either force_load=false or force_load attempt failed). Fall back to AR:
 	// if the asset registry knows the path, report its canonical object path + class so caller
 	// has a useful answer even without bringing the asset into memory.
+	//
+	// Wave I bug-fix: Data.GetObjectPathString() sometimes returns weird concatenated forms
+	// (observed: `/Engine/EditorMaterials/EditorAxisMaterial./Engine/EditorMaterials/EditorAxisMaterial`
+	// when input was the short-form path `/Engine/EditorMaterials/EditorAxisMaterial`). FSoftObjectPath::
+	// ToString returns the canonical `Package.AssetName` form the caller passed (or the auto-
+	// promoted variant FSoftObjectPath constructed) — that's what we want to echo.
 	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
 	const FAssetData Data = AR.GetAssetByObjectPath(Soft, /*bIncludeOnlyOnDiskAssets*/ false);
 	if (Data.IsValid())
 	{
-		Out->SetStringField(TEXT("resolved_path"), Data.GetObjectPathString());
+		Out->SetStringField(TEXT("resolved_path"), Soft.ToString());
 		Out->SetStringField(TEXT("target_class"), Data.AssetClassPath.ToString());
 	}
 	// Otherwise: resolved_path absent, was_loaded=false. Still a success — caller uses validate
@@ -554,5 +560,8 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FSoftRefTools
+
+#include "MCPSurfaceRegistry.h"
+MCP_REGISTER_SURFACE(SoftRefTools, &FSoftRefTools::Register)
 
 #undef LOCTEXT_NAMESPACE

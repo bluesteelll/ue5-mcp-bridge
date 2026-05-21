@@ -161,9 +161,11 @@ namespace
 	{
 		OutCategory = UE::AssetRegistry::EDependencyCategory::Package;
 
-		// Default = unfiltered Package query (both hard and soft come back). If only one of the
-		// two flags is true, ask the registry to filter for us via Hard/NotHard. If both are
-		// false the caller wants no results — issue the query anyway and let the response be empty.
+		// Default = unfiltered Package query (both hard and soft come back). If only one flag is
+		// true, ask the registry to filter for us via Hard/NotHard. The "both flags false" case is
+		// handled at the call site as an early empty-result short-circuit — at this layer we leave
+		// OutQuery in the unfiltered state (would otherwise return all results, which violates the
+		// caller's intent).
 		OutQuery = UE::AssetRegistry::FDependencyQuery();
 		if (bIncludeHard && !bIncludeSoft)
 		{
@@ -496,7 +498,15 @@ FMCPResponse Tool_GetDependencies(const FMCPRequest& Request)
 	const FName RootName(*PackageName);
 
 	TArray<FAssetDependency> All;
-	if (bRecursive)
+	// Wave I bug-fix: when caller asks to include NEITHER hard NOR soft deps, the underlying
+	// FDependencyQuery has no usable filter (NotHard would still include soft, Hard would
+	// include hard) so the registry would return the full result set. Short-circuit to an
+	// empty result instead — that matches the caller's intent ("show me no dep types").
+	if (!bIncludeHard && !bIncludeSoft)
+	{
+		// All stays empty; downstream sort+serialize is a no-op for an empty array.
+	}
+	else if (bRecursive)
 	{
 		FString WalkErr;
 		if (!PKG_WalkDependenciesBFS(IAR, RootName, Category, Query, /*MaxVisited*/ 10000, All, WalkErr))
@@ -569,7 +579,11 @@ FMCPResponse Tool_GetReferencers(const FMCPRequest& Request)
 	const FName RootName(*PackageName);
 
 	TArray<FAssetDependency> All;
-	IAR.GetReferencers(FAssetIdentifier(RootName), All, Category, Query);
+	// Wave I bug-fix: short-circuit empty when neither filter flag is on (see get_dependencies).
+	if (bIncludeHard || bIncludeSoft)
+	{
+		IAR.GetReferencers(FAssetIdentifier(RootName), All, Category, Query);
+	}
 
 	All.StableSort([](const FAssetDependency& A, const FAssetDependency& B)
 	{
@@ -615,5 +629,10 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FPackageTools
+
+// Wave I refactor 2026-05: auto-registration via FMCPSurfaceRegistry replaces the
+// manual include + Register call in UnrealMCPBridge.cpp.
+#include "MCPSurfaceRegistry.h"
+MCP_REGISTER_SURFACE(PackageTools, &FPackageTools::Register)
 
 #undef LOCTEXT_NAMESPACE

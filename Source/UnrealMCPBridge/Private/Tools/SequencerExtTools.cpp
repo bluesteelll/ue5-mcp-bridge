@@ -184,6 +184,18 @@ namespace
 	bool SEQX_ParseBindingGuid(const FString& GuidStr, FGuid& OutGuid)
 	{
 		if (GuidStr.IsEmpty()) { return false; }
+		// Wave I bug-fix: enforce STRICT length on input before delegating to FGuid::Parse — UE
+		// 5.7's FGuid::Parse is too permissive on borderline inputs (e.g. accepts arbitrary 36-
+		// char strings with hyphens in the right slots without validating segment hex content),
+		// so a malformed input like 'not-a-real-guid-format' (len=22) could fail late at binding-
+		// lookup (-32004 NotFound) instead of producing a clear -32602 InvalidParams. Accepted
+		// shapes (matches FGuid::ToString output formats):
+		//   Digits                          (32 hex chars, no separators)        len=32
+		//   DigitsWithHyphens               (8-4-4-4-12 hex separated by hyphens) len=36
+		//   DigitsWithHyphensInBraces       ({…DigitsWithHyphens…})              len=38
+		//   DigitsWithHyphensInParentheses  ((…DigitsWithHyphens…))              len=38
+		const int32 Len = GuidStr.Len();
+		if (Len != 32 && Len != 36 && Len != 38) { return false; }
 		return FGuid::Parse(GuidStr, OutGuid) && OutGuid.IsValid();
 	}
 
@@ -590,5 +602,8 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FSequencerExtTools
+
+#include "MCPSurfaceRegistry.h"
+MCP_REGISTER_SURFACE(SequencerExtTools, &FSequencerExtTools::Register)
 
 #undef LOCTEXT_NAMESPACE

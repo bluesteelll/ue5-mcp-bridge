@@ -711,4 +711,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 
 } // namespace FMaterialInstanceTools
 
+#include "MCPSurfaceRegistry.h"
+MCP_REGISTER_SURFACE(MaterialInstanceTools, &FMaterialInstanceTools::Register)
+
 #undef LOCTEXT_NAMESPACE
