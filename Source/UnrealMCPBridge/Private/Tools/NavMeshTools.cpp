@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -215,10 +216,10 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		NavMeshesArr.Add(MakeShared<FJsonValueObject>(NAV_BuildRecastNavMeshJson(RNM)));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-	Out->SetArrayField(TEXT("navmeshes"), NavMeshesArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("world"), NAV_WorldKindName(World))
+		.Arr(TEXT("navmeshes"), MoveTemp(NavMeshesArr))
+		.BuildSuccess(Request);
 }
 
 // ─── navmesh.rebuild ───────────────────────────────────────────────────────────────────────────
@@ -400,12 +401,12 @@ FMCPResponse Tool_FindPath(const FMCPRequest& Request)
 		// "No navdata available" is NOT an internal error — it's a legitimate state (empty map, no
 		// NavMeshBoundsVolume placed). Surface as found=false so callers can branch on that, not as
 		// -32603 which would imply broken infrastructure.
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("found"), false);
-		Out->SetNumberField(TEXT("path_length"), 0.0);
-		Out->SetArrayField(TEXT("waypoints"), TArray<TSharedPtr<FJsonValue>>());
-		Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("found"), false)
+			.Num(TEXT("path_length"), 0.0)
+			.Arr(TEXT("waypoints"), TArray<TSharedPtr<FJsonValue>>())
+			.Str(TEXT("world"), NAV_WorldKindName(World))
+			.BuildSuccess(Request);
 	}
 
 	FPathFindingQuery Query;
@@ -432,12 +433,12 @@ FMCPResponse Tool_FindPath(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("found"), bFound);
-	Out->SetNumberField(TEXT("path_length"), static_cast<double>(PathLength));
-	Out->SetArrayField(TEXT("waypoints"), WaypointsArr);
-	Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("found"), bFound)
+		.Num(TEXT("path_length"), static_cast<double>(PathLength))
+		.Arr(TEXT("waypoints"), MoveTemp(WaypointsArr))
+		.Str(TEXT("world"), NAV_WorldKindName(World))
+		.BuildSuccess(Request);
 }
 
 // ─── navmesh.project_to_navmesh ────────────────────────────────────────────────────────────────
@@ -512,11 +513,11 @@ FMCPResponse Tool_ProjectToNavMesh(const FMCPRequest& Request)
 
 	const FVector ReportedLoc = bProjected ? OutLoc.Location : Location;
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("projected"), bProjected);
-	Out->SetArrayField(TEXT("location"), NAV_VectorToArray(ReportedLoc));
-	Out->SetStringField(TEXT("world"), NAV_WorldKindName(World));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("projected"), bProjected)
+		.Arr(TEXT("location"), NAV_VectorToArray(ReportedLoc))
+		.Str(TEXT("world"), NAV_WorldKindName(World))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

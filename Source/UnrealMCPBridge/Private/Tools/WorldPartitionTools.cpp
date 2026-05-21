@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -54,11 +55,12 @@ FMCPResponse Tool_IsPartitioned(const FMCPRequest& Request)
 
 	UWorldPartition* WP = World->GetWorldPartition();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("partitioned"), WP != nullptr);
-	if (WP) { Out->SetStringField(TEXT("partition_path"), WP->GetPathName()); }
-	Out->SetStringField(TEXT("world_path"), World->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("partitioned"), WP != nullptr)
+		.If(WP != nullptr,
+			[&](FMCPJsonBuilder& B) { B.Str(TEXT("partition_path"), WP->GetPathName()); })
+		.Str(TEXT("world_path"), World->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── wp.get_actor_runtime_grid ────────────────────────────────────────────────────────────────
@@ -83,10 +85,10 @@ FMCPResponse Tool_GetActorRuntimeGrid(const FMCPRequest& Request)
 			FString::Printf(TEXT("actor '%s' not found: %s"), *ActorPath, *ResolveErr));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
-	Out->SetStringField(TEXT("runtime_grid"), Actor->GetRuntimeGrid().ToString());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), Actor->GetPathName())
+		.Str(TEXT("runtime_grid"), Actor->GetRuntimeGrid().ToString())
+		.BuildSuccess(Request);
 }
 
 // ─── wp.set_actor_runtime_grid ────────────────────────────────────────────────────────────────
@@ -137,11 +139,11 @@ FMCPResponse Tool_SetActorRuntimeGrid(const FMCPRequest& Request)
 		Scope.DirtyPackage(OuterPkg);
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
-	Out->SetStringField(TEXT("prior_grid"), Prior.ToString());
-	Out->SetStringField(TEXT("new_grid"),   Desired.ToString());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), Actor->GetPathName())
+		.Str(TEXT("prior_grid"), Prior.ToString())
+		.Str(TEXT("new_grid"),   Desired.ToString())
+		.BuildSuccess(Request);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

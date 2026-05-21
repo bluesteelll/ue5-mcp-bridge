@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -386,10 +387,10 @@ FMCPResponse Tool_ListStateMachines(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("state_machines"), SMArr);
-	Out->SetStringField(TEXT("anim_blueprint_path"), ABP->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("state_machines"), MoveTemp(SMArr))
+		.Str(TEXT("anim_blueprint_path"), ABP->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── animbp.get_states ─────────────────────────────────────────────────────────────────────────
@@ -449,10 +450,10 @@ FMCPResponse Tool_GetStates(const FMCPRequest& Request)
 		StatesArr.Add(MakeShared<FJsonValueObject>(ABP_BuildStateJson(State, bIsEntry)));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("states"), StatesArr);
-	Out->SetStringField(TEXT("state_machine_name"), SMName);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("states"), MoveTemp(StatesArr))
+		.Str(TEXT("state_machine_name"), SMName)
+		.BuildSuccess(Request);
 }
 
 // ─── animbp.add_state ──────────────────────────────────────────────────────────────────────────
@@ -737,12 +738,12 @@ FMCPResponse Tool_AddTransition(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("transition_node_guid"), TransNode->NodeGuid.ToString(EGuidFormats::Digits));
-	Out->SetStringField(TEXT("from_state"), FromStateName);
-	Out->SetStringField(TEXT("to_state"),   ToStateName);
-	Out->SetArrayField(TEXT("position"), ABP_IntPointToJsonArray(TransNode->NodePosX, TransNode->NodePosY));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("transition_node_guid"), TransNode->NodeGuid.ToString(EGuidFormats::Digits))
+		.Str(TEXT("from_state"), FromStateName)
+		.Str(TEXT("to_state"),   ToStateName)
+		.Arr(TEXT("position"), ABP_IntPointToJsonArray(TransNode->NodePosX, TransNode->NodePosY))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

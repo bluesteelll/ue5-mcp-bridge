@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -229,11 +230,11 @@ FMCPResponse Tool_GetContextBindings(const FMCPRequest& Request)
 		MappingArr.Add(MakeShared<FJsonValueObject>(MapObj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("mapping_context"), IMC->GetPathName());
-	Out->SetArrayField(TEXT("mappings"), MappingArr);
-	Out->SetNumberField(TEXT("mapping_count"), Mappings.Num());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("mapping_context"), IMC->GetPathName())
+		.Arr(TEXT("mappings"), MoveTemp(MappingArr))
+		.Int(TEXT("mapping_count"), Mappings.Num())
+		.BuildSuccess(Request);
 }
 
 // ─── input.list_player_contexts ───────────────────────────────────────────────────────────────

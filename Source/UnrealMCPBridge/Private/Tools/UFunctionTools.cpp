@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
@@ -294,21 +295,17 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("called"), true);
-	if (ReturnValue.IsValid())
-	{
-		Result->SetField(TEXT("return_value"), ReturnValue);
-	}
-	else
-	{
-		Result->SetField(TEXT("return_value"), MakeShared<FJsonValueNull>());
-	}
-	Result->SetObjectField(TEXT("out_params"), OutParamsObj);
-	Result->SetStringField(TEXT("function_signature"), UFN_BuildSignature(Func));
-	Result->SetStringField(TEXT("target_class"), TargetClass->GetPathName());
-	Result->SetStringField(TEXT("target_object"), TargetObject->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Result);
+	const TSharedRef<FJsonValue> ReturnRef = ReturnValue.IsValid()
+		? ReturnValue.ToSharedRef()
+		: StaticCastSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+	return FMCPJsonBuilder()
+		.Bool(TEXT("called"), true)
+		.Field(TEXT("return_value"), ReturnRef)
+		.ObjectShared(TEXT("out_params"), OutParamsObj)
+		.Str(TEXT("function_signature"), UFN_BuildSignature(Func))
+		.Str(TEXT("target_class"), TargetClass->GetPathName())
+		.Str(TEXT("target_object"), TargetObject->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_class_functions ────────────────────────────────────────────────────────────────
@@ -509,23 +506,25 @@ FMCPResponse Tool_ListClassFunctions(const FMCPRequest& Request)
 		Out.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("class_path"), TargetClass->GetPathName());
-	Result->SetArrayField(TEXT("functions"), Out);
-	Result->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-	if (EndExcl < TotalKnown && Out.Num() > 0)
+	FString NextPageToken;
+	const bool bHasMore = (EndExcl < TotalKnown && Out.Num() > 0);
+	if (bHasMore)
 	{
 		FMCPPageCursor NewCursor;
 		NewCursor.FilterHash = FilterHash;
 		NewCursor.LastAssetPath = AllFuncs[EndExcl - 1]->GetName();
 		NewCursor.TotalKnownSnapshot = TotalKnown;
-		Result->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+		NextPageToken = FMCPPageCursorUtils::Encode(NewCursor);
 	}
-	else
-	{
-		Result->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Result);
+	return FMCPJsonBuilder()
+		.Str(TEXT("class_path"), TargetClass->GetPathName())
+		.Arr(TEXT("functions"), MoveTemp(Out))
+		.Num(TEXT("total_known"), static_cast<double>(TotalKnown))
+		.If(bHasMore,
+			[&](FMCPJsonBuilder& B) { B.Str(TEXT("next_page_token"), NextPageToken); })
+		.If(!bHasMore,
+			[&](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+		.BuildSuccess(Request);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

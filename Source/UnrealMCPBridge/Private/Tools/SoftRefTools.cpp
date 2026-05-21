@@ -3,6 +3,7 @@
 #include "SoftRefTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -311,20 +312,20 @@ FMCPResponse Tool_FindRedirectors(const FMCPRequest& Request)
 		RedirectorArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("redirectors"), RedirectorArr);
-	Out->SetNumberField(TEXT("total_known"), Redirectors.Num());
-
-	if (EndIdx < Redirectors.Num() && EndIdx > 0)
-	{
-		FMCPPageCursor OutCursor;
-		OutCursor.FilterHash = FilterHash;
-		OutCursor.LastAssetPath = Redirectors[EndIdx - 1].GetSoftObjectPath().ToString();
-		OutCursor.TotalKnownSnapshot = Redirectors.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
-	}
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalKnown = Redirectors.Num();
+	const bool bHasNextPage = (EndIdx < TotalKnown && EndIdx > 0);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("redirectors"), MoveTemp(RedirectorArr))
+		.Num(TEXT("total_known"), TotalKnown)
+		.If(bHasNextPage, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor OutCursor;
+			OutCursor.FilterHash = FilterHash;
+			OutCursor.LastAssetPath = Redirectors[EndIdx - 1].GetSoftObjectPath().ToString();
+			OutCursor.TotalKnownSnapshot = TotalKnown;
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── soft_ref.fix_redirectors ────────────────────────────────────────────────────────────────
@@ -504,12 +505,12 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 		Fixed = Loaded.Num();
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("fixed"), Fixed);
-	Out->SetNumberField(TEXT("skipped"), Skipped);
-	Out->SetArrayField(TEXT("errors"), ErrorArr);
-	if (bDryRun) { Out->SetBoolField(TEXT("dry_run"), true); }
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("fixed"), Fixed)
+		.Num(TEXT("skipped"), Skipped)
+		.Arr(TEXT("errors"), MoveTemp(ErrorArr))
+		.If(bDryRun, [](FMCPJsonBuilder& B) { B.Bool(TEXT("dry_run"), true); })
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

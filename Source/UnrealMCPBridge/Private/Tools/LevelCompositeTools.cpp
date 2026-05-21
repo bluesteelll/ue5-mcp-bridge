@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -353,9 +354,9 @@ FMCPResponse Tool_FullActorDumpInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── level._find_actors_with_class_internal (Lane B → SubmitJob → game-thread body) ──────────
@@ -557,9 +558,9 @@ FMCPResponse Tool_FindActorsWithClassInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── actor._batch_spawn_internal (Lane B → SubmitJob → game-thread body) ─────────────────────
@@ -754,9 +755,9 @@ FMCPResponse Tool_BatchSpawnInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── actor._batch_destroy_internal (Lane B → SubmitJob → game-thread body) ───────────────────
@@ -905,9 +906,9 @@ FMCPResponse Tool_BatchDestroyInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── actor._batch_set_property_internal (Lane B → SubmitJob → game-thread body) ──────────────
@@ -1114,9 +1115,9 @@ FMCPResponse Tool_BatchSetPropertyInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

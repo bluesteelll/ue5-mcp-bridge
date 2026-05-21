@@ -3,6 +3,7 @@
 #include "AIPerceptionTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -326,11 +327,12 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 		Items.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("perception_components"), Items);
-	Out->SetNumberField(TEXT("total"), Items.Num());
-	Out->SetStringField(TEXT("world_kind"), WorldKind);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalComponents = Items.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("perception_components"), MoveTemp(Items))
+		.Num(TEXT("total"), TotalComponents)
+		.Str(TEXT("world_kind"), WorldKind)
+		.BuildSuccess(Request);
 }
 
 // ─── ai.perception.get_config ─────────────────────────────────────────────────────────────────
@@ -396,15 +398,14 @@ FMCPResponse Tool_GetConfig(const FMCPRequest& Request)
 			AIPER_BuildSenseConfigEntry(Config, bDominant)));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	if (DominantClass)
-	{
-		Out->SetStringField(TEXT("dominant_sense_class"),
-			AIPER_SenseClassToWireString(DominantClass));
-	}
-	Out->SetArrayField(TEXT("sense_configs"), ConfigItems);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.If(DominantClass != nullptr, [&](FMCPJsonBuilder& B)
+		{
+			B.Str(TEXT("dominant_sense_class"), AIPER_SenseClassToWireString(DominantClass));
+		})
+		.Arr(TEXT("sense_configs"), MoveTemp(ConfigItems))
+		.BuildSuccess(Request);
 }
 
 // ─── ai.perception.get_perceived_actors ───────────────────────────────────────────────────────
@@ -560,11 +561,12 @@ FMCPResponse Tool_GetPerceivedActors(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetArrayField(TEXT("perceived"), Items);
-	Out->SetNumberField(TEXT("total"), Items.Num());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalPerceived = Items.Num();
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.Arr(TEXT("perceived"), MoveTemp(Items))
+		.Num(TEXT("total"), TotalPerceived)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

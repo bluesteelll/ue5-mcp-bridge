@@ -3,6 +3,7 @@
 #include "AICrowdTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -400,11 +401,12 @@ FMCPResponse Tool_ListAgents(const FMCPRequest& Request)
 		Arr.Add(MakeShared<FJsonValueObject>(AICRWD_BuildAgentJson(Agent)));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world"), AICRWD_WorldKindName(World));
-	Out->SetNumberField(TEXT("count"), Arr.Num());
-	Out->SetArrayField(TEXT("agents"), Arr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 AgentCount = Arr.Num();
+	return FMCPJsonBuilder()
+		.Str(TEXT("world"), AICRWD_WorldKindName(World))
+		.Num(TEXT("count"), AgentCount)
+		.Arr(TEXT("agents"), MoveTemp(Arr))
+		.BuildSuccess(Request);
 }
 
 // ─── ai.crowd.set_avoidance_quality ────────────────────────────────────────────────────────────
@@ -483,16 +485,15 @@ FMCPResponse Tool_SetAvoidanceQuality(const FMCPRequest& Request)
 	const ECrowdAvoidanceQuality::Type PriorQuality = Agent->GetCrowdAvoidanceQuality();
 	Agent->SetCrowdAvoidanceQuality(NewQuality, /*bUpdateAgent*/ true);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world"), AICRWD_WorldKindName(World));
-	Out->SetBoolField(TEXT("set"), true);
-
 	const AActor* OwnerActor = Agent->GetOwner();
-	Out->SetStringField(TEXT("actor_path"),
-		OwnerActor ? FMCPActorPathUtils::BuildActorPath(OwnerActor) : ActorPath);
-	Out->SetStringField(TEXT("prior_quality"), AICRWD_QualityToString(PriorQuality));
-	Out->SetStringField(TEXT("new_quality"),   AICRWD_QualityToString(NewQuality));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("world"), AICRWD_WorldKindName(World))
+		.Bool(TEXT("set"), true)
+		.Str(TEXT("actor_path"),
+			OwnerActor ? FMCPActorPathUtils::BuildActorPath(OwnerActor) : ActorPath)
+		.Str(TEXT("prior_quality"), AICRWD_QualityToString(PriorQuality))
+		.Str(TEXT("new_quality"),   AICRWD_QualityToString(NewQuality))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

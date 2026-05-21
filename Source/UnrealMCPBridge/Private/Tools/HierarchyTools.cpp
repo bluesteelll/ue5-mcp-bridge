@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -315,13 +316,13 @@ FMCPResponse Tool_ListChildren(const FMCPRequest& Request)
 		ChildArray.Add(MakeShared<FJsonValueObject>(ChildObj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor"),     Actor->GetPathName());
-	Out->SetBoolField  (TEXT("recursive"), bRecursive);
-	Out->SetStringField(TEXT("world_path"),
-		Actor->GetWorld() ? Actor->GetWorld()->GetPathName() : FString());
-	Out->SetArrayField (TEXT("children"),  ChildArray);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str (TEXT("actor"),     Actor->GetPathName())
+		.Bool(TEXT("recursive"), bRecursive)
+		.Str (TEXT("world_path"),
+			Actor->GetWorld() ? Actor->GetWorld()->GetPathName() : FString())
+		.Arr (TEXT("children"),  MoveTemp(ChildArray))
+		.BuildSuccess(Request);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

@@ -3,6 +3,7 @@
 #include "LandscapeTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -197,9 +198,9 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		LandscapesArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("landscapes"), LandscapesArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("landscapes"), MoveTemp(LandscapesArr))
+		.BuildSuccess(Request);
 }
 
 // ─── landscape.get_info ──────────────────────────────────────────────────────────────────────────
@@ -274,14 +275,14 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 	const double MinZ = Bounds.IsValid ? Bounds.Min.Z : 0.0;
 	const double MaxZ = Bounds.IsValid ? Bounds.Max.Z : 0.0;
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("component_size_quads"), static_cast<double>(LSI->ComponentSizeQuads));
-	Out->SetNumberField(TEXT("num_subsections"),      static_cast<double>(LSI->ComponentNumSubsections));
-	Out->SetArrayField(TEXT("layer_infos"),           LayerArr);
-	Out->SetNumberField(TEXT("min_z"),                MinZ);
-	Out->SetNumberField(TEXT("max_z"),                MaxZ);
-	Out->SetNumberField(TEXT("total_components"),     static_cast<double>(LS->LandscapeComponents.Num()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("component_size_quads"), static_cast<double>(LSI->ComponentSizeQuads))
+		.Num(TEXT("num_subsections"),      static_cast<double>(LSI->ComponentNumSubsections))
+		.Arr(TEXT("layer_infos"),          MoveTemp(LayerArr))
+		.Num(TEXT("min_z"),                MinZ)
+		.Num(TEXT("max_z"),                MaxZ)
+		.Num(TEXT("total_components"),     static_cast<double>(LS->LandscapeComponents.Num()))
+		.BuildSuccess(Request);
 }
 
 // ─── landscape.get_height_at ─────────────────────────────────────────────────────────────────────

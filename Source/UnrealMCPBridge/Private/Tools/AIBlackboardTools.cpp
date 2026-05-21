@@ -3,6 +3,7 @@
 #include "AIBlackboardTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -576,11 +577,12 @@ FMCPResponse Tool_ListKeys(const FMCPRequest& Request)
 		KeysArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("keys"), KeysArr);
-	Out->SetNumberField(TEXT("total"), KeysArr.Num());
-	Out->SetStringField(TEXT("actor_path"), ActorPath);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalKeys = KeysArr.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("keys"), MoveTemp(KeysArr))
+		.Num(TEXT("total"), TotalKeys)
+		.Str(TEXT("actor_path"), ActorPath)
+		.BuildSuccess(Request);
 }
 
 // ─── ai.bb.get_value ───────────────────────────────────────────────────────────────────────────
@@ -658,25 +660,24 @@ FMCPResponse Tool_GetValue(const FMCPRequest& Request)
 	const FString TypeName = AIBB_KeyTypeToFriendlyName(KeyType);
 	TSharedPtr<FJsonValue> TypedValue = AIBB_TypedValueToJson(*BB, KeyType, KeyFName);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("name"), KeyName);
-	Out->SetStringField(TEXT("type"), TypeName);
-	Out->SetStringField(TEXT("actor_path"), ActorPath);
-
 	// Detect unsupported subclasses: AIBB_TypedValueToJson returns FJsonValueNull when it didn't
 	// match any IsA<>() branch. Distinguish from a genuine null Object/Class value by checking
 	// the type name — if it still has the BlackboardKeyType_ prefix it's an unrecognised type.
 	const bool bUnsupportedType = TypeName.StartsWith(kAIBBTypePrefix, ESearchCase::CaseSensitive);
-	if (bUnsupportedType)
-	{
-		Out->SetField(TEXT("value"), MakeShared<FJsonValueNull>());
-		Out->SetStringField(TEXT("value_repr"), AIBB_DescribeValue(*BB, KeyType, KeyFName));
-	}
-	else
-	{
-		Out->SetField(TEXT("value"), TypedValue);
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("name"), KeyName)
+		.Str(TEXT("type"), TypeName)
+		.Str(TEXT("actor_path"), ActorPath)
+		.If(bUnsupportedType, [&](FMCPJsonBuilder& B)
+		{
+			B.Null(TEXT("value"))
+			 .Str(TEXT("value_repr"), AIBB_DescribeValue(*BB, KeyType, KeyFName));
+		})
+		.If(!bUnsupportedType, [&](FMCPJsonBuilder& B)
+		{
+			B.Field(TEXT("value"), TypedValue.ToSharedRef());
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── ai.bb.set_value ───────────────────────────────────────────────────────────────────────────
@@ -766,14 +767,17 @@ FMCPResponse Tool_SetValue(const FMCPRequest& Request)
 				*KeyName, *TypeName, *SetErr));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("set"), true);
-	Out->SetStringField(TEXT("name"), KeyName);
-	Out->SetStringField(TEXT("type"), TypeName);
-	Out->SetStringField(TEXT("actor_path"), ActorPath);
-	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
-	Out->SetStringField(TEXT("prior_value_repr"), PriorRepr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const TSharedRef<FJsonValue> PriorValueRef = PriorValue.IsValid()
+		? PriorValue.ToSharedRef()
+		: StaticCastSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+	return FMCPJsonBuilder()
+		.Bool(TEXT("set"), true)
+		.Str(TEXT("name"), KeyName)
+		.Str(TEXT("type"), TypeName)
+		.Str(TEXT("actor_path"), ActorPath)
+		.Field(TEXT("prior_value"), PriorValueRef)
+		.Str(TEXT("prior_value_repr"), PriorRepr)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

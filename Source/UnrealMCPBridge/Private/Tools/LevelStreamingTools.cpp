@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -336,12 +337,12 @@ FMCPResponse Tool_Add(const FMCPRequest& Request)
 		? PersistentWorld->PersistentLevel->GetOutermost()
 		: PersistentWorld->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField  (TEXT("added"),         true);
-	Out->SetStringField(TEXT("sublevel_path"), NewStreaming->GetWorldAssetPackageName());
-	Out->SetStringField(TEXT("package_name"),  NewStreaming->GetWorldAssetPackageName());
-	Out->SetStringField(TEXT("level_class"),   NewStreaming->GetClass()->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"),         true)
+		.Str(TEXT("sublevel_path"), NewStreaming->GetWorldAssetPackageName())
+		.Str(TEXT("package_name"),  NewStreaming->GetWorldAssetPackageName())
+		.Str(TEXT("level_class"),   NewStreaming->GetClass()->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── level_streaming.remove (mutator — PIE-guarded) ──────────────────────────────────────────

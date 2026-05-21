@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -620,9 +621,9 @@ FMCPResponse Tool_ListCinematics(const FMCPRequest& Request)
 		SeqArr.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("sequences"), SeqArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("sequences"), MoveTemp(SeqArr))
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.get_tracks ─────────────────────────────────────────────────────────────────────
@@ -734,11 +735,11 @@ FMCPResponse Tool_GetTracks(const FMCPRequest& Request)
 		SpawnArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("master_tracks"), MasterArr);
-	Out->SetArrayField(TEXT("possessables"),  PossArr);
-	Out->SetArrayField(TEXT("spawnables"),    SpawnArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("master_tracks"), MoveTemp(MasterArr))
+		.Arr(TEXT("possessables"),  MoveTemp(PossArr))
+		.Arr(TEXT("spawnables"),    MoveTemp(SpawnArr))
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.get_camera_cuts ────────────────────────────────────────────────────────────────
@@ -820,10 +821,10 @@ FMCPResponse Tool_GetCameraCuts(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("cuts"), CutsArr);
-	Out->SetObjectField(TEXT("frame_rate"), SEQ_BuildFrameRateJson(MovieScene->GetTickResolution()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("cuts"), MoveTemp(CutsArr))
+		.ObjectShared(TEXT("frame_rate"), SEQ_BuildFrameRateJson(MovieScene->GetTickResolution()))
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.get_keyframes ──────────────────────────────────────────────────────────────────
@@ -889,38 +890,33 @@ FMCPResponse Tool_GetKeyframes(const FMCPRequest& Request)
 	}
 
 	// Build response.
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("keys"), KeyArr);
+	const TRange<FFrameNumber> Range = Section->GetRange();
+	const bool bHasLower = Range.HasLowerBound();
+	const bool bHasUpper = Range.HasUpperBound();
 
-	// Section range echo (for caller convenience — saves a round-trip to get_tracks).
-	{
-		TSharedRef<FJsonObject> RangeObj = MakeShared<FJsonObject>();
-		const TRange<FFrameNumber> Range = Section->GetRange();
-		const bool bHasLower = Range.HasLowerBound();
-		const bool bHasUpper = Range.HasUpperBound();
-		RangeObj->SetBoolField(TEXT("has_lower"), bHasLower);
-		RangeObj->SetBoolField(TEXT("has_upper"), bHasUpper);
-		RangeObj->SetNumberField(TEXT("start"),
-			bHasLower ? static_cast<double>(Range.GetLowerBoundValue().Value) : 0.0);
-		RangeObj->SetNumberField(TEXT("end"),
-			bHasUpper ? static_cast<double>(Range.GetUpperBoundValue().Value) : 0.0);
-		Out->SetObjectField(TEXT("section_range"), RangeObj);
-	}
+	TArray<TSharedPtr<FJsonValue>> Types;
+	Types.Add(MakeShared<FJsonValueString>(TEXT("float")));
+	Types.Add(MakeShared<FJsonValueString>(TEXT("double")));
+	Types.Add(MakeShared<FJsonValueString>(TEXT("bool")));
+	Types.Add(MakeShared<FJsonValueString>(TEXT("integer")));
 
-	Out->SetObjectField(TEXT("frame_rate"), SEQ_BuildFrameRateJson(MovieScene->GetTickResolution()));
-
-	// Document which channel value-types ARE decoded (matches Phase 5 plan's "covers float/transform
-	// + sentinel for others" guidance).
-	{
-		TArray<TSharedPtr<FJsonValue>> Types;
-		Types.Add(MakeShared<FJsonValueString>(TEXT("float")));
-		Types.Add(MakeShared<FJsonValueString>(TEXT("double")));
-		Types.Add(MakeShared<FJsonValueString>(TEXT("bool")));
-		Types.Add(MakeShared<FJsonValueString>(TEXT("integer")));
-		Out->SetArrayField(TEXT("supported_types"), Types);
-	}
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("keys"), MoveTemp(KeyArr))
+		.Object(TEXT("section_range"), [&](FMCPJsonBuilder& R)
+		{
+			// Section range echo (for caller convenience — saves a round-trip to get_tracks).
+			R.Bool(TEXT("has_lower"), bHasLower)
+			 .Bool(TEXT("has_upper"), bHasUpper)
+			 .Num(TEXT("start"),
+				bHasLower ? static_cast<double>(Range.GetLowerBoundValue().Value) : 0.0)
+			 .Num(TEXT("end"),
+				bHasUpper ? static_cast<double>(Range.GetUpperBoundValue().Value) : 0.0);
+		})
+		.ObjectShared(TEXT("frame_rate"), SEQ_BuildFrameRateJson(MovieScene->GetTickResolution()))
+		// Document which channel value-types ARE decoded (matches Phase 5 plan's "covers float/transform
+		// + sentinel for others" guidance).
+		.Arr(TEXT("supported_types"), MoveTemp(Types))
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.get_current_time ───────────────────────────────────────────────────────────────
@@ -973,24 +969,17 @@ FMCPResponse Tool_GetCurrentTime(const FMCPRequest& Request)
 	const FFrameTime CurrentTick = Params.Frame;
 	const FFrameTime DisplayFrameTime = FFrameRate::TransformTime(CurrentTick, TickRes, DisplayRate);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("time_seconds"), TickRes.AsSeconds(CurrentTick));
-	Out->SetNumberField(TEXT("frame"),        DisplayFrameTime.FrameNumber.Value);
-	Out->SetNumberField(TEXT("tick"),         CurrentTick.FrameNumber.Value);
-	Out->SetObjectField(TEXT("frame_rate"), SEQ_BuildFrameRateJson(DisplayRate));
-	Out->SetObjectField(TEXT("tick_rate"),  SEQ_BuildFrameRateJson(TickRes));
-
-	if (UPackage* SeqPkg = CurrentSeq->GetOutermost())
-	{
-		Out->SetStringField(TEXT("sequence_path"), SeqPkg->GetName());
-	}
-	else
-	{
-		Out->SetField(TEXT("sequence_path"), MakeShared<FJsonValueNull>());
-	}
-
-	Out->SetStringField(TEXT("world"), FMCPWorldContext::IsPIEActive() ? TEXT("pie") : TEXT("editor"));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	UPackage* SeqPkg = CurrentSeq->GetOutermost();
+	return FMCPJsonBuilder()
+		.Num(TEXT("time_seconds"), TickRes.AsSeconds(CurrentTick))
+		.Num(TEXT("frame"),        DisplayFrameTime.FrameNumber.Value)
+		.Num(TEXT("tick"),         CurrentTick.FrameNumber.Value)
+		.ObjectShared(TEXT("frame_rate"), SEQ_BuildFrameRateJson(DisplayRate))
+		.ObjectShared(TEXT("tick_rate"),  SEQ_BuildFrameRateJson(TickRes))
+		.If(SeqPkg != nullptr,  [&](FMCPJsonBuilder& B) { B.Str(TEXT("sequence_path"), SeqPkg->GetName()); })
+		.If(SeqPkg == nullptr,  [&](FMCPJsonBuilder& B) { B.Null(TEXT("sequence_path")); })
+		.Str(TEXT("world"), FMCPWorldContext::IsPIEActive() ? TEXT("pie") : TEXT("editor"))
+		.BuildSuccess(Request);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1090,12 +1079,12 @@ FMCPResponse Tool_CreateSequence(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	Out->SetStringField(TEXT("method"), TEXT("manual_init"));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("asset_path"), NewAsset->GetPathName())
+		.Bool(TEXT("saved"), bSavedOk)
+		.Str(TEXT("method"), TEXT("manual_init"))
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.add_master_track ───────────────────────────────────────────────────────────────
@@ -1174,11 +1163,11 @@ FMCPResponse Tool_AddMasterTrack(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Seq->GetPackage());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("track_name"),  SEQ_GetTrackDisplayName(NewTrack));
-	Out->SetStringField(TEXT("track_class"), NewTrack->GetClass()->GetPathName());
-	Out->SetNumberField(TEXT("master_index"), MovieScene->GetTracks().Find(NewTrack));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("track_name"),  SEQ_GetTrackDisplayName(NewTrack))
+		.Str(TEXT("track_class"), NewTrack->GetClass()->GetPathName())
+		.Num(TEXT("master_index"), MovieScene->GetTracks().Find(NewTrack))
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.add_camera_cut ─────────────────────────────────────────────────────────────────
@@ -1282,17 +1271,17 @@ FMCPResponse Tool_AddCameraCut(const FMCPRequest& Request)
 
 	const int32 SectionIdx = CCT->GetAllSections().Find(Section);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("section_index"), SectionIdx);
-	Out->SetStringField(TEXT("section_class"), Section->GetClass()->GetPathName());
-	Out->SetNumberField(TEXT("start_frame"), StartFrameRaw);
-	Out->SetNumberField(TEXT("end_frame"),   EndFrameRaw);
-	if (CameraGuid.IsValid())
-	{
-		Out->SetStringField(TEXT("camera_actor_path"), CameraActorPath);
-		Out->SetStringField(TEXT("binding_guid"), CameraGuid.ToString(EGuidFormats::Digits));
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("section_index"), SectionIdx)
+		.Str(TEXT("section_class"), Section->GetClass()->GetPathName())
+		.Num(TEXT("start_frame"), StartFrameRaw)
+		.Num(TEXT("end_frame"),   EndFrameRaw)
+		.If(CameraGuid.IsValid(), [&](FMCPJsonBuilder& B)
+		{
+			B.Str(TEXT("camera_actor_path"), CameraActorPath)
+			 .Str(TEXT("binding_guid"), CameraGuid.ToString(EGuidFormats::Digits));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.add_keyframe ───────────────────────────────────────────────────────────────────
@@ -1437,11 +1426,11 @@ FMCPResponse Tool_AddKeyframe(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Seq->GetPackage());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("channel_type"), ChannelType);
-	Out->SetNumberField(TEXT("total_keys_after"), TotalKeysAfter);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("channel_type"), ChannelType)
+		.Num(TEXT("total_keys_after"), TotalKeysAfter)
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer.set_section_range ──────────────────────────────────────────────────────────────
@@ -1503,11 +1492,11 @@ FMCPResponse Tool_SetSectionRange(const FMCPRequest& Request)
 		return MakeShared<FJsonValueArray>(Arr);
 	};
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetField(TEXT("prior_range"), RangeToJson(Prior));
-	Out->SetField(TEXT("new_range"),
-		RangeToJson(TRange<FFrameNumber>(FFrameNumber(StartFrame), FFrameNumber(EndFrame))));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Field(TEXT("prior_range"), RangeToJson(Prior))
+		.Field(TEXT("new_range"),
+			RangeToJson(TRange<FFrameNumber>(FFrameNumber(StartFrame), FFrameNumber(EndFrame))))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

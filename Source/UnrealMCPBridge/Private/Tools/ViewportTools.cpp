@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -258,10 +259,10 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		Arr.Add(MakeShared<FJsonValueObject>(VPT_BuildViewportEntry(Idx, VC)));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("viewports"), Arr);
-	Out->SetNumberField(TEXT("count"), Arr.Num());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Int(TEXT("count"), Arr.Num())
+		.Arr(TEXT("viewports"), MoveTemp(Arr))
+		.BuildSuccess(Request);
 }
 
 // ─── viewport.get_camera ───────────────────────────────────────────────────────────────────────
@@ -363,11 +364,11 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 
 	TSharedRef<FJsonObject> NewObj = VPT_SnapshotCamera(VC);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("viewport_index"), VPT_FindViewportIndex(VC));
-	Out->SetObjectField(TEXT("prior"), PriorObj);
-	Out->SetObjectField(TEXT("new"),   NewObj);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Int(TEXT("viewport_index"), VPT_FindViewportIndex(VC))
+		.ObjectShared(TEXT("prior"), PriorObj)
+		.ObjectShared(TEXT("new"),   NewObj)
+		.BuildSuccess(Request);
 }
 
 // ─── viewport.focus_on_actor ───────────────────────────────────────────────────────────────────
@@ -446,12 +447,12 @@ FMCPResponse Tool_FocusOnActor(const FMCPRequest& Request)
 	VC->FocusViewportOnBox(Bounds, /*bInstant*/ true);
 	VC->Invalidate();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
-	Out->SetNumberField(TEXT("viewport_index"), VPT_FindViewportIndex(VC));
-	Out->SetArrayField(TEXT("new_camera_location"), VPT_VectorToArray(VC->GetViewLocation()));
-	Out->SetArrayField(TEXT("new_camera_rotation"), VPT_RotatorToArray(VC->GetViewRotation()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), Actor->GetPathName())
+		.Int(TEXT("viewport_index"), VPT_FindViewportIndex(VC))
+		.Arr(TEXT("new_camera_location"), VPT_VectorToArray(VC->GetViewLocation()))
+		.Arr(TEXT("new_camera_rotation"), VPT_RotatorToArray(VC->GetViewRotation()))
+		.BuildSuccess(Request);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

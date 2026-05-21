@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -217,13 +218,12 @@ FMCPResponse Tool_AddPossessable(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Seq->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("possessable_guid"),
-		PossessableGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetStringField(TEXT("label"),        FinalLabel);
-	Out->SetStringField(TEXT("object_class"), Actor->GetClass()->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("possessable_guid"), PossessableGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.Str(TEXT("label"),        FinalLabel)
+		.Str(TEXT("object_class"), Actor->GetClass()->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer_ext.add_track ──────────────────────────────────────────────────────────────────
@@ -321,14 +321,12 @@ FMCPResponse Tool_AddTrack(const FMCPRequest& Request)
 		TrackIndexInBinding = Binding->GetTracks().Find(NewTrack);
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("track_class_path"), NewTrack->GetClass()->GetPathName());
-	Out->SetStringField(TEXT("track_guid"),
-		NewTrack->GetSignature().ToString(EGuidFormats::DigitsWithHyphens));
-	Out->SetStringField(TEXT("binding_guid"),
-		BindingGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	Out->SetNumberField(TEXT("track_index"), TrackIndexInBinding);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("track_class_path"), NewTrack->GetClass()->GetPathName())
+		.Str(TEXT("track_guid"), NewTrack->GetSignature().ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("binding_guid"), BindingGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Num(TEXT("track_index"), TrackIndexInBinding)
+		.BuildSuccess(Request);
 }
 
 // ─── sequencer_ext.add_section ────────────────────────────────────────────────────────────────
@@ -458,12 +456,12 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 
 	const int32 SectionIndex = Track->GetAllSections().Find(Section);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("section_index"), SectionIndex);
-	Out->SetStringField(TEXT("section_class"), Section->GetClass()->GetPathName());
-	Out->SetNumberField(TEXT("start_frame"),   StartFrame);
-	Out->SetNumberField(TEXT("end_frame"),     EndFrame);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("section_index"), SectionIndex)
+		.Str(TEXT("section_class"), Section->GetClass()->GetPathName())
+		.Num(TEXT("start_frame"),   StartFrame)
+		.Num(TEXT("end_frame"),     EndFrame)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

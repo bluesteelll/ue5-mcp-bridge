@@ -3,6 +3,7 @@
 #include "CollisionTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 
@@ -201,10 +202,10 @@ FMCPResponse Tool_ListChannels(const FMCPRequest& Request)
 		}
 	});
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("trace_channels"), TraceArr);
-	Out->SetArrayField(TEXT("object_channels"), ObjectArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("trace_channels"), MoveTemp(TraceArr))
+		.Arr(TEXT("object_channels"), MoveTemp(ObjectArr))
+		.BuildSuccess(Request);
 }
 
 // ─── collision.list_profiles ────────────────────────────────────────────────────────────────────
@@ -252,9 +253,9 @@ FMCPResponse Tool_ListProfiles(const FMCPRequest& Request)
 		Arr.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("profiles"), Arr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("profiles"), MoveTemp(Arr))
+		.BuildSuccess(Request);
 }
 
 // ─── collision.get_profile ──────────────────────────────────────────────────────────────────────
@@ -297,18 +298,17 @@ FMCPResponse Tool_GetProfile(const FMCPRequest& Request)
 		ResponsesObj->SetStringField(DisplayName.ToString(), COLL_ResponseToString(Resp));
 	});
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("name"), ProfileName.ToString());
-	Out->SetStringField(TEXT("collision_enabled"),
-		COLL_CollisionEnabledToString(Tpl.CollisionEnabled.GetValue()));
-	Out->SetStringField(TEXT("object_type"), Tpl.ObjectTypeName.ToString());
+	return FMCPJsonBuilder()
+		.Str(TEXT("name"), ProfileName.ToString())
+		.Str(TEXT("collision_enabled"), COLL_CollisionEnabledToString(Tpl.CollisionEnabled.GetValue()))
+		.Str(TEXT("object_type"), Tpl.ObjectTypeName.ToString())
 #if WITH_EDITORONLY_DATA
-	Out->SetStringField(TEXT("helper_description"), Tpl.HelpMessage);
+		.Str(TEXT("helper_description"), Tpl.HelpMessage)
 #else
-	Out->SetStringField(TEXT("helper_description"), FString());
+		.Str(TEXT("helper_description"), FString())
 #endif
-	Out->SetObjectField(TEXT("response_to_channels"), ResponsesObj);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		.ObjectShared(TEXT("response_to_channels"), ResponsesObj)
+		.BuildSuccess(Request);
 }
 
 // ─── collision.set_profile_response ─────────────────────────────────────────────────────────────
@@ -435,11 +435,11 @@ FMCPResponse Tool_SetProfileResponse(const FMCPRequest& Request)
 				"or source-control check-out"), *ProfileNameStr, *ChannelNameStr));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("updated"), true);
-	Out->SetStringField(TEXT("prior_response"), COLL_ResponseToString(PriorResponse));
-	Out->SetBoolField(TEXT("persisted_to_ini"), bPersisted);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("updated"), true)
+		.Str(TEXT("prior_response"), COLL_ResponseToString(PriorResponse))
+		.Bool(TEXT("persisted_to_ini"), bPersisted)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

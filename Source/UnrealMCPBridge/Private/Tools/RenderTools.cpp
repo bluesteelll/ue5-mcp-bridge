@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -187,11 +188,12 @@ FMCPResponse Tool_ListShowFlags(const FMCPRequest& Request)
 
 	const int32 VPIdx = GEditor ? GEditor->GetLevelViewportClients().IndexOfByKey(VC) : INDEX_NONE;
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("viewport_index"), VPIdx);
-	Out->SetNumberField(TEXT("count"), Arr.Num());
-	Out->SetArrayField(TEXT("flags"), Arr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 ArrNum = Arr.Num();
+	return FMCPJsonBuilder()
+		.Num(TEXT("viewport_index"), VPIdx)
+		.Num(TEXT("count"), ArrNum)
+		.Arr(TEXT("flags"), MoveTemp(Arr))
+		.BuildSuccess(Request);
 }
 
 // ─── render.set_show_flag ──────────────────────────────────────────────────────────────────────
@@ -244,12 +246,12 @@ FMCPResponse Tool_SetShowFlag(const FMCPRequest& Request)
 
 	const int32 VPIdx = GEditor->GetLevelViewportClients().IndexOfByKey(VC);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("viewport_index"), VPIdx);
-	Out->SetStringField(TEXT("flag_name"), FlagName);
-	Out->SetBoolField(TEXT("prior_enabled"), bPrior);
-	Out->SetBoolField(TEXT("new_enabled"), bNew);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("viewport_index"), VPIdx)
+		.Str(TEXT("flag_name"), FlagName)
+		.Bool(TEXT("prior_enabled"), bPrior)
+		.Bool(TEXT("new_enabled"), bNew)
+		.BuildSuccess(Request);
 }
 
 // ─── render.set_engine_stat ────────────────────────────────────────────────────────────────────
@@ -325,11 +327,11 @@ FMCPResponse Tool_SetEngineStat(const FMCPRequest& Request)
 	default: break;
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("stat_name"), StatName);
-	Out->SetBoolField(TEXT("enabled"), bEnabled);
-	Out->SetStringField(TEXT("world_kind"), WorldKind);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("stat_name"), StatName)
+		.Bool(TEXT("enabled"), bEnabled)
+		.Str(TEXT("world_kind"), WorldKind)
+		.BuildSuccess(Request);
 }
 
 // ─── render.set_post_process_volume_property ───────────────────────────────────────────────────

@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPathSandbox.h"
@@ -597,10 +598,10 @@ FMCPResponse Tool_Status(const FMCPRequest& Request)
 			SCT_BuildStateJson(State->GetFilename(), State.Get())));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("files"), FilesArr);
-	Out->SetStringField(TEXT("provider"), Provider.GetName().ToString());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("files"), MoveTemp(FilesArr))
+		.Str(TEXT("provider"), Provider.GetName().ToString())
+		.BuildSuccess(Request);
 }
 
 // ─── sc.checkout ──────────────────────────────────────────────────────────────────────────────
@@ -697,12 +698,12 @@ FMCPResponse Tool_Checkout(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("checked_out"), CheckedOutArr);
-	Out->SetArrayField(TEXT("failed"),      FailedArr);
-	Out->SetStringField(TEXT("provider"),   Provider.GetName().ToString());
-	Out->SetBoolField(TEXT("batch_ok"),     ExecResult == ECommandResult::Succeeded);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("checked_out"), MoveTemp(CheckedOutArr))
+		.Arr(TEXT("failed"),      MoveTemp(FailedArr))
+		.Str(TEXT("provider"),    Provider.GetName().ToString())
+		.Bool(TEXT("batch_ok"),   ExecResult == ECommandResult::Succeeded)
+		.BuildSuccess(Request);
 }
 
 // ─── sc.diff ──────────────────────────────────────────────────────────────────────────────────
@@ -785,23 +786,8 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 			FString::Printf(TEXT("revision_b load failed: %s"), *LoadErr));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("bytes_a"), static_cast<double>(BytesA.Num()));
-	Out->SetNumberField(TEXT("bytes_b"), static_cast<double>(BytesB.Num()));
-	Out->SetStringField(TEXT("path"), AbsPath);
-	Out->SetStringField(TEXT("revision_a"), RevA);
-	Out->SetStringField(TEXT("revision_b"), RevB);
-
 	const bool bTextual = SCT_LooksTextual(BytesA) && SCT_LooksTextual(BytesB);
-	if (bTextual)
-	{
-		const FString TextA = SCT_BytesToString(BytesA);
-		const FString TextB = SCT_BytesToString(BytesB);
-		const FString Diff = SCT_BuildUnifiedDiff(TextA, TextB);
-		Out->SetBoolField(TEXT("is_binary"), false);
-		Out->SetStringField(TEXT("diff_text"), Diff);
-	}
-	else
+	if (!bTextual)
 	{
 		if (BytesA.Num() > kSCTBinaryDiffMaxBytesPerSide ||
 			BytesB.Num() > kSCTBinaryDiffMaxBytesPerSide)
@@ -812,13 +798,27 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 						 "Use cb.export for large binaries."),
 					kSCTBinaryDiffMaxBytesPerSide, BytesA.Num(), BytesB.Num()));
 		}
-		Out->SetBoolField(TEXT("is_binary"), true);
-		Out->SetStringField(TEXT("base64_a"),
-			FBase64::Encode(BytesA.GetData(), BytesA.Num()));
-		Out->SetStringField(TEXT("base64_b"),
-			FBase64::Encode(BytesB.GetData(), BytesB.Num()));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+
+	return FMCPJsonBuilder()
+		.Num(TEXT("bytes_a"), static_cast<double>(BytesA.Num()))
+		.Num(TEXT("bytes_b"), static_cast<double>(BytesB.Num()))
+		.Str(TEXT("path"), AbsPath)
+		.Str(TEXT("revision_a"), RevA)
+		.Str(TEXT("revision_b"), RevB)
+		.Bool(TEXT("is_binary"), !bTextual)
+		.If(bTextual, [&](FMCPJsonBuilder& B)
+		{
+			const FString TextA = SCT_BytesToString(BytesA);
+			const FString TextB = SCT_BytesToString(BytesB);
+			B.Str(TEXT("diff_text"), SCT_BuildUnifiedDiff(TextA, TextB));
+		})
+		.If(!bTextual, [&](FMCPJsonBuilder& B)
+		{
+			B.Str(TEXT("base64_a"), FBase64::Encode(BytesA.GetData(), BytesA.Num()))
+			 .Str(TEXT("base64_b"), FBase64::Encode(BytesB.GetData(), BytesB.Num()));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── sc.diff_binary ──────────────────────────────────────────────────────────────────────────
@@ -901,18 +901,16 @@ FMCPResponse Tool_DiffBinary(const FMCPRequest& Request)
 				kSCTBinaryDiffMaxBytesPerSide, BytesA.Num(), BytesB.Num()));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("is_binary"), true);
-	Out->SetStringField(TEXT("path"), AbsPath);
-	Out->SetStringField(TEXT("revision_a"), RevA);
-	Out->SetStringField(TEXT("revision_b"), RevB);
-	Out->SetNumberField(TEXT("bytes_a"), static_cast<double>(BytesA.Num()));
-	Out->SetNumberField(TEXT("bytes_b"), static_cast<double>(BytesB.Num()));
-	Out->SetStringField(TEXT("base64_a"),
-		FBase64::Encode(BytesA.GetData(), BytesA.Num()));
-	Out->SetStringField(TEXT("base64_b"),
-		FBase64::Encode(BytesB.GetData(), BytesB.Num()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("is_binary"), true)
+		.Str(TEXT("path"), AbsPath)
+		.Str(TEXT("revision_a"), RevA)
+		.Str(TEXT("revision_b"), RevB)
+		.Num(TEXT("bytes_a"), static_cast<double>(BytesA.Num()))
+		.Num(TEXT("bytes_b"), static_cast<double>(BytesB.Num()))
+		.Str(TEXT("base64_a"), FBase64::Encode(BytesA.GetData(), BytesA.Num()))
+		.Str(TEXT("base64_b"), FBase64::Encode(BytesB.GetData(), BytesB.Num()))
+		.BuildSuccess(Request);
 }
 
 // ─── sc.revert ────────────────────────────────────────────────────────────────────────────────
@@ -1011,12 +1009,12 @@ FMCPResponse Tool_Revert(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("reverted"),  RevertedArr);
-	Out->SetArrayField(TEXT("failed"),    FailedArr);
-	Out->SetStringField(TEXT("provider"), Provider.GetName().ToString());
-	Out->SetBoolField(TEXT("batch_ok"),   ExecResult == ECommandResult::Succeeded);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("reverted"),  MoveTemp(RevertedArr))
+		.Arr(TEXT("failed"),    MoveTemp(FailedArr))
+		.Str(TEXT("provider"),  Provider.GetName().ToString())
+		.Bool(TEXT("batch_ok"), ExecResult == ECommandResult::Succeeded)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

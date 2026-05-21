@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -122,12 +123,12 @@ FMCPResponse Tool_CreateSoundCue(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), Cue->GetPathName());
-	Out->SetBoolField(TEXT("has_source_wave"), SourceWave != nullptr);
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"),         true)
+		.Str (TEXT("asset_path"),      Cue->GetPathName())
+		.Bool(TEXT("has_source_wave"), SourceWave != nullptr)
+		.Bool(TEXT("saved"),           bSavedOk)
+		.BuildSuccess(Request);
 }
 
 // ─── audio.set_attenuation ────────────────────────────────────────────────────────────────────
@@ -169,13 +170,12 @@ FMCPResponse Tool_SetAttenuation(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Sound->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("sound_class"), Sound->GetClass()->GetPathName());
-	Out->SetStringField(TEXT("prior_attenuation"), PriorPath);
-	Out->SetStringField(TEXT("new_attenuation"),
-		Attenuation ? Attenuation->GetPathName() : FString());
-	Out->SetBoolField(TEXT("cleared"), Attenuation == nullptr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str (TEXT("sound_class"),       Sound->GetClass()->GetPathName())
+		.Str (TEXT("prior_attenuation"), PriorPath)
+		.Str (TEXT("new_attenuation"),   Attenuation ? Attenuation->GetPathName() : FString())
+		.Bool(TEXT("cleared"),           Attenuation == nullptr)
+		.BuildSuccess(Request);
 }
 
 // ─── audio.list_mix_classes ───────────────────────────────────────────────────────────────────
@@ -219,10 +219,10 @@ FMCPResponse Tool_ListMixClasses(const FMCPRequest& Request)
 		return Result;
 	};
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("sound_classes"), QueryClass(USoundClass::StaticClass()));
-	Out->SetArrayField(TEXT("sound_mixes"),   QueryClass(USoundMix::StaticClass()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("sound_classes"), QueryClass(USoundClass::StaticClass()))
+		.Arr(TEXT("sound_mixes"),   QueryClass(USoundMix::StaticClass()))
+		.BuildSuccess(Request);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -324,12 +325,14 @@ FMCPResponse Tool_ThumbnailBatchGenerate(const FMCPRequest& Request)
 		FilesOut.Add(MakeShared<FJsonValueObject>(Ok));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("generated"), FilesOut.Num());
-	Out->SetNumberField(TEXT("failed"), FailuresOut.Num());
-	Out->SetArrayField(TEXT("files"), FilesOut);
-	Out->SetArrayField(TEXT("failures"), FailuresOut);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 GeneratedCount = FilesOut.Num();
+	const int32 FailedCount = FailuresOut.Num();
+	return FMCPJsonBuilder()
+		.Num(TEXT("generated"), GeneratedCount)
+		.Num(TEXT("failed"), FailedCount)
+		.Arr(TEXT("files"), MoveTemp(FilesOut))
+		.Arr(TEXT("failures"), MoveTemp(FailuresOut))
+		.BuildSuccess(Request);
 }
 
 // ─── thumbnail.clear_cache ──────────────────────────────────────────────────────────────────────
@@ -446,10 +449,10 @@ FMCPResponse Tool_ThumbnailClearCache(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("cleared_count"), ClearedCount);
-	Out->SetNumberField(TEXT("regenerated_count"), RegeneratedCount);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("cleared_count"), ClearedCount)
+		.Num(TEXT("regenerated_count"), RegeneratedCount)
+		.BuildSuccess(Request);
 }
 
 // ─── thumbnail.set_custom ───────────────────────────────────────────────────────────────────────
@@ -577,13 +580,13 @@ FMCPResponse Tool_ThumbnailSetCustom(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Pkg);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("set"), true);
 	TArray<TSharedPtr<FJsonValue>> ResolutionArr;
 	ResolutionArr.Add(MakeShared<FJsonValueNumber>(Width));
 	ResolutionArr.Add(MakeShared<FJsonValueNumber>(Height));
-	Out->SetArrayField(TEXT("image_resolution"), ResolutionArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("set"), true)
+		.Arr(TEXT("image_resolution"), MoveTemp(ResolutionArr))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ───────────────────────────────────────────────────────────────────────────────

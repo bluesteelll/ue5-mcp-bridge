@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -176,10 +177,10 @@ FMCPResponse Tool_CreateFolder(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), bCreated);
-	Out->SetStringField(TEXT("normalized_path"), NormalizedPath);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), bCreated)
+		.Str(TEXT("normalized_path"), NormalizedPath)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.rename ───────────────────────────────────────────────────────────────────────────────
@@ -223,10 +224,10 @@ FMCPResponse Tool_Rename(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("success"), true);
-	Out->SetStringField(TEXT("canonical_new_path"), NewNormalized);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("success"), true)
+		.Str(TEXT("canonical_new_path"), NewNormalized)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.save ─────────────────────────────────────────────────────────────────────────────────
@@ -254,9 +255,9 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	// Saves don't participate in undo, so no FScopedTransaction.
 	const bool bSaved = Subsys->SaveAsset(NormalizedPath, bOnlyIfDirty);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("saved"), bSaved);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("saved"), bSaved)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.move ─────────────────────────────────────────────────────────────────────────────────
@@ -374,10 +375,10 @@ FMCPResponse Tool_Move(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("moved"), Moved);
-	Out->SetArrayField(TEXT("failed"), Failed);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("moved"), MoveTemp(Moved))
+		.Arr(TEXT("failed"), MoveTemp(Failed))
+		.BuildSuccess(Request);
 }
 
 // ─── cb.duplicate ────────────────────────────────────────────────────────────────────────────
@@ -417,9 +418,9 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("new_path"), Dest);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("new_path"), Dest)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.delete ───────────────────────────────────────────────────────────────────────────────
@@ -534,10 +535,10 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 				*NormalizedPath));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("deleted"), bDeleted);
-	Out->SetBoolField(TEXT("redirector_left"), bRedirectorLeft);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("deleted"), bDeleted)
+		.Bool(TEXT("redirector_left"), bRedirectorLeft)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.fix_redirectors ──────────────────────────────────────────────────────────────────────
@@ -573,10 +574,10 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	if (RedirectorData.Num() == 0)
 	{
 		// Idempotent: zero work to do is success, not error.
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetNumberField(TEXT("fixed_count"), 0);
-		Out->SetNumberField(TEXT("removed_count"), 0);
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Num(TEXT("fixed_count"), 0)
+			.Num(TEXT("removed_count"), 0)
+			.BuildSuccess(Request);
 	}
 
 	// FixupReferencers needs the redirector objects loaded. Loading is per-redirector and
@@ -613,13 +614,13 @@ FMCPResponse Tool_FixRedirectors(const FMCPRequest& Request)
 	IAR.GetAssets(Filter, PostData);
 	const int32 RemovedCount = FMath::Max(0, PreCount - PostData.Num());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	// `fixed_count` is referencers patched — FixupReferencers doesn't return a number directly,
 	// so we use redirectors-removed as the closest signal. Both fields in the schema are present;
 	// removed_count is authoritative, fixed_count is informational.
-	Out->SetNumberField(TEXT("fixed_count"), RemovedCount);
-	Out->SetNumberField(TEXT("removed_count"), RemovedCount);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("fixed_count"), RemovedCount)
+		.Num(TEXT("removed_count"), RemovedCount)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.list_folders (Lane A post-hotfix — body remains Lane-B-safe for Phase 3+ revival) ──
@@ -666,9 +667,9 @@ FMCPResponse Tool_ListFolders(const FMCPRequest& Request)
 		Items.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("folders"), Items);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("folders"), MoveTemp(Items))
+		.BuildSuccess(Request);
 }
 
 // ─── cb.import ───────────────────────────────────────────────────────────────────────────────
@@ -758,9 +759,9 @@ FMCPResponse Tool_Import(const FMCPRequest& Request)
 		ImportedPath = Task->ImportedObjectPaths[0];
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("asset_path"), ImportedPath);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("asset_path"), ImportedPath)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.export ───────────────────────────────────────────────────────────────────────────────
@@ -856,10 +857,10 @@ FMCPResponse Tool_Export(const FMCPRequest& Request)
 
 	const int64 Bytes = IFileManager::Get().FileSize(*AbsDest);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("exported"), true);
-	Out->SetNumberField(TEXT("bytes"), static_cast<double>(Bytes > 0 ? Bytes : 0));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("exported"), true)
+		.Num(TEXT("bytes"), static_cast<double>(Bytes > 0 ? Bytes : 0))
+		.BuildSuccess(Request);
 }
 
 // ─── cb.save_all_dirty (async, inline lambda body per D5/D10) ───────────────────────────────
@@ -930,9 +931,9 @@ FMCPResponse Tool_SaveAllDirty(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── cb.reimport (refresh asset from source) ─────────────────────────────────────────────────
@@ -1018,11 +1019,11 @@ FMCPResponse Tool_Reimport(const FMCPRequest& Request)
 				"(no factory accepted the reimport; check editor log)"), *NormalizedPath));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("reimported"), true);
-	Out->SetStringField(TEXT("asset_path"), NormalizedPath);
-	Out->SetStringField(TEXT("source_file"), SourceFileOverride);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("reimported"), true)
+		.Str(TEXT("asset_path"), NormalizedPath)
+		.Str(TEXT("source_file"), SourceFileOverride)
+		.BuildSuccess(Request);
 }
 
 // ─── cb.list_supported_formats (discover factories + supported file extensions) ─────────────
@@ -1109,10 +1110,10 @@ FMCPResponse Tool_ListSupportedFormats(const FMCPRequest& Request)
 		Out.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-	ResultObj->SetArrayField(TEXT("factories"), Out);
-	ResultObj->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-	return FMCPToolHelpers::MakeSuccessObj(Request, ResultObj);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("factories"), MoveTemp(Out))
+		.Num(TEXT("total_known"), static_cast<double>(TotalKnown))
+		.BuildSuccess(Request);
 }
 
 // ─── cb.bulk_import (async, inline lambda body per D5/D10) ──────────────────────────────────
@@ -1249,11 +1250,11 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 			const double DurationMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
 
 			// Use a distinct field name "imported" per the spec.
-			TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-			Obj->SetArrayField(TEXT("imported"), Imported);
-			Obj->SetArrayField(TEXT("failed"), Failed);
-			Obj->SetNumberField(TEXT("duration_ms"), DurationMs);
-			return MakeShared<FJsonValueObject>(Obj);
+			return MakeShared<FJsonValueObject>(FMCPJsonBuilder()
+				.Arr(TEXT("imported"), MoveTemp(Imported))
+				.Arr(TEXT("failed"), MoveTemp(Failed))
+				.Num(TEXT("duration_ms"), DurationMs)
+				.ToShared());
 		},
 		/*bGameThreadRequired*/ true);
 
@@ -1263,9 +1264,9 @@ FMCPResponse Tool_BulkImport(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

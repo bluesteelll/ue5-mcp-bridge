@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -216,9 +217,9 @@ FMCPResponse Tool_FindUnusedInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── asset._size_report_internal (HOTFIX 2 — async job pattern; sync handler is Lane B) ─────
@@ -324,9 +325,9 @@ FMCPResponse Tool_SizeReportInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── asset._batch_metadata_internal (Lane B — sync only validates strings + submits job) ───
@@ -425,9 +426,9 @@ FMCPResponse Tool_BatchMetadataInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── asset._find_broken_references_internal (Hotfix 3 — Lane B, async-job pattern) ───────────
@@ -539,9 +540,9 @@ FMCPResponse Tool_FindBrokenReferencesInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── asset._find_duplicates_by_name_internal (Hotfix 3 — Lane B, async-job pattern) ──────────
@@ -677,9 +678,9 @@ FMCPResponse Tool_FindDuplicatesByNameInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -324,13 +325,13 @@ FMCPResponse Tool_SetMaterialSlot(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Mesh->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("slot_index"),     SlotIndex);
-	Out->SetStringField(TEXT("slot_name"),      SlotName);
-	Out->SetStringField(TEXT("prior_material"), PriorMaterialPath);
-	Out->SetStringField(TEXT("new_material"),   NewMat->GetPathName());
-	Out->SetNumberField(TEXT("slot_count"),     SlotCount);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("slot_index"),     SlotIndex)
+		.Str(TEXT("slot_name"),      SlotName)
+		.Str(TEXT("prior_material"), PriorMaterialPath)
+		.Str(TEXT("new_material"),   NewMat->GetPathName())
+		.Num(TEXT("slot_count"),     SlotCount)
+		.BuildSuccess(Request);
 }
 
 // ─── mesh.duplicate ───────────────────────────────────────────────────────────────────────────
@@ -412,12 +413,12 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), NewMesh->GetPathName());
-	Out->SetStringField(TEXT("source_path"), Source->GetPathName());
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("asset_path"), NewMesh->GetPathName())
+		.Str(TEXT("source_path"), Source->GetPathName())
+		.Bool(TEXT("saved"), bSavedOk)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

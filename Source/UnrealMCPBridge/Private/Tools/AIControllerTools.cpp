@@ -3,6 +3,7 @@
 #include "AIControllerTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -286,9 +287,9 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		ControllersArr.Add(MakeShared<FJsonValueObject>(AICTRL_BuildListEntry(AIC)));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("controllers"), ControllersArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("controllers"), MoveTemp(ControllersArr))
+		.BuildSuccess(Request);
 }
 
 // ─── ai.controller.get_state ─────────────────────────────────────────────────────────────────────

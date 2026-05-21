@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -193,13 +194,13 @@ FMCPResponse Tool_ValidateAsset(const FMCPRequest& Request)
 	const EDataValidationResult Result = DV_ValidateOne(VS, Asset, Errors, Warnings);
 	const int32 ValidatorsRun = DV_CountEnabledValidators(VS);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("asset_path"), Asset->GetPathName());
-	Out->SetStringField(TEXT("result"), DV_ResultToString(Result));
-	Out->SetArrayField(TEXT("errors"), Errors);
-	Out->SetArrayField(TEXT("warnings"), Warnings);
-	Out->SetNumberField(TEXT("validators_run"), ValidatorsRun);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("asset_path"), Asset->GetPathName())
+		.Str(TEXT("result"), DV_ResultToString(Result))
+		.Arr(TEXT("errors"), MoveTemp(Errors))
+		.Arr(TEXT("warnings"), MoveTemp(Warnings))
+		.Num(TEXT("validators_run"), ValidatorsRun)
+		.BuildSuccess(Request);
 }
 
 // ─── data_validation.validate_path ────────────────────────────────────────────────────────────
@@ -333,17 +334,17 @@ FMCPResponse Tool_ValidatePath(const FMCPRequest& Request)
 
 	const int32 ValidatorsRun = DV_CountEnabledValidators(VS);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("path_prefix"), Normalised);
-	Out->SetBoolField(TEXT("recursive"), bRecursive);
-	Out->SetNumberField(TEXT("total_validated"), EffectiveMax);
-	Out->SetNumberField(TEXT("total_known"), Assets.Num());
-	Out->SetNumberField(TEXT("valid_count"), ValidCount);
-	Out->SetNumberField(TEXT("invalid_count"), InvalidCount);
-	Out->SetNumberField(TEXT("not_validated_count"), NotValidatedCount);
-	Out->SetNumberField(TEXT("validators_run"), ValidatorsRun);
-	Out->SetArrayField(TEXT("failures"), Failures);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("path_prefix"), Normalised)
+		.Bool(TEXT("recursive"), bRecursive)
+		.Num(TEXT("total_validated"), EffectiveMax)
+		.Num(TEXT("total_known"), Assets.Num())
+		.Num(TEXT("valid_count"), ValidCount)
+		.Num(TEXT("invalid_count"), InvalidCount)
+		.Num(TEXT("not_validated_count"), NotValidatedCount)
+		.Num(TEXT("validators_run"), ValidatorsRun)
+		.Arr(TEXT("failures"), MoveTemp(Failures))
+		.BuildSuccess(Request);
 }
 
 // ─── data_validation.list_validators ──────────────────────────────────────────────────────────
@@ -418,10 +419,11 @@ FMCPResponse Tool_ListValidators(const FMCPRequest& Request)
 		return APath < BPath;
 	});
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("validators"), ValidatorArr);
-	Out->SetNumberField(TEXT("total"), ValidatorArr.Num());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 ValidatorCount = ValidatorArr.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("validators"), MoveTemp(ValidatorArr))
+		.Num(TEXT("total"), ValidatorCount)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

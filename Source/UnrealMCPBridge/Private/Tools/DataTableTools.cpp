@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -409,14 +410,14 @@ FMCPResponse Tool_SetRow(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(DT->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("written"), true);
-	Out->SetBoolField(TEXT("was_created"), bWasCreated);
-	Out->SetNumberField(TEXT("fields_updated"), FieldsUpdated);
-	Out->SetNumberField(TEXT("fields_skipped"), FieldsSkipped);
-	Out->SetStringField(TEXT("row_name"), RowNameStr);
-	Out->SetStringField(TEXT("row_struct_path"), RowStruct->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("written"), true)
+		.Bool(TEXT("was_created"), bWasCreated)
+		.Num(TEXT("fields_updated"), FieldsUpdated)
+		.Num(TEXT("fields_skipped"), FieldsSkipped)
+		.Str(TEXT("row_name"), RowNameStr)
+		.Str(TEXT("row_struct_path"), RowStruct->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── data_table.delete_row ────────────────────────────────────────────────────────────────────
@@ -450,12 +451,12 @@ FMCPResponse Tool_DeleteRow(const FMCPRequest& Request)
 	{
 		// Idempotent no-op — abort the transaction so undo history isn't littered with empty ops.
 		Scope.Abort();
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("deleted"), false);
-		Out->SetBoolField(TEXT("row_existed"), false);
-		Out->SetStringField(TEXT("row_name"), RowNameStr);
-		Out->SetNumberField(TEXT("remaining_row_count"), DT->GetRowMap().Num());
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("deleted"), false)
+			.Bool(TEXT("row_existed"), false)
+			.Str(TEXT("row_name"), RowNameStr)
+			.Num(TEXT("remaining_row_count"), DT->GetRowMap().Num())
+			.BuildSuccess(Request);
 	}
 
 	// FDataTableEditorUtils::RemoveRow handles its own nested FScopedTransaction +
@@ -470,12 +471,12 @@ FMCPResponse Tool_DeleteRow(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(DT->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("deleted"), bRemoved);
-	Out->SetBoolField(TEXT("row_existed"), true);
-	Out->SetStringField(TEXT("row_name"), RowNameStr);
-	Out->SetNumberField(TEXT("remaining_row_count"), DT->GetRowMap().Num());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("deleted"), bRemoved)
+		.Bool(TEXT("row_existed"), true)
+		.Str(TEXT("row_name"), RowNameStr)
+		.Num(TEXT("remaining_row_count"), DT->GetRowMap().Num())
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

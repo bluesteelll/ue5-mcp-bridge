@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -620,11 +621,11 @@ FMCPResponse Tool_ListParameters(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("user_params"),    UserArr);
-	Out->SetArrayField(TEXT("system_params"),  SystemArr);
-	Out->SetArrayField(TEXT("emitter_params"), EmitterArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("user_params"),    MoveTemp(UserArr))
+		.Arr(TEXT("system_params"),  MoveTemp(SystemArr))
+		.Arr(TEXT("emitter_params"), MoveTemp(EmitterArr))
+		.BuildSuccess(Request);
 }
 
 // ─── niagara.set_user_param ───────────────────────────────────────────────────────────────────
@@ -716,13 +717,13 @@ FMCPResponse Tool_SetUserParam(const FMCPRequest& Request)
 	// Decode-after-write so the response carries the canonical "as the store sees it" value.
 	TSharedPtr<FJsonValue> NewValue = NIA_DecodeUserParamDefault(UserStore, Var);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("changed"), true);
-	Out->SetStringField(TEXT("name"), Var.GetName().ToString());
-	Out->SetStringField(TEXT("type"), Var.GetType().GetName());
-	Out->SetField(TEXT("prior"), Prior);
-	Out->SetField(TEXT("new"),   NewValue);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("changed"), true)
+		.Str(TEXT("name"), Var.GetName().ToString())
+		.Str(TEXT("type"), Var.GetType().GetName())
+		.Field(TEXT("prior"), Prior.ToSharedRef())
+		.Field(TEXT("new"),   NewValue.ToSharedRef())
+		.BuildSuccess(Request);
 }
 
 // ─── niagara.create_emitter ───────────────────────────────────────────────────────────────────
@@ -804,12 +805,12 @@ FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	Out->SetBoolField(TEXT("default_modules"), bAddDefaultModules);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("asset_path"), NewAsset->GetPathName())
+		.Bool(TEXT("saved"), bSavedOk)
+		.Bool(TEXT("default_modules"), bAddDefaultModules)
+		.BuildSuccess(Request);
 }
 
 // ─── niagara.set_emitter_enabled ──────────────────────────────────────────────────────────────
@@ -926,13 +927,13 @@ FMCPResponse Tool_SetEmitterEnabled(const FMCPRequest& Request)
 	const FName EmitterFName = Handles[EmitterIndex].GetName();
 	TargetComp->SetEmitterEnable(EmitterFName, bEnabled);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
-	Out->SetStringField(TEXT("component_name"), TargetComp->GetName());
-	Out->SetStringField(TEXT("emitter_name"), EmitterFName.ToString());
-	Out->SetNumberField(TEXT("emitter_index"), static_cast<double>(EmitterIndex));
-	Out->SetBoolField(TEXT("enabled"), bEnabled);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), Actor->GetPathName())
+		.Str(TEXT("component_name"), TargetComp->GetName())
+		.Str(TEXT("emitter_name"), EmitterFName.ToString())
+		.Num(TEXT("emitter_index"), static_cast<double>(EmitterIndex))
+		.Bool(TEXT("enabled"), bEnabled)
+		.BuildSuccess(Request);
 }
 
 // ─── niagara.spawn_at_location ────────────────────────────────────────────────────────────────
@@ -1007,11 +1008,11 @@ FMCPResponse Tool_SpawnAtLocation(const FMCPRequest& Request)
 				*System->GetPathName()));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("component_path"), Comp->GetPathName());
-	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
-	Out->SetBoolField(TEXT("auto_destroy"), bAutoDestroy);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("component_path"), Comp->GetPathName())
+		.Str(TEXT("world"), NIA_WorldKindName(World))
+		.Bool(TEXT("auto_destroy"), bAutoDestroy)
+		.BuildSuccess(Request);
 }
 
 // ─── niagara.stop_all ─────────────────────────────────────────────────────────────────────────
@@ -1047,10 +1048,10 @@ FMCPResponse Tool_StopAll(const FMCPRequest& Request)
 		++StoppedCount;
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("stopped_count"), static_cast<double>(StoppedCount));
-	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("stopped_count"), static_cast<double>(StoppedCount))
+		.Str(TEXT("world"), NIA_WorldKindName(World))
+		.BuildSuccess(Request);
 }
 
 // ─── niagara.list_active ──────────────────────────────────────────────────────────────────────
@@ -1116,11 +1117,12 @@ FMCPResponse Tool_ListActive(const FMCPRequest& Request)
 		Components.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("components"), Components);
-	Out->SetNumberField(TEXT("count"), static_cast<double>(Components.Num()));
-	Out->SetStringField(TEXT("world"), NIA_WorldKindName(World));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 ComponentsCount = Components.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("components"), MoveTemp(Components))
+		.Num(TEXT("count"), static_cast<double>(ComponentsCount))
+		.Str(TEXT("world"), NIA_WorldKindName(World))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

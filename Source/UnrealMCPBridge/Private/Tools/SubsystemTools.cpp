@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPReflection.h"
@@ -381,11 +382,12 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("subsystems"), Items);
-	Out->SetNumberField(TEXT("total"), Items.Num());
-	Out->SetStringField(TEXT("kind_filter"), KindLower);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalItems = Items.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("subsystems"),  MoveTemp(Items))
+		.Int(TEXT("total"),       TotalItems)
+		.Str(TEXT("kind_filter"), KindLower)
+		.BuildSuccess(Request);
 }
 
 // ─── subsystem.get_property ───────────────────────────────────────────────────────────────────
@@ -453,13 +455,16 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 	const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Instance);
 	TSharedPtr<FJsonValue> Value = FMCPReflection::ReadPropertyValueAt(Prop, ValuePtr);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("class_path"), SubsystemClass->GetPathName());
-	Out->SetStringField(TEXT("property_name"), PropertyName);
-	Out->SetStringField(TEXT("type"), FMCPReflection::DescribePropertyType(Prop));
-	Out->SetField(TEXT("value"), Value.IsValid() ? Value : MakeShared<FJsonValueNull>());
-	Out->SetStringField(TEXT("instance_path"), Instance->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const TSharedRef<FJsonValue> ValueRef = Value.IsValid()
+		? Value.ToSharedRef()
+		: StaticCastSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+	return FMCPJsonBuilder()
+		.Str  (TEXT("class_path"),    SubsystemClass->GetPathName())
+		.Str  (TEXT("property_name"), PropertyName)
+		.Str  (TEXT("type"),          FMCPReflection::DescribePropertyType(Prop))
+		.Field(TEXT("value"),         ValueRef)
+		.Str  (TEXT("instance_path"), Instance->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── subsystem.call_function ──────────────────────────────────────────────────────────────────
@@ -631,22 +636,18 @@ FMCPResponse Tool_CallFunction(const FMCPRequest& Request)
 	const bool bIsStateChanging =
 		!((FuncFlags & FUNC_Const) || (FuncFlags & FUNC_BlueprintPure));
 
-	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("class_path"), SubsystemClass->GetPathName());
-	Result->SetStringField(TEXT("function_name"), FunctionName);
-	Result->SetStringField(TEXT("function_signature"), Signature);
-	if (ReturnValue.IsValid())
-	{
-		Result->SetField(TEXT("return_value"), ReturnValue);
-	}
-	else
-	{
-		Result->SetField(TEXT("return_value"), MakeShared<FJsonValueNull>());
-	}
-	Result->SetObjectField(TEXT("out_params"), OutParamsObj);
-	Result->SetBoolField(TEXT("is_state_changing"), bIsStateChanging);
-	Result->SetStringField(TEXT("instance_path"), Instance->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Result);
+	const TSharedRef<FJsonValue> ReturnValueRef = ReturnValue.IsValid()
+		? ReturnValue.ToSharedRef()
+		: StaticCastSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+	return FMCPJsonBuilder()
+		.Str         (TEXT("class_path"),         SubsystemClass->GetPathName())
+		.Str         (TEXT("function_name"),      FunctionName)
+		.Str         (TEXT("function_signature"), Signature)
+		.Field       (TEXT("return_value"),       ReturnValueRef)
+		.ObjectShared(TEXT("out_params"),         OutParamsObj)
+		.Bool        (TEXT("is_state_changing"),  bIsStateChanging)
+		.Str         (TEXT("instance_path"),      Instance->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

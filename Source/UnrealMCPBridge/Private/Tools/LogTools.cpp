@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPLogStream.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
@@ -418,12 +419,12 @@ FMCPResponse Tool_Clear(const FMCPRequest& Request)
 
 	const int32 PriorCount = FMCPLogStream::Get().Clear();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("cleared"),           true);
-	Out->SetNumberField(TEXT("line_count_before"), static_cast<double>(PriorCount));
-	Out->SetNumberField(TEXT("ring_capacity"),  static_cast<double>(FMCPLogStream::kMaxEntries));
-	Out->SetNumberField(TEXT("total_observed"), static_cast<double>(FMCPLogStream::Get().GetTotalObserved()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("cleared"),           true)
+		.Num (TEXT("line_count_before"), static_cast<double>(PriorCount))
+		.Num (TEXT("ring_capacity"),     static_cast<double>(FMCPLogStream::kMaxEntries))
+		.Num (TEXT("total_observed"),    static_cast<double>(FMCPLogStream::Get().GetTotalObserved()))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

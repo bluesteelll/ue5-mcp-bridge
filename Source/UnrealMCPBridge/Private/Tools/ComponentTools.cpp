@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -1099,11 +1100,11 @@ FMCPResponse Tool_ListClassDefaultSubcomponents(const FMCPRequest& Request)
 		Subobjects.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("class_path"), Class->GetPathName());
-	Out->SetArrayField(TEXT("subobjects"), Subobjects);
-	Out->SetNumberField(TEXT("total"), static_cast<double>(Subobjects.Num()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("class_path"), Class->GetPathName())
+		.Arr(TEXT("subobjects"), MoveTemp(Subobjects))
+		.Num(TEXT("total"), static_cast<double>(Subobjects.Num()))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

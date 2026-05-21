@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPathSandbox.h"
@@ -270,9 +271,9 @@ FMCPResponse Tool_SubmitInternal(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

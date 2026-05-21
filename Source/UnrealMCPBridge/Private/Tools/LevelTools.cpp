@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -296,21 +297,20 @@ namespace FLevelTools
 FMCPResponse Tool_Phase3LaneBSanity(const FMCPRequest& Request)
 {
 	// Lane B handlers MUST NOT touch UObjects. Build a pure-string response and echo args.
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-
-	// Echo args. If null (no payload), emit empty object so AI clients see the field consistently.
+	// If args null (no payload), emit empty object so AI clients see the field consistently.
 	TSharedRef<FJsonObject> EchoObj = Request.Args.IsValid()
 		? Request.Args.ToSharedRef()
 		: MakeShared<FJsonObject>();
-	Out->SetObjectField(TEXT("echo"), EchoObj);
 
 	// UE's platform thread id is a uint32 — stable for the lifetime of the OS thread. The smoke
 	// spike compares this against the game-thread id captured at module init and asserts the
 	// Lane B response came from a DIFFERENT thread.
 	const uint32 TID = FPlatformTLS::GetCurrentThreadId();
-	Out->SetStringField(TEXT("thread_id"), FString::FromInt(static_cast<int32>(TID)));
 
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.ObjectShared(TEXT("echo"), EchoObj)
+		.Str(TEXT("thread_id"), FString::FromInt(static_cast<int32>(TID)))
+		.BuildSuccess(Request);
 }
 
 // ─── level.list_loaded (read-only — works in PIE) ────────────────────────────────────────────
@@ -330,10 +330,6 @@ FMCPResponse Tool_ListLoaded(const FMCPRequest& Request)
 			TEXT("no world available (GEditor missing and no PIE world)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world_kind"), FMCPWorldContext::IsPIEActive() ? TEXT("PIE") : TEXT("Editor"));
-	Out->SetStringField(TEXT("world_map_path"), FMCPWorldContext::GetWorldPackagePath(World));
-
 	TArray<TSharedPtr<FJsonValue>> Levels;
 	const TArray<ULevel*>& AllLevels = World->GetLevels();
 	Levels.Reserve(AllLevels.Num());
@@ -345,9 +341,14 @@ FMCPResponse Tool_ListLoaded(const FMCPRequest& Request)
 		}
 		Levels.Add(MakeShared<FJsonValueObject>(LVL_BuildLevelSummary(Level, World)));
 	}
-	Out->SetArrayField(TEXT("levels"), Levels);
-	Out->SetNumberField(TEXT("total"), static_cast<double>(Levels.Num()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 LevelsCount = Levels.Num();
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("world_kind"), FMCPWorldContext::IsPIEActive() ? TEXT("PIE") : TEXT("Editor"))
+		.Str(TEXT("world_map_path"), FMCPWorldContext::GetWorldPackagePath(World))
+		.Arr(TEXT("levels"), MoveTemp(Levels))
+		.Num(TEXT("total"), static_cast<double>(LevelsCount))
+		.BuildSuccess(Request);
 }
 
 // ─── level.current_map (read-only — works in PIE) ────────────────────────────────────────────
@@ -366,13 +367,12 @@ FMCPResponse Tool_CurrentMap(const FMCPRequest& Request)
 			TEXT("no world available (GEditor missing and no PIE world)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World));
-	Out->SetStringField(TEXT("world_kind"), FMCPWorldContext::IsPIEActive() ? TEXT("PIE") : TEXT("Editor"));
-
 	const UPackage* Pkg = World->GetOutermost();
-	Out->SetBoolField(TEXT("is_dirty"), Pkg && Pkg->IsDirty());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World))
+		.Str(TEXT("world_kind"), FMCPWorldContext::IsPIEActive() ? TEXT("PIE") : TEXT("Editor"))
+		.Bool(TEXT("is_dirty"), Pkg && Pkg->IsDirty())
+		.BuildSuccess(Request);
 }
 
 // ─── level.load (mutator — PIE-guarded) ──────────────────────────────────────────────────────
@@ -424,16 +424,15 @@ FMCPResponse Tool_Load(const FMCPRequest& Request)
 	}
 
 	const bool bOk = LES->LoadLevel(Norm);
-
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("loaded"), bOk);
-	Out->SetStringField(TEXT("map_path"), Norm);
 	if (!bOk)
 	{
 		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("LoadLevel('%s') returned false (see editor log)"), *Norm));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("loaded"), bOk)
+		.Str(TEXT("map_path"), Norm)
+		.BuildSuccess(Request);
 }
 
 // ─── level.save (mutator — PIE-guarded) ──────────────────────────────────────────────────────
@@ -467,16 +466,15 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 		const bool bOk = LES->SaveCurrentLevel();
 		UWorld* World = FMCPWorldContext::GetEditorWorld();
 		const FString CurrentMap = World ? FMCPWorldContext::GetWorldPackagePath(World) : FString();
-
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("saved"), bOk);
-		Out->SetStringField(TEXT("map_path"), CurrentMap);
 		if (!bOk)
 		{
 			return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 				FString::Printf(TEXT("SaveCurrentLevel('%s') returned false"), *CurrentMap));
 		}
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("saved"), bOk)
+			.Str(TEXT("map_path"), CurrentMap)
+			.BuildSuccess(Request);
 	}
 
 	// Sublevel path — resolve, save the underlying package via UEditorAssetSubsystem::SaveAsset.
@@ -495,16 +493,15 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 	}
 	const FString Norm = FMCPWorldContext::NormaliseMapPath(MapPath);
 	const bool bOk = EAS->SaveAsset(Norm, /*bOnlyIfIsDirty*/ false);
-
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("saved"), bOk);
-	Out->SetStringField(TEXT("map_path"), Norm);
 	if (!bOk)
 	{
 		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("SaveAsset('%s') returned false"), *Norm));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("saved"), bOk)
+		.Str(TEXT("map_path"), Norm)
+		.BuildSuccess(Request);
 }
 
 // ─── level.create (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -568,16 +565,15 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 	const bool bOk = TemplateNorm.IsEmpty()
 		? LES->NewLevel(Norm, /*bIsPartitionedWorld*/ false)
 		: LES->NewLevelFromTemplate(Norm, TemplateNorm);
-
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), bOk);
-	Out->SetStringField(TEXT("map_path"), Norm);
 	if (!bOk)
 	{
 		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("NewLevel('%s') returned false (path already exists? template missing?)"), *Norm));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), bOk)
+		.Str(TEXT("map_path"), Norm)
+		.BuildSuccess(Request);
 }
 
 // ─── level.unload (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -611,19 +607,16 @@ FMCPResponse Tool_Unload(const FMCPRequest& Request)
 	}
 
 	const bool bOk = UEditorLevelUtils::RemoveLevelFromWorld(Level);
-
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("unloaded"), bOk);
-	if (UPackage* Pkg = Level->GetOutermost())
-	{
-		Out->SetStringField(TEXT("map_path"), Pkg->GetName());
-	}
 	if (!bOk)
 	{
 		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			TEXT("RemoveLevelFromWorld returned false"));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	UPackage* Pkg = Level->GetOutermost();
+	return FMCPJsonBuilder()
+		.Bool(TEXT("unloaded"), bOk)
+		.If(Pkg != nullptr, [&](FMCPJsonBuilder& B) { B.Str(TEXT("map_path"), Pkg->GetName()); })
+		.BuildSuccess(Request);
 }
 
 // ─── level.set_streaming_state (mutator — PIE-guarded) ───────────────────────────────────────
@@ -679,12 +672,12 @@ FMCPResponse Tool_SetStreamingState(const FMCPRequest& Request)
 	Streaming->SetShouldBeLoaded(bLoaded);
 	Streaming->SetShouldBeVisible(bVisible);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("level_path"), FMCPWorldContext::NormaliseMapPath(LevelPath));
-	Out->SetBoolField(TEXT("loaded"), bLoaded);
-	Out->SetBoolField(TEXT("visible"), bVisible);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("level_path"), FMCPWorldContext::NormaliseMapPath(LevelPath))
+		.Bool(TEXT("loaded"), bLoaded)
+		.Bool(TEXT("visible"), bVisible)
+		.BuildSuccess(Request);
 }
 
 // ─── level.get_world_settings (read-only — works in PIE) ─────────────────────────────────────
@@ -760,10 +753,10 @@ FMCPResponse Tool_GetWorldSettings(const FMCPRequest& Request)
 		Properties->SetField(FieldName, Value.IsValid() ? Value : MakeShared<FJsonValueNull>());
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World));
-	Out->SetObjectField(TEXT("properties"), Properties);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World))
+		.ObjectShared(TEXT("properties"), Properties)
+		.BuildSuccess(Request);
 }
 
 // ─── level.set_world_settings (mutator — PIE-guarded) ────────────────────────────────────────
@@ -868,12 +861,12 @@ FMCPResponse Tool_SetWorldSettings(const FMCPRequest& Request)
 		Applied.Add(MakeShared<FJsonValueString>(Name));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World));
-	Out->SetArrayField(TEXT("applied"), Applied);
-	Out->SetArrayField(TEXT("rejected"), Rejected);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("map_path"), FMCPWorldContext::GetWorldPackagePath(World))
+		.Arr(TEXT("applied"), MoveTemp(Applied))
+		.Arr(TEXT("rejected"), MoveTemp(Rejected))
+		.BuildSuccess(Request);
 }
 
 // ─── level.get_persistent_level_actors (read-only, paginated — works in PIE) ─────────────────
@@ -985,23 +978,20 @@ FMCPResponse Tool_GetPersistentLevelActors(const FMCPRequest& Request)
 		NextSentinel = Sorted[EndExcl - 1]->GetPathName();
 	}
 
-	TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-	Obj->SetStringField(TEXT("map_path"), ResolvedLevelPkg);
-	Obj->SetArrayField(TEXT("actors"), Out);
-	Obj->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-	if (NextSentinel.IsEmpty())
-	{
-		Obj->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-	}
-	else
-	{
-		FMCPPageCursor NewCursor;
-		NewCursor.FilterHash = FilterHash;
-		NewCursor.LastAssetPath = NextSentinel;
-		NewCursor.TotalKnownSnapshot = TotalKnown;
-		Obj->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Obj);
+	return FMCPJsonBuilder()
+		.Str(TEXT("map_path"), ResolvedLevelPkg)
+		.Arr(TEXT("actors"), MoveTemp(Out))
+		.Num(TEXT("total_known"), static_cast<double>(TotalKnown))
+		.If(NextSentinel.IsEmpty(), [&](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+		.If(!NextSentinel.IsEmpty(), [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor NewCursor;
+			NewCursor.FilterHash = FilterHash;
+			NewCursor.LastAssetPath = NextSentinel;
+			NewCursor.TotalKnownSnapshot = TotalKnown;
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── level.save_all_dirty (Lane A + inline SubmitJob — per plan D3 N7 pattern) ───────────────
@@ -1072,11 +1062,11 @@ FMCPResponse Tool_SaveAllDirty(const FMCPRequest& Request)
 
 			Job.Progress.store(1.0f, std::memory_order_release);
 
-			TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-			Out->SetArrayField(TEXT("saved"), Saved);
-			Out->SetArrayField(TEXT("failed"), Failed);
-			Out->SetNumberField(TEXT("total_dirty"), static_cast<double>(Total));
-			return MakeShared<FJsonValueObject>(Out);
+			return MakeShared<FJsonValueObject>(FMCPJsonBuilder()
+				.Arr(TEXT("saved"), MoveTemp(Saved))
+				.Arr(TEXT("failed"), MoveTemp(Failed))
+				.Num(TEXT("total_dirty"), static_cast<double>(Total))
+				.ToShared());
 		},
 		/*bGameThreadRequired*/ true);
 
@@ -1086,9 +1076,9 @@ FMCPResponse Tool_SaveAllDirty(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobId.ToString(EGuidFormats::DigitsWithHyphens))
+		.BuildSuccess(Request);
 }
 
 // ─── level.duplicate (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -1153,17 +1143,16 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 
 	UObject* Result = EAS->DuplicateAsset(SrcNorm, DstNorm);
 	const bool bOk = Result != nullptr;
-
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("duplicated"), bOk);
-	Out->SetStringField(TEXT("source_map"), SrcNorm);
-	Out->SetStringField(TEXT("dest_map"), DstNorm);
 	if (!bOk)
 	{
 		return FMCPToolHelpers::MakeError(Request, kLVLErrorInternal,
 			FString::Printf(TEXT("DuplicateAsset('%s' → '%s') returned null"), *SrcNorm, *DstNorm));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("duplicated"), bOk)
+		.Str(TEXT("source_map"), SrcNorm)
+		.Str(TEXT("dest_map"), DstNorm)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

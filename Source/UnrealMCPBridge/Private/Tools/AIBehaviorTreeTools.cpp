@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -321,20 +322,20 @@ FMCPResponse Tool_ListAssets(const FMCPRequest& Request)
 		BTArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("behavior_trees"), BTArr);
-	Out->SetNumberField(TEXT("total_known"), Assets.Num());
-
-	if (EndIdx < Assets.Num() && EndIdx > 0)
-	{
-		FMCPPageCursor OutCursor;
-		OutCursor.FilterHash = FilterHash;
-		OutCursor.LastAssetPath = Assets[EndIdx - 1].GetSoftObjectPath().ToString();
-		OutCursor.TotalKnownSnapshot = Assets.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
-	}
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalKnown = Assets.Num();
+	const bool bHasNextPage = (EndIdx < TotalKnown && EndIdx > 0);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("behavior_trees"), MoveTemp(BTArr))
+		.Num(TEXT("total_known"), TotalKnown)
+		.If(bHasNextPage, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor OutCursor;
+			OutCursor.FilterHash = FilterHash;
+			OutCursor.LastAssetPath = Assets[EndIdx - 1].GetSoftObjectPath().ToString();
+			OutCursor.TotalKnownSnapshot = TotalKnown;
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── ai.bt.get_nodes ───────────────────────────────────────────────────────────────────────────
@@ -400,24 +401,18 @@ FMCPResponse Tool_GetNodes(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("bt_path"), BT->GetPathName());
-	if (BT->BlackboardAsset)
-	{
-		Out->SetStringField(TEXT("blackboard_asset_path"), BT->BlackboardAsset->GetPathName());
-	}
-
-	if (BT->RootNode)
-	{
-		Out->SetObjectField(TEXT("root"), AIBT_NodeToJson(BT->RootNode, /*Depth*/ 0));
-	}
-	else
-	{
-		// Newly-created BT with no root composite — legitimate state, surface as root=null.
-		Out->SetField(TEXT("root"), MakeShared<FJsonValueNull>());
-	}
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("bt_path"), BT->GetPathName())
+		.If(BT->BlackboardAsset != nullptr, [&](FMCPJsonBuilder& B)
+		{
+			B.Str(TEXT("blackboard_asset_path"), BT->BlackboardAsset->GetPathName());
+		})
+		.If(BT->RootNode != nullptr,
+			[&](FMCPJsonBuilder& B) { B.ObjectShared(TEXT("root"), AIBT_NodeToJson(BT->RootNode, /*Depth*/ 0)); })
+		.If(BT->RootNode == nullptr,
+			// Newly-created BT with no root composite — legitimate state, surface as root=null.
+			[](FMCPJsonBuilder& B) { B.Null(TEXT("root")); })
+		.BuildSuccess(Request);
 }
 
 // ─── ai.bt.start_on_actor ──────────────────────────────────────────────────────────────────────
@@ -487,11 +482,11 @@ FMCPResponse Tool_StartOnActor(const FMCPRequest& Request)
 
 	const bool bStarted = AIC->RunBehaviorTree(BT);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("started"), bStarted);
-	Out->SetStringField(TEXT("controller_path"), AIC->GetPathName());
-	Out->SetStringField(TEXT("bt_path"), BT->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("started"), bStarted)
+		.Str(TEXT("controller_path"), AIC->GetPathName())
+		.Str(TEXT("bt_path"), BT->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── ai.bt.stop_on_actor ───────────────────────────────────────────────────────────────────────

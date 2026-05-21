@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -198,35 +199,29 @@ namespace
 		bool bIncludeTags,
 		bool bIncludeColdCacheFlag)
 	{
-		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 		TArray<TSharedPtr<FJsonValue>> Items;
 		Items.Reserve(PageAssets.Num());
 		for (const FAssetData& Data : PageAssets)
 		{
 			Items.Add(MakeShared<FJsonValueObject>(AR_BuildAssetSummary(Data, bIncludeTags)));
 		}
-		Out->SetArrayField(ItemsFieldName, Items);
-		Out->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-
-		if (NextSentinel.IsEmpty())
-		{
-			Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-		}
-		else
-		{
-			FMCPPageCursor Cursor;
-			Cursor.FilterHash = FilterHash;
-			Cursor.LastAssetPath = NextSentinel;
-			Cursor.TotalKnownSnapshot = TotalKnown;
-			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(Cursor));
-		}
-
-		if (bIncludeColdCacheFlag)
-		{
-			Out->SetBoolField(TEXT("is_cold_cache"),
-				FAssetRegistryModule::GetRegistry().IsLoadingAssets());
-		}
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Arr(ItemsFieldName, MoveTemp(Items))
+			.Int(TEXT("total_known"), TotalKnown)
+			.If(NextSentinel.IsEmpty(), [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+			.If(!NextSentinel.IsEmpty(), [&](FMCPJsonBuilder& B)
+			{
+				FMCPPageCursor Cursor;
+				Cursor.FilterHash = FilterHash;
+				Cursor.LastAssetPath = NextSentinel;
+				Cursor.TotalKnownSnapshot = TotalKnown;
+				B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(Cursor));
+			})
+			.If(bIncludeColdCacheFlag, [](FMCPJsonBuilder& B)
+			{
+				B.Bool(TEXT("is_cold_cache"), FAssetRegistryModule::GetRegistry().IsLoadingAssets());
+			})
+			.BuildSuccess(Request);
 	}
 
 	/**
@@ -460,10 +455,10 @@ FMCPResponse Tool_AssetExists(const FMCPRequest& Request)
 	const FSoftObjectPath Soft(ObjectPath);
 	const FAssetData Data = IAR.GetAssetByObjectPath(Soft, /*bIncludeOnlyOnDiskAssets*/ false);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("exists"), Data.IsValid());
-	Out->SetStringField(TEXT("asset_path_canonical"), NormalizedPath);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("exists"), Data.IsValid())
+		.Str(TEXT("asset_path_canonical"), NormalizedPath)
+		.BuildSuccess(Request);
 }
 
 // ─── asset.metadata ──────────────────────────────────────────────────────────────────────────
@@ -522,10 +517,10 @@ FMCPResponse Tool_AssetGetOutermostPackage(const FMCPRequest& Request)
 	const FString PackageNameStr = Data.PackageName.ToString();
 	const bool bOnDisk = FPackageName::DoesPackageExist(PackageNameStr);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("package_path"), PackageNameStr);
-	Out->SetBoolField(TEXT("on_disk"), bOnDisk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("package_path"), PackageNameStr)
+		.Bool(TEXT("on_disk"), bOnDisk)
+		.BuildSuccess(Request);
 }
 
 // ─── asset.is_dirty (Lane A — touches loaded-package map) ────────────────────────────────────
@@ -544,20 +539,13 @@ FMCPResponse Tool_AssetIsDirty(const FMCPRequest& Request)
 	}
 
 	const FString PackageNameStr = Data.PackageName.ToString();
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	if (UPackage* P = FindPackage(nullptr, *PackageNameStr))
-	{
-		Out->SetBoolField(TEXT("dirty"), P->IsDirty());
-		Out->SetBoolField(TEXT("in_memory"), true);
-	}
-	else
-	{
-		// Deliberate: we do NOT autoload — that would mutate in-memory state silently. Contrast
-		// with cb.delete force=false which MAY autoload during its reference walk.
-		Out->SetBoolField(TEXT("dirty"), false);
-		Out->SetBoolField(TEXT("in_memory"), false);
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	UPackage* P = FindPackage(nullptr, *PackageNameStr);
+	// Deliberate: we do NOT autoload — that would mutate in-memory state silently. Contrast
+	// with cb.delete force=false which MAY autoload during its reference walk.
+	return FMCPJsonBuilder()
+		.Bool(TEXT("dirty"), P ? P->IsDirty() : false)
+		.Bool(TEXT("in_memory"), P != nullptr)
+		.BuildSuccess(Request);
 }
 
 // ─── asset.list (paginated, FARFilter) ───────────────────────────────────────────────────────
@@ -686,7 +674,6 @@ namespace
 		FString NextSentinel;
 		AR_SliceDependencyPage(All, Cursor.LastAssetPath, PageSize, Page, NextSentinel);
 
-		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 		TArray<TSharedPtr<FJsonValue>> Items;
 		Items.Reserve(Page.Num());
 		for (const FAssetDependency& Dep : Page)
@@ -696,21 +683,19 @@ namespace
 			ItemObj->SetStringField(TEXT("dependency_kind"), AR_ClassifyDependency(Dep));
 			Items.Add(MakeShared<FJsonValueObject>(ItemObj));
 		}
-		Out->SetArrayField(ItemsFieldName, Items);
-		Out->SetNumberField(TEXT("total_known"), static_cast<double>(All.Num()));
-		if (NextSentinel.IsEmpty())
-		{
-			Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-		}
-		else
-		{
-			FMCPPageCursor NewCursor;
-			NewCursor.FilterHash = FilterHash;
-			NewCursor.LastAssetPath = NextSentinel;
-			NewCursor.TotalKnownSnapshot = All.Num();
-			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
-		}
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Arr(ItemsFieldName, MoveTemp(Items))
+			.Int(TEXT("total_known"), All.Num())
+			.If(NextSentinel.IsEmpty(), [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+			.If(!NextSentinel.IsEmpty(), [&](FMCPJsonBuilder& B)
+			{
+				FMCPPageCursor NewCursor;
+				NewCursor.FilterHash = FilterHash;
+				NewCursor.LastAssetPath = NextSentinel;
+				NewCursor.TotalKnownSnapshot = All.Num();
+				B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+			})
+			.BuildSuccess(Request);
 	}
 }
 
@@ -934,7 +919,6 @@ FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 
 	// Custom response shape — includes per-item ``tag_value`` field, so we can't reuse the
 	// generic paginated builder verbatim.
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> Items;
 	Items.Reserve(Page.Num());
 	for (const FAssetData& Data : Page)
@@ -944,21 +928,19 @@ FMCPResponse Tool_AssetSearchByTag(const FMCPRequest& Request)
 		ItemObj->SetStringField(TEXT("tag_value"), ValRef.IsSet() ? ValRef.AsString() : FString());
 		Items.Add(MakeShared<FJsonValueObject>(ItemObj));
 	}
-	Out->SetArrayField(TEXT("matches"), Items);
-	Out->SetNumberField(TEXT("total_known"), static_cast<double>(Filtered.Num()));
-	if (NextSentinel.IsEmpty())
-	{
-		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-	}
-	else
-	{
-		FMCPPageCursor NewCursor;
-		NewCursor.FilterHash = FilterHash;
-		NewCursor.LastAssetPath = NextSentinel;
-		NewCursor.TotalKnownSnapshot = Filtered.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("matches"), MoveTemp(Items))
+		.Int(TEXT("total_known"), Filtered.Num())
+		.If(NextSentinel.IsEmpty(), [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+		.If(!NextSentinel.IsEmpty(), [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor NewCursor;
+			NewCursor.FilterHash = FilterHash;
+			NewCursor.LastAssetPath = NextSentinel;
+			NewCursor.TotalKnownSnapshot = Filtered.Num();
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── asset.search_by_name ────────────────────────────────────────────────────────────────────
@@ -1179,13 +1161,13 @@ FMCPResponse Tool_AssetGetThumbnail(const FMCPRequest& Request)
 
 	const FString Base64 = FBase64::Encode(reinterpret_cast<const uint8*>(PNGBytes.GetData()), PNGBytes.Num());
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("base64"), Base64);
-	Out->SetStringField(TEXT("mime"), TEXT("image/png"));
-	Out->SetNumberField(TEXT("width"),  Width);
-	Out->SetNumberField(TEXT("height"), Height);
-	Out->SetBoolField(TEXT("is_class_generic"), bIsClassGeneric);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("base64"), Base64)
+		.Str(TEXT("mime"), TEXT("image/png"))
+		.Int(TEXT("width"),  Width)
+		.Int(TEXT("height"), Height)
+		.Bool(TEXT("is_class_generic"), bIsClassGeneric)
+		.BuildSuccess(Request);
 }
 
 // ─── asset.get_thumbnail_to_disk (file output, sandboxed, max 2048) ─────────────────────────
@@ -1289,12 +1271,12 @@ FMCPResponse Tool_AssetGetThumbnailToDisk(const FMCPRequest& Request)
 			FString::Printf(TEXT("could not write thumbnail to '%s'"), *AbsPath));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("path"), AbsPath);
-	Out->SetNumberField(TEXT("bytes"), static_cast<double>(WriteBuf.Num()));
-	Out->SetNumberField(TEXT("width"),  Width);
-	Out->SetNumberField(TEXT("height"), Height);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("path"), AbsPath)
+		.Int(TEXT("bytes"), WriteBuf.Num())
+		.Int(TEXT("width"),  Width)
+		.Int(TEXT("height"), Height)
+		.BuildSuccess(Request);
 }
 // ─── asset.get_class_hierarchy ───────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
@@ -1330,9 +1312,9 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 	if (Data.AssetClassPath.IsNull())
 	{
 		// AR entry exists but its class path is unknown — cannot build a hierarchy at all.
-		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetArrayField(TEXT("chain"), Chain);
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Arr(TEXT("chain"), MoveTemp(Chain))
+			.BuildSuccess(Request);
 	}
 
 	// Leaf entry (the asset's own class) is always included — even if GetAncestorClassNames
@@ -1347,9 +1329,9 @@ FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request)
 		Chain.Add(MakeChainEntry(AncestorPath));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("chain"), Chain);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("chain"), MoveTemp(Chain))
+		.BuildSuccess(Request);
 }
 
 // ─── asset.create_data_asset — create a new UDataAsset of given class at given path ─────────
@@ -1482,12 +1464,12 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
-	Out->SetStringField(TEXT("class_path"), TargetClass->GetPathName());
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("asset_path"), NewAsset->GetPathName())
+		.Str(TEXT("class_path"), TargetClass->GetPathName())
+		.Bool(TEXT("saved"), bSavedOk)
+		.BuildSuccess(Request);
 }
 
 // ─── asset.create — generic creator for ANY UObject subclass (no source file) ───────────────
@@ -1655,13 +1637,13 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
-	Out->SetStringField(TEXT("class_path"), TargetClass->GetPathName());
-	Out->SetStringField(TEXT("used_factory"), UsedFactory);
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("asset_path"), NewAsset->GetPathName())
+		.Str(TEXT("class_path"), TargetClass->GetPathName())
+		.Str(TEXT("used_factory"), UsedFactory)
+		.Bool(TEXT("saved"), bSavedOk)
+		.BuildSuccess(Request);
 }
 
 // ─── asset.list_data_asset_classes — discover UDataAsset subclasses available for create ────
@@ -1805,22 +1787,20 @@ FMCPResponse Tool_AssetListDataAssetClasses(const FMCPRequest& Request)
 		Out.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-	ResultObj->SetArrayField(TEXT("classes"), Out);
-	ResultObj->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-	if (EndExcl < TotalKnown && Out.Num() > 0)
-	{
-		FMCPPageCursor NewCursor;
-		NewCursor.FilterHash = FilterHash;
-		NewCursor.LastAssetPath = AllMatching[EndExcl - 1]->GetPathName();
-		NewCursor.TotalKnownSnapshot = TotalKnown;
-		ResultObj->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
-	}
-	else
-	{
-		ResultObj->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, ResultObj);
+	const bool bHasNext = (EndExcl < TotalKnown && Out.Num() > 0);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("classes"), MoveTemp(Out))
+		.Int(TEXT("total_known"), TotalKnown)
+		.If(bHasNext, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor NewCursor;
+			NewCursor.FilterHash = FilterHash;
+			NewCursor.LastAssetPath = AllMatching[EndExcl - 1]->GetPathName();
+			NewCursor.TotalKnownSnapshot = TotalKnown;
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NewCursor));
+		})
+		.If(!bHasNext, [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

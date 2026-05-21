@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -180,11 +181,12 @@ FMCPResponse Tool_CookListPlatforms(const FMCPRequest& Request)
 		return AName < BName;
 	});
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("platforms"), PlatformsArr);
-	Out->SetNumberField(TEXT("total"), PlatformsArr.Num());
-	Out->SetNumberField(TEXT("active_count"), Active.Num());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 PlatformCount = PlatformsArr.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("platforms"), MoveTemp(PlatformsArr))
+		.Num(TEXT("total"), PlatformCount)
+		.Num(TEXT("active_count"), Active.Num())
+		.BuildSuccess(Request);
 }
 
 // ─── cook.validate_cookable ───────────────────────────────────────────────────────────────────
@@ -400,15 +402,15 @@ FMCPResponse Tool_CookValidateCookable(const FMCPRequest& Request)
 		++CookableCount;
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("platform_name"), PlatformName);
-	Out->SetNumberField(TEXT("cookable_count"), CookableCount);
-	Out->SetNumberField(TEXT("uncookable_count"), UncookableCount);
-	Out->SetNumberField(TEXT("total_visited"), EffectiveMax);
-	Out->SetNumberField(TEXT("total_known"), Assets.Num());
-	Out->SetBoolField(TEXT("max_assets_reached"), bMaxReached);
-	Out->SetArrayField(TEXT("errors"), ErrorsArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("platform_name"), PlatformName)
+		.Num(TEXT("cookable_count"), CookableCount)
+		.Num(TEXT("uncookable_count"), UncookableCount)
+		.Num(TEXT("total_visited"), EffectiveMax)
+		.Num(TEXT("total_known"), Assets.Num())
+		.Bool(TEXT("max_assets_reached"), bMaxReached)
+		.Arr(TEXT("errors"), MoveTemp(ErrorsArr))
+		.BuildSuccess(Request);
 }
 
 // ─── cook.start ──────────────────────────────────────────────────────────────────────────────
@@ -666,11 +668,11 @@ FMCPResponse Tool_CookStart(const FMCPRequest& Request)
 			TEXT("FMCPJobRegistry::SubmitJob refused (shutdown?)"));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	Out->SetNumberField(TEXT("started_at"), SubmittedAt);
-	Out->SetStringField(TEXT("command_line"), CookCommandLine);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("job_id"), JobIdGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Num(TEXT("started_at"), SubmittedAt)
+		.Str(TEXT("command_line"), CookCommandLine)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -526,29 +527,25 @@ namespace
 		const FString& NextSentinel,
 		uint64 FilterHash)
 	{
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 		TArray<TSharedPtr<FJsonValue>> Items;
 		Items.Reserve(PageActors.Num());
 		for (const AActor* A : PageActors)
 		{
 			Items.Add(MakeShared<FJsonValueObject>(ACT_BuildActorMatchSummary(A)));
 		}
-		Out->SetArrayField(TEXT("actors"), Items);
-		Out->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-
-		if (NextSentinel.IsEmpty())
-		{
-			Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-		}
-		else
-		{
-			FMCPPageCursor Cursor;
-			Cursor.FilterHash = FilterHash;
-			Cursor.LastAssetPath = NextSentinel;
-			Cursor.TotalKnownSnapshot = TotalKnown;
-			Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(Cursor));
-		}
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Arr(TEXT("actors"), MoveTemp(Items))
+			.Int(TEXT("total_known"), TotalKnown)
+			.If(NextSentinel.IsEmpty(), [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+			.If(!NextSentinel.IsEmpty(), [&](FMCPJsonBuilder& B)
+			{
+				FMCPPageCursor Cursor;
+				Cursor.FilterHash = FilterHash;
+				Cursor.LastAssetPath = NextSentinel;
+				Cursor.TotalKnownSnapshot = TotalKnown;
+				B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(Cursor));
+			})
+			.BuildSuccess(Request);
 	}
 
 	// ─── cycle detection (attach) ────────────────────────────────────────────────────────────────
@@ -837,17 +834,16 @@ FMCPResponse Tool_Spawn(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(NewActor));
-	Out->SetStringField(TEXT("class"),      NewActor->GetClass()->GetPathName());
-	Out->SetStringField(TEXT("label"),      NewActor->GetActorNameOrLabel());
-	Out->SetStringField(TEXT("name"),       NewActor->GetFName().ToString());
-	if (const ULevel* L = NewActor->GetLevel())
-	{
-		Out->SetStringField(TEXT("map_path"), L->GetOutermost() ? L->GetOutermost()->GetName() : FString());
-	}
-	Out->SetObjectField(TEXT("transform"), ACT_TransformToJson(NewActor->GetActorTransform()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const ULevel* Level = NewActor->GetLevel();
+	const FString MapPath = (Level && Level->GetOutermost()) ? Level->GetOutermost()->GetName() : FString();
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(NewActor))
+		.Str(TEXT("class"),      NewActor->GetClass()->GetPathName())
+		.Str(TEXT("label"),      NewActor->GetActorNameOrLabel())
+		.Str(TEXT("name"),       NewActor->GetFName().ToString())
+		.If(Level != nullptr, [&](FMCPJsonBuilder& B) { B.Str(TEXT("map_path"), MapPath); })
+		.ObjectShared(TEXT("transform"), ACT_TransformToJson(NewActor->GetActorTransform()))
+		.BuildSuccess(Request);
 }
 
 // ─── actor.destroy (mutator — PIE-guarded) ───────────────────────────────────────────────────
@@ -879,15 +875,15 @@ FMCPResponse Tool_Destroy(const FMCPRequest& Request)
 
 	const bool bOk = World->EditorDestroyActor(Actor, /*bShouldModifyLevel*/ true);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("destroyed"), bOk);
-	Out->SetStringField(TEXT("actor_path"), CanonicalPath);
 	if (!bOk)
 	{
 		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal,
 			FString::Printf(TEXT("EditorDestroyActor('%s') returned false"), *CanonicalPath));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("destroyed"), bOk)
+		.Str(TEXT("actor_path"), CanonicalPath)
+		.BuildSuccess(Request);
 }
 
 // ─── actor.duplicate (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -960,17 +956,16 @@ FMCPResponse Tool_Duplicate(const FMCPRequest& Request)
 	}
 #endif
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(NewActor));
-	Out->SetStringField(TEXT("class"),      NewActor->GetClass()->GetPathName());
-	Out->SetStringField(TEXT("label"),      NewActor->GetActorNameOrLabel());
-	Out->SetStringField(TEXT("name"),       NewActor->GetFName().ToString());
-	if (const ULevel* L = NewActor->GetLevel())
-	{
-		Out->SetStringField(TEXT("map_path"), L->GetOutermost() ? L->GetOutermost()->GetName() : FString());
-	}
-	Out->SetObjectField(TEXT("transform"), ACT_TransformToJson(NewActor->GetActorTransform()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const ULevel* Level = NewActor->GetLevel();
+	const FString MapPath = (Level && Level->GetOutermost()) ? Level->GetOutermost()->GetName() : FString();
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(NewActor))
+		.Str(TEXT("class"),      NewActor->GetClass()->GetPathName())
+		.Str(TEXT("label"),      NewActor->GetActorNameOrLabel())
+		.Str(TEXT("name"),       NewActor->GetFName().ToString())
+		.If(Level != nullptr, [&](FMCPJsonBuilder& B) { B.Str(TEXT("map_path"), MapPath); })
+		.ObjectShared(TEXT("transform"), ACT_TransformToJson(NewActor->GetActorTransform()))
+		.BuildSuccess(Request);
 }
 
 // ─── actor.get (read-only — works in PIE) ────────────────────────────────────────────────────
@@ -1062,11 +1057,11 @@ FMCPResponse Tool_SetTransform(const FMCPRequest& Request)
 	Actor->Modify();
 	Actor->SetActorTransform(NewT);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetObjectField(TEXT("transform"), ACT_TransformToJson(Actor->GetActorTransform()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.ObjectShared(TEXT("transform"), ACT_TransformToJson(Actor->GetActorTransform()))
+		.BuildSuccess(Request);
 }
 
 // ─── actor.set_location (mutator — PIE-guarded) ──────────────────────────────────────────────
@@ -1107,11 +1102,11 @@ FMCPResponse Tool_SetLocation(const FMCPRequest& Request)
 	Actor->Modify();
 	Actor->SetActorLocation(NewLoc);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetObjectField(TEXT("location"), ACT_VectorToJson(Actor->GetActorLocation()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.ObjectShared(TEXT("location"), ACT_VectorToJson(Actor->GetActorLocation()))
+		.BuildSuccess(Request);
 }
 
 // ─── actor.set_rotation (mutator — PIE-guarded) ──────────────────────────────────────────────
@@ -1150,11 +1145,11 @@ FMCPResponse Tool_SetRotation(const FMCPRequest& Request)
 	Actor->Modify();
 	Actor->SetActorRotation(NewRot);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetObjectField(TEXT("rotation"), ACT_RotatorToJson(Actor->GetActorRotation()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.ObjectShared(TEXT("rotation"), ACT_RotatorToJson(Actor->GetActorRotation()))
+		.BuildSuccess(Request);
 }
 
 // ─── actor.set_scale (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -1193,11 +1188,11 @@ FMCPResponse Tool_SetScale(const FMCPRequest& Request)
 	Actor->Modify();
 	Actor->SetActorScale3D(NewScale);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetObjectField(TEXT("scale"), ACT_VectorToJson(Actor->GetActorScale3D()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.ObjectShared(TEXT("scale"), ACT_VectorToJson(Actor->GetActorScale3D()))
+		.BuildSuccess(Request);
 }
 
 // ─── actor.set_label (mutator — PIE-guarded) ─────────────────────────────────────────────────
@@ -1235,12 +1230,12 @@ FMCPResponse Tool_SetLabel(const FMCPRequest& Request)
 	Actor->SetActorLabel(NewLabel);
 #endif
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetStringField(TEXT("label"), Actor->GetActorLabel());
-	Out->SetStringField(TEXT("previous_label"), PrevLabel);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.Str(TEXT("label"), Actor->GetActorLabel())
+		.Str(TEXT("previous_label"), PrevLabel)
+		.BuildSuccess(Request);
 }
 
 // ─── actor.set_folder (mutator — PIE-guarded) ────────────────────────────────────────────────
@@ -1276,12 +1271,12 @@ FMCPResponse Tool_SetFolder(const FMCPRequest& Request)
 
 	Actor->SetFolderPath(FName(*FolderPath));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetStringField(TEXT("folder_path"), Actor->GetFolderPath().ToString());
-	Out->SetStringField(TEXT("previous_folder_path"), PrevFolder);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.Str(TEXT("folder_path"), Actor->GetFolderPath().ToString())
+		.Str(TEXT("previous_folder_path"), PrevFolder)
+		.BuildSuccess(Request);
 }
 
 // ─── actor.attach (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -1402,26 +1397,22 @@ FMCPResponse Tool_Attach(const FMCPRequest& Request)
 	Parent->Modify();
 	const bool bOk = Child->AttachToActor(Parent, Rules, SocketName);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), bOk);
-	Out->SetStringField(TEXT("child_actor_path"), FMCPActorPathUtils::BuildActorPath(Child));
-	Out->SetStringField(TEXT("parent_actor_path"), FMCPActorPathUtils::BuildActorPath(Parent));
-	Out->SetStringField(TEXT("socket"), SocketName.ToString());
-	Out->SetStringField(TEXT("rule"), RuleStr.IsEmpty() ? TEXT("KeepWorld") : RuleStr);
-	if (PrevParent)
-	{
-		Out->SetStringField(TEXT("previous_parent_path"), FMCPActorPathUtils::BuildActorPath(PrevParent));
-	}
-	else
-	{
-		Out->SetField(TEXT("previous_parent_path"), MakeShared<FJsonValueNull>());
-	}
 	if (!bOk)
 	{
 		return FMCPToolHelpers::MakeError(Request, kACTErrorInternal,
 			TEXT("AttachToActor returned false (no RootComponent on child? socket name missing on parent mesh?)"));
 	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), bOk)
+		.Str(TEXT("child_actor_path"), FMCPActorPathUtils::BuildActorPath(Child))
+		.Str(TEXT("parent_actor_path"), FMCPActorPathUtils::BuildActorPath(Parent))
+		.Str(TEXT("socket"), SocketName.ToString())
+		.Str(TEXT("rule"), RuleStr.IsEmpty() ? TEXT("KeepWorld") : RuleStr)
+		.If(PrevParent != nullptr, [&](FMCPJsonBuilder& B)
+			{ B.Str(TEXT("previous_parent_path"), FMCPActorPathUtils::BuildActorPath(PrevParent)); })
+		.If(PrevParent == nullptr, [](FMCPJsonBuilder& B) { B.Null(TEXT("previous_parent_path")); })
+		.BuildSuccess(Request);
 }
 
 // ─── actor.detach (mutator — PIE-guarded) ────────────────────────────────────────────────────
@@ -1474,18 +1465,13 @@ FMCPResponse Tool_Detach(const FMCPRequest& Request)
 	Child->Modify();
 	Child->DetachFromActor(Rules);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("child_actor_path"), FMCPActorPathUtils::BuildActorPath(Child));
-	if (PrevParent)
-	{
-		Out->SetStringField(TEXT("previous_parent_path"), FMCPActorPathUtils::BuildActorPath(PrevParent));
-	}
-	else
-	{
-		Out->SetField(TEXT("previous_parent_path"), MakeShared<FJsonValueNull>());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("child_actor_path"), FMCPActorPathUtils::BuildActorPath(Child))
+		.If(PrevParent != nullptr, [&](FMCPJsonBuilder& B)
+			{ B.Str(TEXT("previous_parent_path"), FMCPActorPathUtils::BuildActorPath(PrevParent)); })
+		.If(PrevParent == nullptr, [](FMCPJsonBuilder& B) { B.Null(TEXT("previous_parent_path")); })
+		.BuildSuccess(Request);
 }
 
 // ─── actor.get_property (read-only — works in PIE) ───────────────────────────────────────────
@@ -1528,12 +1514,12 @@ FMCPResponse Tool_GetProperty(const FMCPRequest& Request)
 
 	TSharedPtr<FJsonValue> Value = FMCPReflection::ReadPropertyValueAt(LeafProp, LeafValuePtr);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"),    FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetStringField(TEXT("property_path"), PropertyName);
-	Out->SetStringField(TEXT("type"),          FMCPReflection::DescribePropertyType(LeafProp));
-	Out->SetField(TEXT("value"), Value);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"),    FMCPActorPathUtils::BuildActorPath(Actor))
+		.Str(TEXT("property_path"), PropertyName)
+		.Str(TEXT("type"),          FMCPReflection::DescribePropertyType(LeafProp))
+		.Field(TEXT("value"), Value.ToSharedRef())
+		.BuildSuccess(Request);
 }
 
 // ─── actor.set_property (mutator — PIE-guarded) ──────────────────────────────────────────────
@@ -1625,12 +1611,12 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	// Re-read post-write for round-trip echo.
 	TSharedPtr<FJsonValue> EchoValue = FMCPReflection::ReadPropertyValueAt(LeafProp, LeafValuePtr);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ok"), true);
-	Out->SetStringField(TEXT("actor_path"),    FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetStringField(TEXT("property_path"), PropertyName);
-	Out->SetField(TEXT("value"), EchoValue);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ok"), true)
+		.Str(TEXT("actor_path"),    FMCPActorPathUtils::BuildActorPath(Actor))
+		.Str(TEXT("property_path"), PropertyName)
+		.Field(TEXT("value"), EchoValue.ToSharedRef())
+		.BuildSuccess(Request);
 }
 
 // ─── actor.exists (read-only — works in PIE) ─────────────────────────────────────────────────
@@ -1650,11 +1636,11 @@ FMCPResponse Tool_Exists(const FMCPRequest& Request)
 
 	AActor* Actor = FMCPActorPathUtils::ResolveActorOrNull(Path, /*bRejectPIE*/ false);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("exists"), Actor != nullptr);
-	Out->SetStringField(TEXT("actor_path"),
-		Actor ? FMCPActorPathUtils::BuildActorPath(Actor) : Path);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("exists"), Actor != nullptr)
+		.Str(TEXT("actor_path"),
+			Actor ? FMCPActorPathUtils::BuildActorPath(Actor) : Path)
+		.BuildSuccess(Request);
 }
 
 // ─── actor.select_in_editor (works in PIE per D10 edge case) ─────────────────────────────────
@@ -1727,18 +1713,18 @@ FMCPResponse Tool_SelectInEditor(const FMCPRequest& Request)
 	}
 	Selection->EndBatchSelectOperation(/*bNotify*/ true);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("selected"), static_cast<double>(Resolved.Num()));
-	Out->SetNumberField(TEXT("requested"), static_cast<double>(PathsArr->Num()));
-	Out->SetBoolField(TEXT("additive"), bAdditive);
 	TArray<TSharedPtr<FJsonValue>> MissingJson;
 	MissingJson.Reserve(Missing.Num());
 	for (const FString& M : Missing)
 	{
 		MissingJson.Add(MakeShared<FJsonValueString>(M));
 	}
-	Out->SetArrayField(TEXT("missing"), MissingJson);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Int(TEXT("selected"), Resolved.Num())
+		.Int(TEXT("requested"), PathsArr->Num())
+		.Bool(TEXT("additive"), bAdditive)
+		.Arr(TEXT("missing"), MoveTemp(MissingJson))
+		.BuildSuccess(Request);
 }
 
 // ─── actor.find_by_class (paginated read — works in PIE) ─────────────────────────────────────
@@ -2004,11 +1990,11 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 		CompArr.Add(MakeShared<FJsonValueObject>(ACT_BuildComponentSummary(C)));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor));
-	Out->SetArrayField(TEXT("components"), CompArr);
-	Out->SetNumberField(TEXT("total"), static_cast<double>(Comps.Num()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"), FMCPActorPathUtils::BuildActorPath(Actor))
+		.Arr(TEXT("components"), MoveTemp(CompArr))
+		.Int(TEXT("total"), Comps.Num())
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

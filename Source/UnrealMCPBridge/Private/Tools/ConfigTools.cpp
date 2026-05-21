@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
@@ -344,20 +345,20 @@ FMCPResponse Tool_GetCVar(const FMCPRequest& Request)
 				"per Phase 6 D5"), *Name));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("name"),           Name);
-	Out->SetStringField(TEXT("type"),           CFG_GetCVarTypeString(*Var));
-	Out->SetField(TEXT("value"),                CFG_GetCVarValueJson(*Var));
-	Out->SetStringField(TEXT("value_string"),   Var->GetString());
-	Out->SetStringField(TEXT("help"),           Obj->GetHelp());
-	Out->SetStringField(TEXT("default_value"),  Var->GetDefaultValue());
 	const EConsoleVariableFlags Flags = Var->GetFlags();
-	Out->SetStringField(TEXT("set_by"),         GetConsoleVariableSetByName(Flags));
-	Out->SetNumberField(TEXT("flags_raw"),      static_cast<double>(static_cast<uint32>(Flags)));
-	Out->SetBoolField(TEXT("is_read_only"),     Var->TestFlags(ECVF_ReadOnly));
-	Out->SetBoolField(TEXT("is_cheat"),         Var->TestFlags(ECVF_Cheat));
-	Out->SetBoolField(TEXT("is_unregistered"),  Var->TestFlags(ECVF_Unregistered));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("name"),           Name)
+		.Str(TEXT("type"),           CFG_GetCVarTypeString(*Var))
+		.Field(TEXT("value"),        CFG_GetCVarValueJson(*Var))
+		.Str(TEXT("value_string"),   Var->GetString())
+		.Str(TEXT("help"),           Obj->GetHelp())
+		.Str(TEXT("default_value"),  Var->GetDefaultValue())
+		.Str(TEXT("set_by"),         GetConsoleVariableSetByName(Flags))
+		.Num(TEXT("flags_raw"),      static_cast<double>(static_cast<uint32>(Flags)))
+		.Bool(TEXT("is_read_only"),  Var->TestFlags(ECVF_ReadOnly))
+		.Bool(TEXT("is_cheat"),      Var->TestFlags(ECVF_Cheat))
+		.Bool(TEXT("is_unregistered"), Var->TestFlags(ECVF_Unregistered))
+		.BuildSuccess(Request);
 }
 
 // ─── cfg.set_cvar ─────────────────────────────────────────────────────────────────────────────
@@ -576,16 +577,16 @@ FMCPResponse Tool_SetCVar(const FMCPRequest& Request)
 	// ini-loaded and scalability values but a subsequent Console-priority write (operator) wins.
 	Var->Set(*WriteValue, ECVF_SetByCode);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("set"),                  true);
-	Out->SetStringField(TEXT("name"),               Name);
-	Out->SetStringField(TEXT("type"),               TypeStr);
-	Out->SetField(TEXT("prior_value"),              PriorValueJson);
-	Out->SetStringField(TEXT("prior_value_string"), PriorValueString);
-	Out->SetField(TEXT("new_value"),                CFG_GetCVarValueJson(*Var));
-	Out->SetStringField(TEXT("new_value_string"),   Var->GetString());
-	Out->SetStringField(TEXT("set_by"),             GetConsoleVariableSetByName(Var->GetFlags()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("set"),                  true)
+		.Str(TEXT("name"),                  Name)
+		.Str(TEXT("type"),                  TypeStr)
+		.Field(TEXT("prior_value"),         PriorValueJson)
+		.Str(TEXT("prior_value_string"),    PriorValueString)
+		.Field(TEXT("new_value"),           CFG_GetCVarValueJson(*Var))
+		.Str(TEXT("new_value_string"),      Var->GetString())
+		.Str(TEXT("set_by"),                GetConsoleVariableSetByName(Var->GetFlags()))
+		.BuildSuccess(Request);
 }
 
 // ─── cfg.list_cvars ───────────────────────────────────────────────────────────────────────────
@@ -825,16 +826,16 @@ FMCPResponse Tool_Read(const FMCPRequest& Request)
 				*Key, *Section, *IniBaseName));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("found"),           true);
-	Out->SetStringField(TEXT("value"),         RawValue);
-	Out->SetStringField(TEXT("raw_string"),    RawValue);
-	Out->SetStringField(TEXT("type_hint"),     CFG_GuessIniTypeHint(RawValue));
-	Out->SetStringField(TEXT("ini_path"),      IniPath);
-	Out->SetStringField(TEXT("ini_file_echo"), IniBaseName);
-	Out->SetStringField(TEXT("section_echo"),  Section);
-	Out->SetStringField(TEXT("key_echo"),      Key);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("found"),         true)
+		.Str(TEXT("value"),          RawValue)
+		.Str(TEXT("raw_string"),     RawValue)
+		.Str(TEXT("type_hint"),      CFG_GuessIniTypeHint(RawValue))
+		.Str(TEXT("ini_path"),       IniPath)
+		.Str(TEXT("ini_file_echo"),  IniBaseName)
+		.Str(TEXT("section_echo"),   Section)
+		.Str(TEXT("key_echo"),       Key)
+		.BuildSuccess(Request);
 }
 
 // ─── cfg.write ────────────────────────────────────────────────────────────────────────────────
@@ -942,17 +943,17 @@ FMCPResponse Tool_Write(const FMCPRequest& Request)
 	// the file is read-only on disk; we report the result so caller can detect this case.
 	const bool bFileOnDisk = IFileManager::Get().FileExists(*IniPath);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("written"),           true);
-	Out->SetBoolField(TEXT("prior_existed"),     bPriorExisted);
-	Out->SetStringField(TEXT("prior_value"),     bPriorExisted ? PriorValue : FString());
-	Out->SetStringField(TEXT("new_value_string"), PostValue);
-	Out->SetStringField(TEXT("ini_path"),        IniPath);
-	Out->SetStringField(TEXT("ini_file_echo"),   IniBaseName);
-	Out->SetStringField(TEXT("section_echo"),    Section);
-	Out->SetStringField(TEXT("key_echo"),        Key);
-	Out->SetBoolField(TEXT("flushed"),           bFileOnDisk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("written"),            true)
+		.Bool(TEXT("prior_existed"),      bPriorExisted)
+		.Str(TEXT("prior_value"),         bPriorExisted ? PriorValue : FString())
+		.Str(TEXT("new_value_string"),    PostValue)
+		.Str(TEXT("ini_path"),            IniPath)
+		.Str(TEXT("ini_file_echo"),       IniBaseName)
+		.Str(TEXT("section_echo"),        Section)
+		.Str(TEXT("key_echo"),            Key)
+		.Bool(TEXT("flushed"),            bFileOnDisk)
+		.BuildSuccess(Request);
 }
 
 // ─── cfg.list_sections ────────────────────────────────────────────────────────────────────────

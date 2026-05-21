@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -236,29 +237,25 @@ FMCPResponse Tool_GetInfo(const FMCPRequest& Request)
 	UTexture2D* Tex = FMCPAssetLoader::Load<UTexture2D>(TexPath, LoadErrCode, LoadErrMsg);
 	if (!Tex) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("asset_path"), Tex->GetPathName());
-
 	// Size — [W, H] as JSON array.
-	{
-		TArray<TSharedPtr<FJsonValue>> Size;
-		Size.Reserve(2);
-		Size.Add(MakeShared<FJsonValueNumber>(Tex->GetSizeX()));
-		Size.Add(MakeShared<FJsonValueNumber>(Tex->GetSizeY()));
-		Out->SetArrayField(TEXT("size"), Size);
-	}
+	TArray<TSharedPtr<FJsonValue>> Size;
+	Size.Reserve(2);
+	Size.Add(MakeShared<FJsonValueNumber>(Tex->GetSizeX()));
+	Size.Add(MakeShared<FJsonValueNumber>(Tex->GetSizeY()));
 
-	Out->SetStringField(TEXT("pixel_format"), GetPixelFormatString(Tex->GetPixelFormat()));
-	Out->SetStringField(TEXT("compression"),  TEX_CompressionToString(Tex->CompressionSettings));
-	Out->SetNumberField(TEXT("mip_count"),    Tex->GetNumMips());
-	Out->SetBoolField  (TEXT("srgb"),         Tex->SRGB != 0);
-	Out->SetStringField(TEXT("lod_group"),    TEX_LODGroupToString(Tex->LODGroup));
-	Out->SetNumberField(TEXT("lod_bias"),     Tex->LODBias);
-	Out->SetBoolField  (TEXT("never_stream"), Tex->NeverStream != 0);
-	Out->SetStringField(TEXT("address_x"),    TEX_AddressToString(Tex->GetTextureAddressX()));
-	Out->SetStringField(TEXT("address_y"),    TEX_AddressToString(Tex->GetTextureAddressY()));
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str (TEXT("asset_path"),   Tex->GetPathName())
+		.Arr (TEXT("size"),         MoveTemp(Size))
+		.Str (TEXT("pixel_format"), GetPixelFormatString(Tex->GetPixelFormat()))
+		.Str (TEXT("compression"),  TEX_CompressionToString(Tex->CompressionSettings))
+		.Num (TEXT("mip_count"),    Tex->GetNumMips())
+		.Bool(TEXT("srgb"),         Tex->SRGB != 0)
+		.Str (TEXT("lod_group"),    TEX_LODGroupToString(Tex->LODGroup))
+		.Num (TEXT("lod_bias"),     Tex->LODBias)
+		.Bool(TEXT("never_stream"), Tex->NeverStream != 0)
+		.Str (TEXT("address_x"),    TEX_AddressToString(Tex->GetTextureAddressX()))
+		.Str (TEXT("address_y"),    TEX_AddressToString(Tex->GetTextureAddressY()))
+		.BuildSuccess(Request);
 }
 
 // ─── texture.set_compression ──────────────────────────────────────────────────────────────────
@@ -315,12 +312,12 @@ FMCPResponse Tool_SetCompression(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Tex->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("asset_path"),            Tex->GetPathName());
-	Out->SetStringField(TEXT("prior_compression"),     TEX_CompressionToString(PriorComp));
-	Out->SetStringField(TEXT("new_compression"),       TEX_CompressionToString(NewComp));
-	Out->SetBoolField  (TEXT("update_resource_called"), bUpdateResource);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str (TEXT("asset_path"),            Tex->GetPathName())
+		.Str (TEXT("prior_compression"),     TEX_CompressionToString(PriorComp))
+		.Str (TEXT("new_compression"),       TEX_CompressionToString(NewComp))
+		.Bool(TEXT("update_resource_called"), bUpdateResource)
+		.BuildSuccess(Request);
 }
 
 // ─── texture.generate_solid_color ─────────────────────────────────────────────────────────────
@@ -451,12 +448,12 @@ FMCPResponse Tool_GenerateSolidColor(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField  (TEXT("created"),    true);
-	Out->SetStringField(TEXT("asset_path"), NewTex->GetPathName());
-	Out->SetBoolField  (TEXT("saved"),      bSavedOk);
-	Out->SetNumberField(TEXT("size"),       Size);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"),    true)
+		.Str (TEXT("asset_path"), NewTex->GetPathName())
+		.Bool(TEXT("saved"),      bSavedOk)
+		.Int (TEXT("size"),       Size)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

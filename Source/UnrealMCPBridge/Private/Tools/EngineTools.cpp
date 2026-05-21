@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPWorldContext.h"
@@ -222,16 +223,15 @@ FMCPResponse Tool_GCCollect(const FMCPRequest& Request)
 	const double FreedMB = PriorMB - NewMB;
 	const double DurationSeconds = EndTime - StartTime;
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField  (TEXT("collected"),              bCollected);
-	Out->SetBoolField  (TEXT("forced"),                 bForce);
-	Out->SetBoolField  (TEXT("purge_object_references"), bPurgeObjectReferences);
-	Out->SetNumberField(TEXT("prior_allocated_mb"),     PriorMB);
-	Out->SetNumberField(TEXT("new_allocated_mb"),       NewMB);
-	Out->SetNumberField(TEXT("freed_mb"),               FreedMB);
-	Out->SetNumberField(TEXT("duration_seconds"),       DurationSeconds);
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("collected"),              bCollected)
+		.Bool(TEXT("forced"),                 bForce)
+		.Bool(TEXT("purge_object_references"), bPurgeObjectReferences)
+		.Num(TEXT("prior_allocated_mb"),     PriorMB)
+		.Num(TEXT("new_allocated_mb"),       NewMB)
+		.Num(TEXT("freed_mb"),               FreedMB)
+		.Num(TEXT("duration_seconds"),       DurationSeconds)
+		.BuildSuccess(Request);
 }
 
 // ─── engine.get_memory_snapshot ────────────────────────────────────────────────────────────────

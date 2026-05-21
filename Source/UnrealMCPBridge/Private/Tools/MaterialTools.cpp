@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -425,25 +426,23 @@ FMCPResponse Tool_ListParameters(const FMCPRequest& Request)
 	ParamsObj->SetArrayField(TEXT("texture"),       TextureArr);
 	ParamsObj->SetArrayField(TEXT("static_switch"), StaticSwitchArr);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetObjectField(TEXT("parameters"), ParamsObj);
-	Out->SetStringField(TEXT("source_class"), Material->GetClass()->GetPathName());
-	Out->SetNumberField(TEXT("total_known"), static_cast<double>(TotalKnown));
-
 	// Emit next_page_token iff there are params past the last emitted entry. RemainingAfterPage
 	// counts entries skipped because Budget hit zero — non-zero means there's at least one more
 	// page worth of data. EmittedCursorKey is the "<cat_idx>|<name>" encoding the next-page
 	// resume gate consumes.
-	if (bAnyEmittedThisPage && RemainingAfterPage > 0)
-	{
-		FMCPPageCursor NextCursor;
-		NextCursor.FilterHash         = FilterHash;
-		NextCursor.LastAssetPath      = EmittedCursorKey;
-		NextCursor.TotalKnownSnapshot = TotalKnown;
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
-	}
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.ObjectShared(TEXT("parameters"), ParamsObj)
+		.Str(TEXT("source_class"), Material->GetClass()->GetPathName())
+		.Int(TEXT("total_known"), TotalKnown)
+		.If(bAnyEmittedThisPage && RemainingAfterPage > 0, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor NextCursor;
+			NextCursor.FilterHash         = FilterHash;
+			NextCursor.LastAssetPath      = EmittedCursorKey;
+			NextCursor.TotalKnownSnapshot = TotalKnown;
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── material.get_parameter (Lane A, no PIE guard) ────────────────────────────────────────────
@@ -493,13 +492,13 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		const float Default = Base
 			? UMaterialEditingLibrary::GetMaterialDefaultScalarParameterValue(Base, ParamName)
 			: 0.0f;
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("found"),   true);
-		Out->SetStringField(TEXT("type"),  MAT_ParameterTypeScalar);
-		Out->SetNumberField(TEXT("value"), Value);
-		Out->SetNumberField(TEXT("default"), Default);
-		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		PathErr = FMCPJsonBuilder()
+			.Bool(TEXT("found"),   true)
+			.Str(TEXT("type"),  MAT_ParameterTypeScalar)
+			.Num(TEXT("value"), Value)
+			.Num(TEXT("default"), Default)
+			.Str(TEXT("group"), TEXT(""))
+			.BuildSuccess(Request);
 		return true;
 	};
 
@@ -514,13 +513,13 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		const FLinearColor Default = Base
 			? UMaterialEditingLibrary::GetMaterialDefaultVectorParameterValue(Base, ParamName)
 			: FLinearColor::Black;
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("found"),  true);
-		Out->SetStringField(TEXT("type"), MAT_ParameterTypeVector);
-		Out->SetObjectField(TEXT("value"),   MAT_LinearColorToJson(Value));
-		Out->SetObjectField(TEXT("default"), MAT_LinearColorToJson(Default));
-		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		PathErr = FMCPJsonBuilder()
+			.Bool(TEXT("found"),  true)
+			.Str(TEXT("type"), MAT_ParameterTypeVector)
+			.ObjectShared(TEXT("value"),   MAT_LinearColorToJson(Value))
+			.ObjectShared(TEXT("default"), MAT_LinearColorToJson(Default))
+			.Str(TEXT("group"), TEXT(""))
+			.BuildSuccess(Request);
 		return true;
 	};
 
@@ -535,13 +534,13 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		UTexture* Default = Base
 			? UMaterialEditingLibrary::GetMaterialDefaultTextureParameterValue(Base, ParamName)
 			: nullptr;
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("found"),   true);
-		Out->SetStringField(TEXT("type"),  MAT_ParameterTypeTexture);
-		Out->SetStringField(TEXT("value"),   Value   ? Value->GetPathName()   : FString());
-		Out->SetStringField(TEXT("default"), Default ? Default->GetPathName() : FString());
-		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		PathErr = FMCPJsonBuilder()
+			.Bool(TEXT("found"),   true)
+			.Str(TEXT("type"),  MAT_ParameterTypeTexture)
+			.Str(TEXT("value"),   Value   ? Value->GetPathName()   : FString())
+			.Str(TEXT("default"), Default ? Default->GetPathName() : FString())
+			.Str(TEXT("group"), TEXT(""))
+			.BuildSuccess(Request);
 		return true;
 	};
 
@@ -557,13 +556,13 @@ FMCPResponse Tool_GetParameter(const FMCPRequest& Request)
 		const bool bDefault = Base
 			? UMaterialEditingLibrary::GetMaterialDefaultStaticSwitchParameterValue(Base, ParamName)
 			: false;
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("found"),  true);
-		Out->SetStringField(TEXT("type"), MAT_ParameterTypeStaticSwitch);
-		Out->SetBoolField(TEXT("value"),   bValue);
-		Out->SetBoolField(TEXT("default"), bDefault);
-		Out->SetStringField(TEXT("group"), TEXT(""));
-		PathErr = FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		PathErr = FMCPJsonBuilder()
+			.Bool(TEXT("found"),  true)
+			.Str(TEXT("type"), MAT_ParameterTypeStaticSwitch)
+			.Bool(TEXT("value"),   bValue)
+			.Bool(TEXT("default"), bDefault)
+			.Str(TEXT("group"), TEXT(""))
+			.BuildSuccess(Request);
 		return true;
 	};
 
@@ -759,10 +758,10 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 
 	MIC->GetOutermost()->MarkPackageDirty();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("applied"), true);
-	Out->SetNumberField(TEXT("prior_value"), PriorValue);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.Num(TEXT("prior_value"), PriorValue)
+		.BuildSuccess(Request);
 }
 
 // ─── material.set_vector_param (Lane A, PIE-guarded, MIC-only) ────────────────────────────────
@@ -821,10 +820,10 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 
 	MIC->GetOutermost()->MarkPackageDirty();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("applied"), true);
-	Out->SetObjectField(TEXT("prior_value"), MAT_LinearColorToJson(PriorValue));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.ObjectShared(TEXT("prior_value"), MAT_LinearColorToJson(PriorValue))
+		.BuildSuccess(Request);
 }
 
 // ─── material.set_texture_param (Lane A, PIE-guarded, MIC-only) ───────────────────────────────
@@ -884,11 +883,11 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 
 	MIC->GetOutermost()->MarkPackageDirty();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("applied"), true);
-	Out->SetStringField(TEXT("prior_value"),
-		PriorTexture ? PriorTexture->GetPathName() : FString());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.Str(TEXT("prior_value"),
+			PriorTexture ? PriorTexture->GetPathName() : FString())
+		.BuildSuccess(Request);
 }
 
 // ─── material.set_static_switch (Lane A, PIE-guarded, MIC-only, backpressure) ─────────────────
@@ -972,12 +971,12 @@ FMCPResponse Tool_SetStaticSwitch(const FMCPRequest& Request)
 
 	MIC->GetOutermost()->MarkPackageDirty();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("applied"), true);
-	Out->SetBoolField(TEXT("prior_value"), bPriorValue);
-	Out->SetBoolField(TEXT("recompile_triggered"), true);
-	Out->SetBoolField(TEXT("recompile_already_pending"), bRecompileAlreadyPending);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.Bool(TEXT("prior_value"), bPriorValue)
+		.Bool(TEXT("recompile_triggered"), true)
+		.Bool(TEXT("recompile_already_pending"), bRecompileAlreadyPending)
+		.BuildSuccess(Request);
 }
 
 // ─── material.is_shader_compiling (Lane A, no PIE guard, trivial) ─────────────────────────────
@@ -998,10 +997,10 @@ FMCPResponse Tool_IsShaderCompiling(const FMCPRequest& Request)
 		RemainingJobs = GShaderCompilingManager->GetNumRemainingJobs();
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("compiling"), bCompiling);
-	Out->SetNumberField(TEXT("remaining_jobs"), static_cast<double>(RemainingJobs));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("compiling"), bCompiling)
+		.Int(TEXT("remaining_jobs"), RemainingJobs)
+		.BuildSuccess(Request);
 }
 
 // ─── material.create_instance (Lane A, PIE-guarded) ───────────────────────────────────────────
@@ -1103,10 +1102,10 @@ FMCPResponse Tool_CreateInstance(const FMCPRequest& Request)
 	}
 	Scope.DirtyPackage(NewMIC->GetPackage());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("mic_path"), NewMIC->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("mic_path"), NewMIC->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── material.get_compile_errors (Lane A, no PIE guard) ───────────────────────────────────────
@@ -1154,11 +1153,11 @@ FMCPResponse Tool_GetCompileErrors(const FMCPRequest& Request)
 	// needs the distinction.
 	TArray<TSharedPtr<FJsonValue>> WarningArr;
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("has_errors"), ErrorArr.Num() > 0);
-	Out->SetArrayField(TEXT("errors"),    ErrorArr);
-	Out->SetArrayField(TEXT("warnings"),  WarningArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("has_errors"), ErrorArr.Num() > 0)
+		.Arr(TEXT("errors"),    MoveTemp(ErrorArr))
+		.Arr(TEXT("warnings"),  MoveTemp(WarningArr))
+		.BuildSuccess(Request);
 }
 
 // ─── Wave G Surface 2: material graph node editing (4 tools, all Lane A, PIE-guarded) ─────────
@@ -1384,18 +1383,17 @@ FMCPResponse Tool_AddExpression(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Material->GetPackage());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("expression_guid"), MAT_FormatExpressionGuid(NewExpr));
-	Out->SetStringField(TEXT("expression_class"), ExprClass->GetPathName());
 	TArray<TSharedPtr<FJsonValue>> PositionResp;
 	PositionResp.Add(MakeShared<FJsonValueNumber>(NewExpr->MaterialExpressionEditorX));
 	PositionResp.Add(MakeShared<FJsonValueNumber>(NewExpr->MaterialExpressionEditorY));
-	Out->SetArrayField(TEXT("position"), PositionResp);
-	if (NewExpr->HasAParameterName())
-	{
-		Out->SetStringField(TEXT("parameter_name"), NewExpr->GetParameterName().ToString());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const bool bHasParamName = NewExpr->HasAParameterName();
+	return FMCPJsonBuilder()
+		.Str(TEXT("expression_guid"), MAT_FormatExpressionGuid(NewExpr))
+		.Str(TEXT("expression_class"), ExprClass->GetPathName())
+		.Arr(TEXT("position"), MoveTemp(PositionResp))
+		.If(bHasParamName, [&](FMCPJsonBuilder& B)
+			{ B.Str(TEXT("parameter_name"), NewExpr->GetParameterName().ToString()); })
+		.BuildSuccess(Request);
 }
 
 // ─── mat.connect_expressions ───────────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -912,7 +913,6 @@ FMCPResponse Tool_Exists(const FMCPRequest& Request)
 	FString ErrMsg;
 	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(Path, ErrCode, ErrMsg);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	if (!Blueprint)
 	{
 		// Path-shape errors and type-mismatch errors still surface as real errors. Only the
@@ -926,13 +926,15 @@ FMCPResponse Tool_Exists(const FMCPRequest& Request)
 			return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 		}
 		// -32004 ObjectNotFound → exists=false success response.
-		Out->SetBoolField(TEXT("exists"), false);
-		Out->SetField(TEXT("generated_class_path"), MakeShared<FJsonValueNull>());
-		Out->SetField(TEXT("parent_class_path"), MakeShared<FJsonValueNull>());
-		Out->SetBoolField(TEXT("is_data_only"), false);
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("exists"), false)
+			.Null(TEXT("generated_class_path"))
+			.Null(TEXT("parent_class_path"))
+			.Bool(TEXT("is_data_only"), false)
+			.BuildSuccess(Request);
 	}
 
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetBoolField(TEXT("exists"), true);
 	if (UClass* GeneratedClass = FMCPBlueprintUtils::GetGeneratedClass(Blueprint))
 	{
@@ -1004,10 +1006,10 @@ FMCPResponse Tool_GetVariable(const FMCPRequest& Request)
 		return VarErr;
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetObjectField(TEXT("variable"), VarObj);
-	Out->SetBoolField(TEXT("found"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.ObjectShared(TEXT("variable"), VarObj.ToSharedRef())
+		.Bool(TEXT("found"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_variables (Lane A, no PIE guard, paginated) ─────────────────────────────────────
@@ -1089,23 +1091,20 @@ FMCPResponse Tool_ListVariables(const FMCPRequest& Request)
 		LastEmittedKey = Var.VarName.ToString();
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("variables"), Items);
-	Out->SetNumberField(TEXT("total_known"), static_cast<double>(SortedIndices.Num()));
-
-	if (EndIdxExcl < SortedIndices.Num() && !LastEmittedKey.IsEmpty())
-	{
-		FMCPPageCursor NextCursor;
-		NextCursor.FilterHash = FilterHash;
-		NextCursor.LastAssetPath = LastEmittedKey;
-		NextCursor.TotalKnownSnapshot = SortedIndices.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
-	}
-	else
-	{
-		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const bool bHasNext = (EndIdxExcl < SortedIndices.Num() && !LastEmittedKey.IsEmpty());
+	return FMCPJsonBuilder()
+		.Arr(TEXT("variables"), MoveTemp(Items))
+		.Int(TEXT("total_known"), SortedIndices.Num())
+		.If(bHasNext, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor NextCursor;
+			NextCursor.FilterHash = FilterHash;
+			NextCursor.LastAssetPath = LastEmittedKey;
+			NextCursor.TotalKnownSnapshot = SortedIndices.Num();
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
+		})
+		.If(!bHasNext, [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_functions (Lane A, no PIE guard, paginated) ─────────────────────────────────────
@@ -1181,23 +1180,20 @@ FMCPResponse Tool_ListFunctions(const FMCPRequest& Request)
 		LastEmittedKey = Graphs[i]->GetFName().ToString();
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("functions"), Items);
-	Out->SetNumberField(TEXT("total_known"), static_cast<double>(Graphs.Num()));
-
-	if (EndIdxExcl < Graphs.Num() && !LastEmittedKey.IsEmpty())
-	{
-		FMCPPageCursor NextCursor;
-		NextCursor.FilterHash = FilterHash;
-		NextCursor.LastAssetPath = LastEmittedKey;
-		NextCursor.TotalKnownSnapshot = Graphs.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
-	}
-	else
-	{
-		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const bool bHasNext = (EndIdxExcl < Graphs.Num() && !LastEmittedKey.IsEmpty());
+	return FMCPJsonBuilder()
+		.Arr(TEXT("functions"), MoveTemp(Items))
+		.Int(TEXT("total_known"), Graphs.Num())
+		.If(bHasNext, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor NextCursor;
+			NextCursor.FilterHash = FilterHash;
+			NextCursor.LastAssetPath = LastEmittedKey;
+			NextCursor.TotalKnownSnapshot = Graphs.Num();
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
+		})
+		.If(!bHasNext, [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+		.BuildSuccess(Request);
 }
 
 // ─── bp.get_function (Lane A, no PIE guard) ──────────────────────────────────────────────────
@@ -1259,9 +1255,9 @@ FMCPResponse Tool_GetFunction(const FMCPRequest& Request)
 	FnObj->SetArrayField(TEXT("local_variables"), Locals);
 	FnObj->SetNumberField(TEXT("execution_path_node_count"), static_cast<double>(Graph->Nodes.Num()));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetObjectField(TEXT("function"), FnObj);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.ObjectShared(TEXT("function"), FnObj.ToSharedRef())
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_nodes_in_function (Lane A, no PIE guard, paginated) ─────────────────────────────
@@ -1356,23 +1352,20 @@ FMCPResponse Tool_ListNodesInFunction(const FMCPRequest& Request)
 		LastEmittedKey = Nodes[i]->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("nodes"), Items);
-	Out->SetNumberField(TEXT("total_known"), static_cast<double>(Nodes.Num()));
-
-	if (EndIdxExcl < Nodes.Num() && !LastEmittedKey.IsEmpty())
-	{
-		FMCPPageCursor NextCursor;
-		NextCursor.FilterHash = FilterHash;
-		NextCursor.LastAssetPath = LastEmittedKey;
-		NextCursor.TotalKnownSnapshot = Nodes.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
-	}
-	else
-	{
-		Out->SetField(TEXT("next_page_token"), MakeShared<FJsonValueNull>());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const bool bHasNext = (EndIdxExcl < Nodes.Num() && !LastEmittedKey.IsEmpty());
+	return FMCPJsonBuilder()
+		.Arr(TEXT("nodes"), MoveTemp(Items))
+		.Int(TEXT("total_known"), Nodes.Num())
+		.If(bHasNext, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor NextCursor;
+			NextCursor.FilterHash = FilterHash;
+			NextCursor.LastAssetPath = LastEmittedKey;
+			NextCursor.TotalKnownSnapshot = Nodes.Num();
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(NextCursor));
+		})
+		.If(!bHasNext, [](FMCPJsonBuilder& B) { B.Null(TEXT("next_page_token")); })
+		.BuildSuccess(Request);
 }
 
 // ─── bp.add_variable (Lane A, PIE-guarded — edit-const gate carve-out) ───────────────────────
@@ -1508,10 +1501,10 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 	// existing variable's default on a CDO post-creation — that one would correctly apply.
 	// args.bypass_readonly is accepted but currently a no-op (forward-compat).
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("variable_name"), VarNameStr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("variable_name"), VarNameStr)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.remove_variable (Lane A, PIE-guarded, idempotent) ────────────────────────────────────
@@ -1552,20 +1545,21 @@ FMCPResponse Tool_RemoveVariable(const FMCPRequest& Request)
 	const FName VarName(*VarNameStr);
 	const bool bWasPresent = (FMCPBlueprintUtils::FindVariableIndex(Blueprint, VarName) != INDEX_NONE);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	if (!bWasPresent)
 	{
-		Out->SetBoolField(TEXT("removed"), false);
-		Out->SetBoolField(TEXT("was_present"), false);
 		Scope.Abort();
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("removed"), false)
+			.Bool(TEXT("was_present"), false)
+			.BuildSuccess(Request);
 	}
 
 	FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, VarName);
 
-	Out->SetBoolField(TEXT("removed"), true);
-	Out->SetBoolField(TEXT("was_present"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), true)
+		.Bool(TEXT("was_present"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.change_variable_type (Lane A, PIE-guarded) ───────────────────────────────────────────
@@ -1643,15 +1637,15 @@ FMCPResponse Tool_ChangeVariableType(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::ChangeMemberVariableType(Blueprint, VarName, NewPinType);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("changed"), true);
-	Out->SetObjectField(TEXT("prior_pin_type"), PriorPinTypeObj);
-	Out->SetStringField(TEXT("warning"),
-		TEXT("changing variable type may invalidate graph references to this variable — UE replaces "
-			 "incompatible nodes with red error nodes that need manual reconnection. Recompile "
-			 "and inspect the graph after this call. Pass drop_default_value=true if the prior "
-			 "default is no longer type-compatible."));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("changed"), true)
+		.ObjectShared(TEXT("prior_pin_type"), PriorPinTypeObj.ToSharedRef())
+		.Str(TEXT("warning"),
+			TEXT("changing variable type may invalidate graph references to this variable — UE replaces "
+				 "incompatible nodes with red error nodes that need manual reconnection. Recompile "
+				 "and inspect the graph after this call. Pass drop_default_value=true if the prior "
+				 "default is no longer type-compatible."))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.add_function (Lane A, PIE-guarded) ───────────────────────────────────────────────────
@@ -1843,10 +1837,10 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("function_name"), FnNameStr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("function_name"), FnNameStr)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.remove_function (Lane A, PIE-guarded, idempotent) ────────────────────────────────────
@@ -1884,20 +1878,21 @@ FMCPResponse Tool_RemoveFunction(const FMCPRequest& Request)
 	const FName FnName(*FnNameStr);
 	UEdGraph* Graph = FMCPBlueprintUtils::FindFunctionGraph(Blueprint, FnName);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	if (!Graph)
 	{
-		Out->SetBoolField(TEXT("removed"), false);
-		Out->SetBoolField(TEXT("was_present"), false);
 		Scope.Abort();
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("removed"), false)
+			.Bool(TEXT("was_present"), false)
+			.BuildSuccess(Request);
 	}
 
 	FBlueprintEditorUtils::RemoveGraph(Blueprint, Graph, EGraphRemoveFlags::Recompile);
 
-	Out->SetBoolField(TEXT("removed"), true);
-	Out->SetBoolField(TEXT("was_present"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), true)
+		.Bool(TEXT("was_present"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.reparent (Lane A, PIE-guarded, EXPERIMENTAL, confirm_dangerous-gated) ────────────────
@@ -1976,13 +1971,13 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 	// we just forwarded to UE.
 	if (NewParentClass == OldParentClass)
 	{
-		TSharedRef<FJsonObject> NoOpOut = MakeShared<FJsonObject>();
-		NoOpOut->SetBoolField(TEXT("reparented"), false);
-		NoOpOut->SetStringField(TEXT("prior_parent"), OldParentClass->GetPathName());
-		NoOpOut->SetArrayField(TEXT("lost_variables"), TArray<TSharedPtr<FJsonValue>>());
-		NoOpOut->SetArrayField(TEXT("lost_functions"), TArray<TSharedPtr<FJsonValue>>());
 		Scope.Abort();
-		return FMCPToolHelpers::MakeSuccessObj(Request, NoOpOut);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("reparented"), false)
+			.Str(TEXT("prior_parent"), OldParentClass->GetPathName())
+			.Arr(TEXT("lost_variables"), TArray<TSharedPtr<FJsonValue>>())
+			.Arr(TEXT("lost_functions"), TArray<TSharedPtr<FJsonValue>>())
+			.BuildSuccess(Request);
 	}
 
 	// Diff variables / functions that the OLD parent declared but the NEW parent does NOT.
@@ -2029,12 +2024,12 @@ FMCPResponse Tool_Reparent(const FMCPRequest& Request)
 		*Path, *OldParentName, *NewParentClass->GetPathName(),
 		LostVars.Num(), LostFuncs.Num());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("reparented"), true);
-	Out->SetStringField(TEXT("prior_parent"), OldParentName);
-	Out->SetArrayField(TEXT("lost_variables"), BP_StringSetToJsonArray(LostVars));
-	Out->SetArrayField(TEXT("lost_functions"), BP_StringSetToJsonArray(LostFuncs));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("reparented"), true)
+		.Str(TEXT("prior_parent"), OldParentName)
+		.Arr(TEXT("lost_variables"), BP_StringSetToJsonArray(LostVars))
+		.Arr(TEXT("lost_functions"), BP_StringSetToJsonArray(LostFuncs))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.compile (Lane A sync, PIE-guarded) ────────────────────────────────────────────────────
@@ -2240,14 +2235,14 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
-	Out->SetStringField(TEXT("generated_class"),
-		NewBP && NewBP->GeneratedClass ? NewBP->GeneratedClass->GetPathName() : FString());
-	Out->SetStringField(TEXT("parent_class"), ParentClass->GetPathName());
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("asset_path"), NewAsset->GetPathName())
+		.Str(TEXT("generated_class"),
+			NewBP && NewBP->GeneratedClass ? NewBP->GeneratedClass->GetPathName() : FString())
+		.Str(TEXT("parent_class"), ParentClass->GetPathName())
+		.Bool(TEXT("saved"), bSavedOk)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.add_function_parameter (Lane A, PIE-guarded) ─────────────────────────────────────────
@@ -2394,11 +2389,11 @@ FMCPResponse Tool_AddFunctionParameter(const FMCPRequest& Request)
 	// UFunction shape stays in sync. Mirrors what Tool_AddFunction does at end-of-creation.
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("param_name"), ParamNameStr);
-	Out->SetStringField(TEXT("direction"), bIsInputDir ? TEXT("input") : TEXT("output"));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("param_name"), ParamNameStr)
+		.Str(TEXT("direction"), bIsInputDir ? TEXT("input") : TEXT("output"))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.remove_function_parameter (Lane A, PIE-guarded, idempotent on terminator side) ───────
@@ -2468,13 +2463,13 @@ FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
 		bWasInputDir = false;
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	if (!Owner)
 	{
-		Out->SetBoolField(TEXT("removed"), false);
-		Out->SetField(TEXT("direction"), MakeShared<FJsonValueNull>());
 		Scope.Abort();
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("removed"), false)
+			.Null(TEXT("direction"))
+			.BuildSuccess(Request);
 	}
 
 	Owner->Modify();
@@ -2484,9 +2479,10 @@ FMCPResponse Tool_RemoveFunctionParameter(const FMCPRequest& Request)
 	// shape stays in sync. Same rationale as Tool_AddFunctionParameter.
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	Out->SetBoolField(TEXT("removed"), true);
-	Out->SetStringField(TEXT("direction"), bWasInputDir ? TEXT("input") : TEXT("output"));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), true)
+		.Str(TEXT("direction"), bWasInputDir ? TEXT("input") : TEXT("output"))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_function_parameters (Lane A, NO PIE guard — read) ───────────────────────────────
@@ -2542,10 +2538,10 @@ FMCPResponse Tool_ListFunctionParameters(const FMCPRequest& Request)
 	TSharedPtr<FJsonValue> OutputsArr = BuildArray(Result, PinErr);
 	if (!OutputsArr.IsValid()) { return PinErr; }
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetField(TEXT("inputs"), InputsArr);
-	Out->SetField(TEXT("outputs"), OutputsArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Field(TEXT("inputs"), InputsArr.ToSharedRef())
+		.Field(TEXT("outputs"), OutputsArr.ToSharedRef())
+		.BuildSuccess(Request);
 }
 
 // ─── bp.set_function_metadata (Lane A, PIE-guarded) ──────────────────────────────────────────
@@ -2701,10 +2697,10 @@ FMCPResponse Tool_SetFunctionMetadata(const FMCPRequest& Request)
 
 	TSharedPtr<FJsonObject> NewSnap = BP_BuildFunctionMetadataSnapshot(Entry, Graph);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetObjectField(TEXT("prior"), PriorSnap);
-	Out->SetObjectField(TEXT("new"), NewSnap);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.ObjectShared(TEXT("prior"), PriorSnap.ToSharedRef())
+		.ObjectShared(TEXT("new"), NewSnap.ToSharedRef())
+		.BuildSuccess(Request);
 }
 
 // ─── Wave F Surface 4 — Blueprint interface implementation surface (3 tools) ─────────────────
@@ -2863,11 +2859,11 @@ FMCPResponse Tool_AddInterface(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("interface_class"), InterfacePath.ToString());
-	Out->SetNumberField(TEXT("generated_event_count"), GeneratedEventCount);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("interface_class"), InterfacePath.ToString())
+		.Int(TEXT("generated_event_count"), GeneratedEventCount)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.remove_interface (Lane A, PIE-guarded) ───────────────────────────────────────────────
@@ -2937,10 +2933,10 @@ FMCPResponse Tool_RemoveInterface(const FMCPRequest& Request)
 	// generated class. Mirrors the add path.
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("removed"), true);
-	Out->SetStringField(TEXT("interface_class"), InterfacePath.ToString());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), true)
+		.Str(TEXT("interface_class"), InterfacePath.ToString())
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_interfaces (Lane A, read — no PIE guard) ────────────────────────────────────────
@@ -3011,9 +3007,9 @@ FMCPResponse Tool_ListInterfaces(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("implemented_interfaces"), Items);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("implemented_interfaces"), MoveTemp(Items))
+		.BuildSuccess(Request);
 }
 
 // ─── Wave F Surface 5 — Blueprint variable metadata + category enumeration (2 tools) ─────────
@@ -3378,10 +3374,10 @@ FMCPResponse Tool_SetVariableMetadata(const FMCPRequest& Request)
 
 	TSharedPtr<FJsonObject> NewSnap = BP_BuildVariableMetadataSnapshot(Blueprint->NewVariables[Idx]);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetObjectField(TEXT("prior"), PriorSnap);
-	Out->SetObjectField(TEXT("new"), NewSnap);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.ObjectShared(TEXT("prior"), PriorSnap.ToSharedRef())
+		.ObjectShared(TEXT("new"), NewSnap.ToSharedRef())
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_categories (Lane A, no PIE guard, READ) ─────────────────────────────────────────
@@ -3435,9 +3431,9 @@ FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("categories"), BP_StringSetToJsonArray(Categories));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("categories"), BP_StringSetToJsonArray(Categories))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

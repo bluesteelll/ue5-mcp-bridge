@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -438,10 +439,10 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 	{
 		// Caller passed an explicit ``types`` array with no recognised entries — empty result is
 		// the correct response (not an error). Caller gets an empty curves[] + total_known=0.
-		TSharedRef<FJsonObject> OutEmpty = MakeShared<FJsonObject>();
-		OutEmpty->SetArrayField(TEXT("curves"), {});
-		OutEmpty->SetNumberField(TEXT("total_known"), 0);
-		return FMCPToolHelpers::MakeSuccessObj(Request, OutEmpty);
+		return FMCPJsonBuilder()
+			.Arr(TEXT("curves"), TArray<TSharedPtr<FJsonValue>>())
+			.Num(TEXT("total_known"), 0)
+			.BuildSuccess(Request);
 	}
 	Filter.bRecursiveClasses = false;
 	Filter.bRecursivePaths   = true;
@@ -733,10 +734,10 @@ FMCPResponse Tool_SetData(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(CurveObj->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("prior_key_count"), PriorKeyCount);
-	Out->SetNumberField(TEXT("new_key_count"),   NewKeyCount);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("prior_key_count"), PriorKeyCount)
+		.Num(TEXT("new_key_count"),   NewKeyCount)
+		.BuildSuccess(Request);
 }
 
 // ─── curve.add_key ────────────────────────────────────────────────────────────────────────────
@@ -847,11 +848,11 @@ FMCPResponse Tool_AddKey(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(CurveObj->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField  (TEXT("added"),         bAdded);
-	Out->SetBoolField  (TEXT("was_replaced"),  bWasReplaced);
-	Out->SetNumberField(TEXT("new_key_count"), NewKeyCount);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"),         bAdded)
+		.Bool(TEXT("was_replaced"),  bWasReplaced)
+		.Num(TEXT("new_key_count"),  NewKeyCount)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

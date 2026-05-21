@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -169,9 +170,9 @@ FMCPResponse Tool_ListWidgets(const FMCPRequest& Request)
 		WidgetsArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("widgets"), WidgetsArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("widgets"), MoveTemp(WidgetsArr))
+		.BuildSuccess(Request);
 }
 
 // ─── umg.get_widget_property ───────────────────────────────────────────────────────────────────
@@ -258,10 +259,10 @@ FMCPResponse Tool_GetWidgetProperty(const FMCPRequest& Request)
 				*PropertyPath, *WidgetName));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetField(TEXT("value"), ValueJson);
-	Out->SetStringField(TEXT("type"), FMCPReflection::DescribePropertyType(OutLeafProp));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Field(TEXT("value"), ValueJson.ToSharedRef())
+		.Str(TEXT("type"), FMCPReflection::DescribePropertyType(OutLeafProp))
+		.BuildSuccess(Request);
 }
 
 // ─── umg.create_widget_blueprint — create new UWidgetBlueprint with optional parent class ───
@@ -363,14 +364,14 @@ FMCPResponse Tool_CreateWidgetBlueprint(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
-	Out->SetStringField(TEXT("generated_class"),
-		WBP && WBP->GeneratedClass ? WBP->GeneratedClass->GetPathName() : FString());
-	Out->SetStringField(TEXT("parent_class"), ParentClass->GetPathName());
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), true)
+		.Str(TEXT("asset_path"), NewAsset->GetPathName())
+		.Str(TEXT("generated_class"),
+			WBP && WBP->GeneratedClass ? WBP->GeneratedClass->GetPathName() : FString())
+		.Str(TEXT("parent_class"), ParentClass->GetPathName())
+		.Bool(TEXT("saved"), bSavedOk)
+		.BuildSuccess(Request);
 }
 
 // ─── umg.add_widget — instantiate a UWidget into the BP's WidgetTree ────────────────────────
@@ -497,14 +498,14 @@ FMCPResponse Tool_AddWidget(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("widget_name"), NewWidget->GetName());
-	Out->SetStringField(TEXT("widget_class"), WidgetClass->GetPathName());
-	Out->SetStringField(TEXT("parent_widget_name"), ParentResolved);
-	Out->SetStringField(TEXT("parent_widget_class"),
-		ParentPanel ? ParentPanel->GetClass()->GetPathName() : FString(TEXT("<root>")));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("widget_name"), NewWidget->GetName())
+		.Str(TEXT("widget_class"), WidgetClass->GetPathName())
+		.Str(TEXT("parent_widget_name"), ParentResolved)
+		.Str(TEXT("parent_widget_class"),
+			ParentPanel ? ParentPanel->GetClass()->GetPathName() : FString(TEXT("<root>")))
+		.BuildSuccess(Request);
 }
 
 // ─── umg.remove_widget — remove widget from BP's WidgetTree ─────────────────────────────────
@@ -539,10 +540,10 @@ FMCPResponse Tool_RemoveWidget(const FMCPRequest& Request)
 	UWidget* W = WBP->WidgetTree->FindWidget(FName(*WidgetName));
 	if (!W)
 	{
-		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("removed"), false);
-		Out->SetBoolField(TEXT("was_present"), false);
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("removed"), false)
+			.Bool(TEXT("was_present"), false)
+			.BuildSuccess(Request);
 	}
 
 	// FMCPMutatorScope at function-top owns the FScopedTransaction lifetime.
@@ -551,10 +552,10 @@ FMCPResponse Tool_RemoveWidget(const FMCPRequest& Request)
 	const bool bRemoved = WBP->WidgetTree->RemoveWidget(W);
 	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("removed"), bRemoved);
-	Out->SetBoolField(TEXT("was_present"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), bRemoved)
+		.Bool(TEXT("was_present"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── umg.set_widget_property — write any UPROPERTY on a widget in the BP's tree ────────────
@@ -626,10 +627,10 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 	}
 	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("applied"), true);
-	Out->SetStringField(TEXT("property"), Prop->GetName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.Str(TEXT("property"), Prop->GetName())
+		.BuildSuccess(Request);
 }
 
 // ─── umg.bind_widget_event — bind multicast delegate event on a widget to a UFUNCTION ──────
@@ -731,12 +732,12 @@ FMCPResponse Tool_BindWidgetEvent(const FMCPRequest& Request)
 	WBP->Bindings.Add(Binding);
 	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("bound"), true);
-	Out->SetStringField(TEXT("event_name"), EventName);
-	Out->SetStringField(TEXT("function_name"), FunctionName);
-	Out->SetStringField(TEXT("widget_name"), WidgetName);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("bound"), true)
+		.Str(TEXT("event_name"), EventName)
+		.Str(TEXT("function_name"), FunctionName)
+		.Str(TEXT("widget_name"), WidgetName)
+		.BuildSuccess(Request);
 }
 
 // ─── umg.add_to_viewport — instantiate widget at runtime and add to viewport (PIE only) ─────
@@ -791,12 +792,12 @@ FMCPResponse Tool_AddToViewport(const FMCPRequest& Request)
 	W->Initialize();
 	W->AddToViewport(ZOrder);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("widget_path"), W->GetPathName());
-	Out->SetStringField(TEXT("class_path"), BP->GeneratedClass->GetPathName());
-	Out->SetNumberField(TEXT("z_order"), static_cast<double>(ZOrder));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("widget_path"), W->GetPathName())
+		.Str(TEXT("class_path"), BP->GeneratedClass->GetPathName())
+		.Num(TEXT("z_order"), static_cast<double>(ZOrder))
+		.BuildSuccess(Request);
 }
 
 // ─── umg.remove_from_viewport — remove a runtime widget instance from viewport (PIE only) ──
@@ -830,10 +831,10 @@ FMCPResponse Tool_RemoveFromViewport(const FMCPRequest& Request)
 	const bool bWasInViewport = W->IsInViewport();
 	W->RemoveFromParent();
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("removed"), true);
-	Out->SetBoolField(TEXT("was_in_viewport"), bWasInViewport);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), true)
+		.Bool(TEXT("was_in_viewport"), bWasInViewport)
+		.BuildSuccess(Request);
 }
 
 // ─── umg.list_root_widgets — enumerate widgets currently in viewport (PIE only) ────────────
@@ -861,10 +862,11 @@ FMCPResponse Tool_ListRootWidgets(const FMCPRequest& Request)
 		Widgets.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("widgets"), Widgets);
-	Out->SetNumberField(TEXT("count"), static_cast<double>(Widgets.Num()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 WidgetCount = Widgets.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("widgets"), MoveTemp(Widgets))
+		.Num(TEXT("count"), static_cast<double>(WidgetCount))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

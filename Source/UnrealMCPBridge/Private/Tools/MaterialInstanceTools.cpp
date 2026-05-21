@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -216,20 +217,20 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		InstanceArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("instances"), InstanceArr);
-	Out->SetNumberField(TEXT("total_known"), Assets.Num());
-
-	if (EndIdx < Assets.Num() && EndIdx > 0)
-	{
-		FMCPPageCursor OutCursor;
-		OutCursor.FilterHash = FilterHash;
-		OutCursor.LastAssetPath = Assets[EndIdx - 1].GetSoftObjectPath().ToString();
-		OutCursor.TotalKnownSnapshot = Assets.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
-	}
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalKnown = Assets.Num();
+	const bool bHasNextPage = (EndIdx < TotalKnown && EndIdx > 0);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("instances"), MoveTemp(InstanceArr))
+		.Num(TEXT("total_known"), TotalKnown)
+		.If(bHasNextPage, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor OutCursor;
+			OutCursor.FilterHash = FilterHash;
+			OutCursor.LastAssetPath = Assets[EndIdx - 1].GetSoftObjectPath().ToString();
+			OutCursor.TotalKnownSnapshot = TotalKnown;
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
+		})
+		.BuildSuccess(Request);
 }
 
 // ─── mat_inst.get_params ──────────────────────────────────────────────────────────────────────
@@ -340,11 +341,11 @@ FMCPResponse Tool_GetParams(const FMCPRequest& Request)
 		TextureArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("scalar_params"),  ScalarArr);
-	Out->SetArrayField(TEXT("vector_params"),  VectorArr);
-	Out->SetArrayField(TEXT("texture_params"), TextureArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("scalar_params"),  MoveTemp(ScalarArr))
+		.Arr(TEXT("vector_params"),  MoveTemp(VectorArr))
+		.Arr(TEXT("texture_params"), MoveTemp(TextureArr))
+		.BuildSuccess(Request);
 }
 
 // ─── mat_inst.set_scalar_param ────────────────────────────────────────────────────────────────
@@ -414,11 +415,11 @@ FMCPResponse Tool_SetScalarParam(const FMCPRequest& Request)
 	UMaterialEditingLibrary::SetMaterialInstanceScalarParameterValue(MIC, ParamName, ValueF);
 	Scope.DirtyPackage(MIC->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("set"), true);
-	Out->SetNumberField(TEXT("prior_value"), PriorValue);
-	Out->SetBoolField(TEXT("prior_overridden"), bPriorOverridden);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("set"), true)
+		.Num(TEXT("prior_value"), PriorValue)
+		.Bool(TEXT("prior_overridden"), bPriorOverridden)
+		.BuildSuccess(Request);
 }
 
 // ─── mat_inst.set_vector_param ────────────────────────────────────────────────────────────────
@@ -474,11 +475,11 @@ FMCPResponse Tool_SetVectorParam(const FMCPRequest& Request)
 	UMaterialEditingLibrary::SetMaterialInstanceVectorParameterValue(MIC, ParamName, Value);
 	Scope.DirtyPackage(MIC->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("set"), true);
-	Out->SetField(TEXT("prior_value"), MI_LinearColorToArray(PriorValue));
-	Out->SetBoolField(TEXT("prior_overridden"), bPriorOverridden);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("set"), true)
+		.Field(TEXT("prior_value"), MI_LinearColorToArray(PriorValue))
+		.Bool(TEXT("prior_overridden"), bPriorOverridden)
+		.BuildSuccess(Request);
 }
 
 // ─── mat_inst.set_texture_param ───────────────────────────────────────────────────────────────
@@ -531,12 +532,11 @@ FMCPResponse Tool_SetTextureParam(const FMCPRequest& Request)
 	UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MIC, ParamName, Texture);
 	Scope.DirtyPackage(MIC->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("set"), true);
-	Out->SetStringField(TEXT("prior_texture_path"),
-		PriorTexture ? PriorTexture->GetPathName() : FString());
-	Out->SetBoolField(TEXT("prior_overridden"), bPriorOverridden);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("set"), true)
+		.Str(TEXT("prior_texture_path"), PriorTexture ? PriorTexture->GetPathName() : FString())
+		.Bool(TEXT("prior_overridden"), bPriorOverridden)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -492,15 +493,15 @@ FMCPResponse Tool_HighResolution(const FMCPRequest& Request)
 			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("saved_path"), AbsPath);
-	Out->SetNumberField(TEXT("width"), OutW);
-	Out->SetNumberField(TEXT("height"), OutH);
-	Out->SetNumberField(TEXT("bytes"), static_cast<double>(BytesWritten));
-	Out->SetNumberField(TEXT("multiplier"), Multiplier);
-	Out->SetNumberField(TEXT("native_width"), NativeSize.X);
-	Out->SetNumberField(TEXT("native_height"), NativeSize.Y);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("saved_path"), AbsPath)
+		.Num(TEXT("width"), OutW)
+		.Num(TEXT("height"), OutH)
+		.Num(TEXT("bytes"), static_cast<double>(BytesWritten))
+		.Num(TEXT("multiplier"), Multiplier)
+		.Num(TEXT("native_width"), NativeSize.X)
+		.Num(TEXT("native_height"), NativeSize.Y)
+		.BuildSuccess(Request);
 }
 
 // ─── screenshot.region_capture ─────────────────────────────────────────────────────────────────
@@ -710,15 +711,15 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 	ResArrOut.Add(MakeShared<FJsonValueNumber>(OutW));
 	ResArrOut.Add(MakeShared<FJsonValueNumber>(OutH));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("saved_path"), AbsPath);
-	Out->SetNumberField(TEXT("width"), OutW);
-	Out->SetNumberField(TEXT("height"), OutH);
-	Out->SetNumberField(TEXT("bytes"), static_cast<double>(BytesWritten));
-	Out->SetStringField(TEXT("actor_path"), Actor->GetPathName());
-	Out->SetObjectField(TEXT("actor_bounds"), BoundsObj);
-	Out->SetArrayField(TEXT("captured_resolution"), ResArrOut);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("saved_path"), AbsPath)
+		.Num(TEXT("width"), OutW)
+		.Num(TEXT("height"), OutH)
+		.Num(TEXT("bytes"), static_cast<double>(BytesWritten))
+		.Str(TEXT("actor_path"), Actor->GetPathName())
+		.ObjectShared(TEXT("actor_bounds"), BoundsObj)
+		.Arr(TEXT("captured_resolution"), MoveTemp(ResArrOut))
+		.BuildSuccess(Request);
 }
 
 // ─── screenshot.diff ───────────────────────────────────────────────────────────────────────────
@@ -852,15 +853,15 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	// Dimension mismatch: well-defined "everything differs" result, not an error.
 	if (ImageA.SizeX != ImageB.SizeX || ImageA.SizeY != ImageB.SizeY)
 	{
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(TEXT("identical"), false);
-		Out->SetNumberField(TEXT("difference_pct"), 100.0);
-		Out->SetNumberField(TEXT("differing_pixels"), 0);
-		Out->SetNumberField(TEXT("total_pixels"), 0);
-		Out->SetObjectField(TEXT("image_a"), ASizeObj);
-		Out->SetObjectField(TEXT("image_b"), BSizeObj);
-		Out->SetStringField(TEXT("note"), TEXT("dimension mismatch — diff is 100% by definition"));
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("identical"), false)
+			.Num(TEXT("difference_pct"), 100.0)
+			.Num(TEXT("differing_pixels"), 0)
+			.Num(TEXT("total_pixels"), 0)
+			.ObjectShared(TEXT("image_a"), ASizeObj)
+			.ObjectShared(TEXT("image_b"), BSizeObj)
+			.Str(TEXT("note"), TEXT("dimension mismatch — diff is 100% by definition"))
+			.BuildSuccess(Request);
 	}
 
 	TArrayView64<const FColor> PixelsA = ImageA.AsBGRA8();
@@ -902,19 +903,16 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("identical"), bIdentical);
-	Out->SetNumberField(TEXT("difference_pct"), DiffPct);
-	Out->SetNumberField(TEXT("differing_pixels"), static_cast<double>(DiffCount));
-	Out->SetNumberField(TEXT("total_pixels"), static_cast<double>(TotalPixels));
-	Out->SetObjectField(TEXT("image_a"), ASizeObj);
-	Out->SetObjectField(TEXT("image_b"), BSizeObj);
-	Out->SetNumberField(TEXT("threshold"), Threshold);
-	if (bOverlayWritten)
-	{
-		Out->SetStringField(TEXT("diff_image_path"), DiffWritePath);
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("identical"), bIdentical)
+		.Num(TEXT("difference_pct"), DiffPct)
+		.Num(TEXT("differing_pixels"), static_cast<double>(DiffCount))
+		.Num(TEXT("total_pixels"), static_cast<double>(TotalPixels))
+		.ObjectShared(TEXT("image_a"), ASizeObj)
+		.ObjectShared(TEXT("image_b"), BSizeObj)
+		.Num(TEXT("threshold"), Threshold)
+		.If(bOverlayWritten, [&](FMCPJsonBuilder& B) { B.Str(TEXT("diff_image_path"), DiffWritePath); })
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

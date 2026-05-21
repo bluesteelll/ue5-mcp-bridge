@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -429,17 +430,11 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 		? GEditor->PlayWorld->GetOutermost()->GetName()
 		: FString();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("started"), true);
-	if (PlayWorldPath.IsEmpty())
-	{
-		Out->SetField(TEXT("pie_world_path"), MakeShared<FJsonValueNull>());
-	}
-	else
-	{
-		Out->SetStringField(TEXT("pie_world_path"), PlayWorldPath);
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("started"), true)
+		.If(PlayWorldPath.IsEmpty(),  [&](FMCPJsonBuilder& B) { B.Null(TEXT("pie_world_path")); })
+		.If(!PlayWorldPath.IsEmpty(), [&](FMCPJsonBuilder& B) { B.Str(TEXT("pie_world_path"), PlayWorldPath); })
+		.BuildSuccess(Request);
 }
 
 // ─── pie.stop ──────────────────────────────────────────────────────────────────────────────────
@@ -469,9 +464,9 @@ FMCPResponse Tool_Stop(const FMCPRequest& Request)
 
 	GEditor->RequestEndPlayMap();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("stopped"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("stopped"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.pause ─────────────────────────────────────────────────────────────────────────────────
@@ -502,9 +497,9 @@ FMCPResponse Tool_Pause(const FMCPRequest& Request)
 	// at the wire surface.
 	const bool bOk = GEditor->SetPIEWorldsPaused(true);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("paused"), bOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("paused"), bOk)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.resume ────────────────────────────────────────────────────────────────────────────────
@@ -529,9 +524,9 @@ FMCPResponse Tool_Resume(const FMCPRequest& Request)
 
 	const bool bOk = GEditor->SetPIEWorldsPaused(false);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("resumed"), bOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("resumed"), bOk)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.step_frame ────────────────────────────────────────────────────────────────────────────
@@ -567,11 +562,11 @@ FMCPResponse Tool_StepFrame(const FMCPRequest& Request)
 
 	GEditor->PlaySessionSingleStepped();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("advanced"), true);
 	// GFrameCounter is the global engine frame index — a monotonic uint64. Cast to double for JSON.
-	Out->SetNumberField(TEXT("current_frame"), static_cast<double>(GFrameCounter));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("advanced"), true)
+		.Num(TEXT("current_frame"), static_cast<double>(GFrameCounter))
+		.BuildSuccess(Request);
 }
 
 // ─── pie.console_exec ──────────────────────────────────────────────────────────────────────────
@@ -684,10 +679,10 @@ FMCPResponse Tool_ConsoleExec(const FMCPRequest& Request)
 		bAnyOk = bAnyOk || bOk;
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("executed"), bAnyOk);
-	Out->SetStringField(TEXT("output"), static_cast<const FString&>(OutputDevice));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("executed"), bAnyOk)
+		.Str(TEXT("output"), static_cast<const FString&>(OutputDevice))
+		.BuildSuccess(Request);
 }
 
 // ─── pie.is_running ────────────────────────────────────────────────────────────────────────────
@@ -705,11 +700,11 @@ FMCPResponse Tool_IsRunning(const FMCPRequest& Request)
 	const bool bPaused = bRunning && PIE_IsAnyWorldPaused();
 	const int32 WorldCount = bRunning ? PIE_CountWorlds() : 0;
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("running"), bRunning);
-	Out->SetBoolField(TEXT("paused"), bPaused);
-	Out->SetNumberField(TEXT("world_count"), static_cast<double>(WorldCount));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("running"), bRunning)
+		.Bool(TEXT("paused"), bPaused)
+		.Num(TEXT("world_count"), static_cast<double>(WorldCount))
+		.BuildSuccess(Request);
 }
 
 // ─── pie.get_player_controller ─────────────────────────────────────────────────────────────────
@@ -893,9 +888,9 @@ FMCPResponse Tool_FocusActor(const FMCPRequest& Request)
 	// other editor viewports the user may be using to monitor PIE from a different angle.
 	GEditor->MoveViewportCamerasToActor(*Target, /*bActiveViewportOnly*/ true);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("focused"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("focused"), true)
+		.BuildSuccess(Request);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -960,11 +955,11 @@ FMCPResponse Tool_SimulateKey(const FMCPRequest& Request)
 			FString::Printf(TEXT("unknown action '%s'; use 'press', 'release', or 'tap'"), *Action));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("simulated"), true);
-	Out->SetStringField(TEXT("key"), KeyName);
-	Out->SetStringField(TEXT("action"), ActionLower);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("simulated"), true)
+		.Str(TEXT("key"), KeyName)
+		.Str(TEXT("action"), ActionLower)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.click_screen — synthesize a click at screen coordinates ────────────────────────────
@@ -1038,12 +1033,12 @@ FMCPResponse Tool_ClickScreen(const FMCPRequest& Request)
 	PC->InputKey(FInputKeyParams(MouseKey, IE_Pressed, 1.0, false));
 	PC->InputKey(FInputKeyParams(MouseKey, IE_Released, 0.0, false));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("clicked"), true);
-	Out->SetNumberField(TEXT("x"), X);
-	Out->SetNumberField(TEXT("y"), Y);
-	Out->SetStringField(TEXT("button"), BLow);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("clicked"), true)
+		.Num(TEXT("x"), X)
+		.Num(TEXT("y"), Y)
+		.Str(TEXT("button"), BLow)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.click_actor — project actor world pos to screen, then click ────────────────────────
@@ -1109,13 +1104,13 @@ FMCPResponse Tool_ClickActor(const FMCPRequest& Request)
 	PC->InputKey(FInputKeyParams(MouseKey, IE_Pressed,  1.0, false));
 	PC->InputKey(FInputKeyParams(MouseKey, IE_Released, 0.0, false));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("clicked"), true);
-	Out->SetStringField(TEXT("actor_path"), Target->GetPathName());
-	Out->SetNumberField(TEXT("screen_x"), ScreenPos.X);
-	Out->SetNumberField(TEXT("screen_y"), ScreenPos.Y);
-	Out->SetStringField(TEXT("button"), BLow);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("clicked"), true)
+		.Str(TEXT("actor_path"), Target->GetPathName())
+		.Num(TEXT("screen_x"), ScreenPos.X)
+		.Num(TEXT("screen_y"), ScreenPos.Y)
+		.Str(TEXT("button"), BLow)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.set_time_dilation — global time scale via UGameplayStatics::SetGlobalTimeDilation ──
@@ -1144,11 +1139,11 @@ FMCPResponse Tool_SetTimeDilation(const FMCPRequest& Request)
 	const float Prior = UGameplayStatics::GetGlobalTimeDilation(GEditor->PlayWorld);
 	UGameplayStatics::SetGlobalTimeDilation(GEditor->PlayWorld, static_cast<float>(Scale));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("applied"), true);
-	Out->SetNumberField(TEXT("prior_scale"), static_cast<double>(Prior));
-	Out->SetNumberField(TEXT("new_scale"), Scale);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.Num(TEXT("prior_scale"), static_cast<double>(Prior))
+		.Num(TEXT("new_scale"), Scale)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.get_stats — collect runtime stats snapshot ────────────────────────────────────────
@@ -1173,23 +1168,23 @@ FMCPResponse Tool_GetStats(const FMCPRequest& Request)
 	int32 ActorCount = 0;
 	for (TActorIterator<AActor> It(W); It; ++It) { ++ActorCount; }
 
-	TSharedRef<FJsonObject> MemObj = MakeShared<FJsonObject>();
-	MemObj->SetNumberField(TEXT("used_physical_mb"),  static_cast<double>(MemStats.UsedPhysical)  / (1024.0 * 1024.0));
-	MemObj->SetNumberField(TEXT("used_virtual_mb"),   static_cast<double>(MemStats.UsedVirtual)   / (1024.0 * 1024.0));
-	MemObj->SetNumberField(TEXT("available_physical_mb"), static_cast<double>(MemStats.AvailablePhysical) / (1024.0 * 1024.0));
-	MemObj->SetNumberField(TEXT("peak_used_physical_mb"), static_cast<double>(MemStats.PeakUsedPhysical) / (1024.0 * 1024.0));
-
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("delta_time_ms"), static_cast<double>(DeltaTime) * 1000.0);
-	Out->SetNumberField(TEXT("instant_fps"),   InstantFPS);
-	Out->SetNumberField(TEXT("avg_fps"),       AvgFPS);
-	Out->SetNumberField(TEXT("avg_ms"),        AvgMS);
-	Out->SetObjectField(TEXT("memory"),        MemObj);
-	Out->SetNumberField(TEXT("actor_count"),   static_cast<double>(ActorCount));
-	Out->SetNumberField(TEXT("time_seconds"),  W->GetTimeSeconds());
-	Out->SetNumberField(TEXT("time_dilation"), static_cast<double>(UGameplayStatics::GetGlobalTimeDilation(W)));
-	Out->SetStringField(TEXT("world_path"),    W->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("delta_time_ms"), static_cast<double>(DeltaTime) * 1000.0)
+		.Num(TEXT("instant_fps"),   InstantFPS)
+		.Num(TEXT("avg_fps"),       AvgFPS)
+		.Num(TEXT("avg_ms"),        AvgMS)
+		.Object(TEXT("memory"), [&](FMCPJsonBuilder& M)
+		{
+			M.Num(TEXT("used_physical_mb"),       static_cast<double>(MemStats.UsedPhysical)      / (1024.0 * 1024.0))
+			 .Num(TEXT("used_virtual_mb"),        static_cast<double>(MemStats.UsedVirtual)       / (1024.0 * 1024.0))
+			 .Num(TEXT("available_physical_mb"),  static_cast<double>(MemStats.AvailablePhysical) / (1024.0 * 1024.0))
+			 .Num(TEXT("peak_used_physical_mb"),  static_cast<double>(MemStats.PeakUsedPhysical)  / (1024.0 * 1024.0));
+		})
+		.Num(TEXT("actor_count"),   static_cast<double>(ActorCount))
+		.Num(TEXT("time_seconds"),  W->GetTimeSeconds())
+		.Num(TEXT("time_dilation"), static_cast<double>(UGameplayStatics::GetGlobalTimeDilation(W)))
+		.Str(TEXT("world_path"),    W->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── pie.dump_world_state — JSON snapshot of all PIE actors (compact form) ─────────────────
@@ -1249,11 +1244,11 @@ FMCPResponse Tool_DumpWorldState(const FMCPRequest& Request)
 		Actors.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world_path"), W->GetPathName());
-	Out->SetNumberField(TEXT("total"),      static_cast<double>(Total));
-	Out->SetArrayField(TEXT("actors"),      Actors);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("world_path"), W->GetPathName())
+		.Num(TEXT("total"),      static_cast<double>(Total))
+		.Arr(TEXT("actors"),     MoveTemp(Actors))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

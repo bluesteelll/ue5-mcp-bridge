@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPPageCursor.h"
@@ -155,11 +156,6 @@ namespace
 	 */
 	TSharedRef<FJsonObject> TST_BuildSpecJson(const FAutomationTestInfo& Info)
 	{
-		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-		Obj->SetStringField(TEXT("name"),         Info.GetDisplayName());
-		Obj->SetStringField(TEXT("full_path"),    Info.GetFullTestPath());
-		Obj->SetStringField(TEXT("command_line"), Info.GetTestName());
-
 		// Derive category = first dot-separated segment.
 		FString Category;
 		const FString& FullPath = Info.GetFullTestPath();
@@ -175,17 +171,22 @@ namespace
 				Category = FullPath;
 			}
 		}
-		Obj->SetStringField(TEXT("category"),         Category);
-		Obj->SetStringField(TEXT("test_tags"),        Info.GetTestTags());
-		Obj->SetStringField(TEXT("parameter"),        Info.GetTestParameter());
-		Obj->SetStringField(TEXT("source_file"),      Info.GetSourceFile());
-		Obj->SetNumberField(TEXT("source_line"),      static_cast<double>(Info.GetSourceFileLine()));
-		Obj->SetStringField(TEXT("asset_path"),       Info.GetAssetPath());
-		Obj->SetStringField(TEXT("open_command"),     Info.GetOpenCommand());
-		Obj->SetNumberField(TEXT("num_participants"), static_cast<double>(Info.GetNumParticipantsRequired()));
-		Obj->SetArrayField(TEXT("flags"),             TST_FlagsToJsonArray(Info.GetTestFlags()));
-		Obj->SetNumberField(TEXT("flags_raw"),        static_cast<double>(static_cast<uint32>(Info.GetTestFlags())));
-		return Obj;
+
+		return FMCPJsonBuilder()
+			.Str(TEXT("name"),             Info.GetDisplayName())
+			.Str(TEXT("full_path"),        Info.GetFullTestPath())
+			.Str(TEXT("command_line"),     Info.GetTestName())
+			.Str(TEXT("category"),         Category)
+			.Str(TEXT("test_tags"),        Info.GetTestTags())
+			.Str(TEXT("parameter"),        Info.GetTestParameter())
+			.Str(TEXT("source_file"),      Info.GetSourceFile())
+			.Num(TEXT("source_line"),      static_cast<double>(Info.GetSourceFileLine()))
+			.Str(TEXT("asset_path"),       Info.GetAssetPath())
+			.Str(TEXT("open_command"),     Info.GetOpenCommand())
+			.Num(TEXT("num_participants"), static_cast<double>(Info.GetNumParticipantsRequired()))
+			.Arr(TEXT("flags"),            TST_FlagsToJsonArray(Info.GetTestFlags()))
+			.Num(TEXT("flags_raw"),        static_cast<double>(static_cast<uint32>(Info.GetTestFlags())))
+			.ToShared();
 	}
 
 	/**
@@ -241,14 +242,14 @@ namespace
 	 */
 	TSharedRef<FJsonObject> TST_BuildEntryJson(const FAutomationExecutionEntry& Entry)
 	{
-		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-		Obj->SetStringField(TEXT("type"),      TST_EventTypeToString(Entry.Event.Type));
-		Obj->SetStringField(TEXT("message"),   Entry.Event.Message);
-		Obj->SetStringField(TEXT("context"),   Entry.Event.Context);
-		Obj->SetStringField(TEXT("filename"),  Entry.Filename);
-		Obj->SetNumberField(TEXT("line"),      static_cast<double>(Entry.LineNumber));
-		Obj->SetStringField(TEXT("timestamp"), Entry.Timestamp.ToIso8601());
-		return Obj;
+		return FMCPJsonBuilder()
+			.Str(TEXT("type"),      TST_EventTypeToString(Entry.Event.Type))
+			.Str(TEXT("message"),   Entry.Event.Message)
+			.Str(TEXT("context"),   Entry.Event.Context)
+			.Str(TEXT("filename"),  Entry.Filename)
+			.Num(TEXT("line"),      static_cast<double>(Entry.LineNumber))
+			.Str(TEXT("timestamp"), Entry.Timestamp.ToIso8601())
+			.ToShared();
 	}
 
 	/**
@@ -491,24 +492,23 @@ FMCPResponse Tool_RunSingleTest(const FMCPRequest& Request)
 	TArray<TSharedPtr<FJsonValue>> InfoArr;
 	TST_PartitionEntries(ExecInfo, ErrorsArr, WarningsArr, InfoArr);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("name"),           Info.GetFullTestPath());
-	Out->SetBoolField(TEXT("succeeded"),        bSuccessful && !bCapHit);
-	Out->SetBoolField(TEXT("completed"),        bCompleted);
-	Out->SetBoolField(TEXT("cap_exceeded"),     bCapHit);
-	Out->SetNumberField(TEXT("duration_secs"),  DurationSeconds);
-	Out->SetNumberField(TEXT("cap_secs"),       kTSTSingleTestMaxSeconds);
-	Out->SetArrayField(TEXT("errors"),          ErrorsArr);
-	Out->SetArrayField(TEXT("warnings"),        WarningsArr);
-	Out->SetArrayField(TEXT("info"),            InfoArr);
-	Out->SetNumberField(TEXT("error_count"),    static_cast<double>(ExecInfo.GetErrorTotal()));
-	Out->SetNumberField(TEXT("warning_count"),  static_cast<double>(ExecInfo.GetWarningTotal()));
-
 	// Always return ok=true with the result payload. ``cap_exceeded=true`` + ``succeeded=false``
 	// + ``completed=false`` is the cap-hit signal — caller branches on those flags rather than
 	// the wire envelope. (FMCPResponse's serializer can't carry a Result block alongside an
 	// error block, so we'd lose the partial results if we returned an error envelope.)
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str (TEXT("name"),          Info.GetFullTestPath())
+		.Bool(TEXT("succeeded"),     bSuccessful && !bCapHit)
+		.Bool(TEXT("completed"),     bCompleted)
+		.Bool(TEXT("cap_exceeded"),  bCapHit)
+		.Num (TEXT("duration_secs"), DurationSeconds)
+		.Num (TEXT("cap_secs"),      kTSTSingleTestMaxSeconds)
+		.Arr (TEXT("errors"),        MoveTemp(ErrorsArr))
+		.Arr (TEXT("warnings"),      MoveTemp(WarningsArr))
+		.Arr (TEXT("info"),          MoveTemp(InfoArr))
+		.Num (TEXT("error_count"),   static_cast<double>(ExecInfo.GetErrorTotal()))
+		.Num (TEXT("warning_count"), static_cast<double>(ExecInfo.GetWarningTotal()))
+		.BuildSuccess(Request);
 }
 
 // ─── test.get_last_results ────────────────────────────────────────────────────────────────────
@@ -534,18 +534,17 @@ FMCPResponse Tool_GetLastResults(const FMCPRequest& Request)
 	FAutomationTestFramework& Framework = FAutomationTestFramework::Get();
 	FAutomationTestBase* Current = Framework.GetCurrentTest();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	if (!Current)
 	{
-		Out->SetBoolField(TEXT("has_results"), false);
-		Out->SetBoolField(TEXT("is_running"), false);
-		Out->SetStringField(TEXT("current_test_full_path"), TEXT(""));
-		Out->SetNumberField(TEXT("error_count"), 0.0);
-		Out->SetNumberField(TEXT("warning_count"), 0.0);
-		Out->SetNumberField(TEXT("duration_secs"), 0.0);
-		TArray<TSharedPtr<FJsonValue>> EmptyArr;
-		Out->SetArrayField(TEXT("entries"), EmptyArr);
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(TEXT("has_results"),            false)
+			.Bool(TEXT("is_running"),             false)
+			.Str (TEXT("current_test_full_path"), TEXT(""))
+			.Num (TEXT("error_count"),            0.0)
+			.Num (TEXT("warning_count"),          0.0)
+			.Num (TEXT("duration_secs"),          0.0)
+			.Arr (TEXT("entries"),                TArray<TSharedPtr<FJsonValue>>{})
+			.BuildSuccess(Request);
 	}
 
 	FAutomationTestExecutionInfo ExecInfo;
@@ -558,14 +557,15 @@ FMCPResponse Tool_GetLastResults(const FMCPRequest& Request)
 		EntriesArr.Add(MakeShared<FJsonValueObject>(TST_BuildEntryJson(Entry)));
 	}
 
-	Out->SetBoolField(TEXT("has_results"), true);
-	Out->SetBoolField(TEXT("is_running"), true);
-	Out->SetStringField(TEXT("current_test_full_path"), Framework.GetCurrentTestFullPath());
-	Out->SetNumberField(TEXT("error_count"),    static_cast<double>(ExecInfo.GetErrorTotal()));
-	Out->SetNumberField(TEXT("warning_count"),  static_cast<double>(ExecInfo.GetWarningTotal()));
-	Out->SetNumberField(TEXT("duration_secs"),  ExecInfo.Duration);
-	Out->SetArrayField(TEXT("entries"), EntriesArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("has_results"),            true)
+		.Bool(TEXT("is_running"),             true)
+		.Str (TEXT("current_test_full_path"), Framework.GetCurrentTestFullPath())
+		.Num (TEXT("error_count"),            static_cast<double>(ExecInfo.GetErrorTotal()))
+		.Num (TEXT("warning_count"),          static_cast<double>(ExecInfo.GetWarningTotal()))
+		.Num (TEXT("duration_secs"),          ExecInfo.Duration)
+		.Arr (TEXT("entries"),                MoveTemp(EntriesArr))
+		.BuildSuccess(Request);
 }
 
 // ─── test.cancel_current ──────────────────────────────────────────────────────────────────────
@@ -604,12 +604,12 @@ FMCPResponse Tool_CancelCurrent(const FMCPRequest& Request)
 		bSuccessful = Framework.StopTest(Discard);
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("cancelled"),                bWasRunning);
-	Out->SetBoolField(TEXT("was_running"),              bWasRunning);
-	Out->SetBoolField(TEXT("stop_succeeded"),           bSuccessful);
-	Out->SetStringField(TEXT("current_test_full_path"), PriorFullPath);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("cancelled"),              bWasRunning)
+		.Bool(TEXT("was_running"),            bWasRunning)
+		.Bool(TEXT("stop_succeeded"),         bSuccessful)
+		.Str (TEXT("current_test_full_path"), PriorFullPath)
+		.BuildSuccess(Request);
 }
 
 // ─── test.list_categories ─────────────────────────────────────────────────────────────────────
@@ -663,10 +663,10 @@ FMCPResponse Tool_ListCategories(const FMCPRequest& Request)
 		CatArr.Add(MakeShared<FJsonValueString>(Cat));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("categories"), CatArr);
-	Out->SetNumberField(TEXT("total"), static_cast<double>(Sorted.Num()));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("categories"), MoveTemp(CatArr))
+		.Num(TEXT("total"),      static_cast<double>(Sorted.Num()))
+		.BuildSuccess(Request);
 }
 
 // ─── test.get_test_info ───────────────────────────────────────────────────────────────────────
@@ -771,11 +771,11 @@ FMCPResponse Tool_SetFilterFlags(const FMCPRequest& Request)
 
 	FAutomationTestFramework::Get().SetRequestedTestFilter(AppliedMask);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("applied"),       AppliedArr);
-	Out->SetArrayField(TEXT("rejected"),      RejectedArr);
-	Out->SetNumberField(TEXT("applied_mask"), static_cast<double>(static_cast<uint32>(AppliedMask)));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("applied"),      MoveTemp(AppliedArr))
+		.Arr(TEXT("rejected"),     MoveTemp(RejectedArr))
+		.Num(TEXT("applied_mask"), static_cast<double>(static_cast<uint32>(AppliedMask)))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

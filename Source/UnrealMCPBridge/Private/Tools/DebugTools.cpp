@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPWorldContext.h"
@@ -106,10 +107,10 @@ namespace
 	/** Build the standard success response: { drawn|cleared: true, world: "editor"|"pie" }. */
 	FMCPResponse DBG_MakeDrawSuccess(const FMCPRequest& Request, const UWorld* World, const TCHAR* Verb = TEXT("drawn"))
 	{
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetBoolField(Verb, true);
-		Out->SetStringField(TEXT("world"), DBG_WorldKindName(World));
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Bool(Verb, true)
+			.Str(TEXT("world"), DBG_WorldKindName(World))
+			.BuildSuccess(Request);
 	}
 } // namespace
 

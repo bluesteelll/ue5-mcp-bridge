@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -341,13 +342,13 @@ FMCPResponse Tool_ViewportScreenshot(const FMCPRequest& Request)
 	const FString Base64 = FBase64::Encode(
 		reinterpret_cast<const uint8*>(Encoded.GetData()), static_cast<int32>(Encoded.Num()));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("base64"), Base64);
-	Out->SetStringField(TEXT("mime"),
-		Format == FMCPScreenshotUtils::EImageFormat::JPG ? TEXT("image/jpeg") : TEXT("image/png"));
-	Out->SetNumberField(TEXT("width"), OutW);
-	Out->SetNumberField(TEXT("height"), OutH);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("base64"), Base64)
+		.Str(TEXT("mime"),
+			Format == FMCPScreenshotUtils::EImageFormat::JPG ? FString(TEXT("image/jpeg")) : FString(TEXT("image/png")))
+		.Num(TEXT("width"), OutW)
+		.Num(TEXT("height"), OutH)
+		.BuildSuccess(Request);
 }
 
 // ─── editor.viewport_screenshot_to_disk ────────────────────────────────────────────────────────
@@ -455,12 +456,12 @@ FMCPResponse Tool_ViewportScreenshotToDisk(const FMCPRequest& Request)
 			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("path"), AbsPath);
-	Out->SetNumberField(TEXT("bytes"), static_cast<double>(BytesWritten));
-	Out->SetNumberField(TEXT("width"), OutW);
-	Out->SetNumberField(TEXT("height"), OutH);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("path"), AbsPath)
+		.Num(TEXT("bytes"), static_cast<double>(BytesWritten))
+		.Num(TEXT("width"), OutW)
+		.Num(TEXT("height"), OutH)
+		.BuildSuccess(Request);
 }
 
 // ─── pie.screenshot_to_disk ────────────────────────────────────────────────────────────────────
@@ -567,11 +568,11 @@ FMCPResponse Tool_PIEScreenshotToDisk(const FMCPRequest& Request)
 			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("path"), AbsPath);
-	Out->SetNumberField(TEXT("bytes"), static_cast<double>(BytesWritten));
-	Out->SetStringField(TEXT("world"), WorldPath);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("path"), AbsPath)
+		.Num(TEXT("bytes"), static_cast<double>(BytesWritten))
+		.Str(TEXT("world"), WorldPath)
+		.BuildSuccess(Request);
 }
 
 // ─── editor.get_camera ─────────────────────────────────────────────────────────────────────────
@@ -684,9 +685,9 @@ FMCPResponse Tool_SetCamera(const FMCPRequest& Request)
 	// the next natural redraw trigger.
 	Client->Invalidate();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("set"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("set"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── editor.get_selection ──────────────────────────────────────────────────────────────────────
@@ -759,10 +760,10 @@ FMCPResponse Tool_GetSelection(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("actors"), ActorsArr);
-	Out->SetArrayField(TEXT("components"), ComponentsArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("actors"), MoveTemp(ActorsArr))
+		.Arr(TEXT("components"), MoveTemp(ComponentsArr))
+		.BuildSuccess(Request);
 }
 
 // ─── editor.set_selection ──────────────────────────────────────────────────────────────────────
@@ -878,12 +879,12 @@ FMCPResponse Tool_SetSelection(const FMCPRequest& Request)
 
 	Subsystem->SetSelectedLevelActors(Resolved);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
 	// Report what the subsystem actually selected (it may have filtered out PIE/invalid actors
 	// internally — we report the post-state count, not just Resolved.Num()).
 	const int32 PostCount = GEditor->GetSelectedActors() ? GEditor->GetSelectedActors()->Num() : 0;
-	Out->SetNumberField(TEXT("selected_count"), PostCount);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("selected_count"), PostCount)
+		.BuildSuccess(Request);
 }
 
 // ─── editor.show_message ───────────────────────────────────────────────────────────────────────
@@ -973,9 +974,9 @@ FMCPResponse Tool_ShowMessage(const FMCPRequest& Request)
 		Item->SetCompletionState(State);
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("shown"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("shown"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── editor.current_world ──────────────────────────────────────────────────────────────────────
@@ -1006,11 +1007,11 @@ FMCPResponse Tool_CurrentWorld(const FMCPRequest& Request)
 	const FString PackagePath = World->GetOutermost() ? World->GetOutermost()->GetName() : FString();
 	const FString WorldName = World->GetName();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world_path"), PackagePath);
-	Out->SetStringField(TEXT("world_name"), WorldName);
-	Out->SetBoolField(TEXT("pie_active"), FMCPWorldContext::IsPIEActive());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("world_path"), PackagePath)
+		.Str(TEXT("world_name"), WorldName)
+		.Bool(TEXT("pie_active"), FMCPWorldContext::IsPIEActive())
+		.BuildSuccess(Request);
 }
 
 // ─── editor.tick_once ──────────────────────────────────────────────────────────────────────────
@@ -1040,13 +1041,13 @@ FMCPResponse Tool_TickOnce(const FMCPRequest& Request)
 	constexpr float TickDt = 1.0f / 60.0f;
 	FTSTicker::GetCoreTicker().Tick(TickDt);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("ticked"), true);
-	Out->SetNumberField(TEXT("delta_seconds"), TickDt);
-	Out->SetStringField(TEXT("note"),
-		TEXT("FTSTicker advanced; GEditor->Tick is unsafe mid-frame and is NOT called here. "
-			 "Engine render/anim/physics ticks still require a natural editor frame."));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("ticked"), true)
+		.Num(TEXT("delta_seconds"), TickDt)
+		.Str(TEXT("note"),
+			TEXT("FTSTicker advanced; GEditor->Tick is unsafe mid-frame and is NOT called here. "
+				 "Engine render/anim/physics ticks still require a natural editor frame."))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

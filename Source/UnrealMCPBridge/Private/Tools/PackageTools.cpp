@@ -3,6 +3,7 @@
 #include "PackageTools.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -285,12 +286,12 @@ FMCPResponse Tool_Save(const FMCPRequest& Request)
 				*PackageName, *Filename));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("saved"), true);
-	Out->SetBoolField(TEXT("was_dirty"), bWasDirty);
-	Out->SetStringField(TEXT("file_path"), Filename);
-	Out->SetStringField(TEXT("package_path"), PackageName);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("saved"), true)
+		.Bool(TEXT("was_dirty"), bWasDirty)
+		.Str(TEXT("file_path"), Filename)
+		.Str(TEXT("package_path"), PackageName)
+		.BuildSuccess(Request);
 }
 
 // ─── package.save_all ─────────────────────────────────────────────────────────────────────────
@@ -370,14 +371,15 @@ FMCPResponse Tool_SaveAll(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("saved"), SavedCount);
-	Out->SetNumberField(TEXT("failed"), Failures.Num());
-	Out->SetArrayField(TEXT("failures"), Failures);
-	Out->SetNumberField(TEXT("total_candidates"), Candidates.Num());
-	Out->SetBoolField(TEXT("only_dirty"), bOnlyDirty);
-	Out->SetNumberField(TEXT("max_packages"), MaxPackages);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 FailureCount = Failures.Num();
+	return FMCPJsonBuilder()
+		.Num(TEXT("saved"), SavedCount)
+		.Num(TEXT("failed"), FailureCount)
+		.Arr(TEXT("failures"), MoveTemp(Failures))
+		.Num(TEXT("total_candidates"), Candidates.Num())
+		.Bool(TEXT("only_dirty"), bOnlyDirty)
+		.Num(TEXT("max_packages"), MaxPackages)
+		.BuildSuccess(Request);
 }
 
 // ─── package.list_dirty ───────────────────────────────────────────────────────────────────────
@@ -412,10 +414,10 @@ FMCPResponse Tool_ListDirty(const FMCPRequest& Request)
 		DirtyArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("dirty_packages"), DirtyArr);
-	Out->SetNumberField(TEXT("total_dirty"), TotalDirty);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("dirty_packages"), MoveTemp(DirtyArr))
+		.Num(TEXT("total_dirty"), TotalDirty)
+		.BuildSuccess(Request);
 }
 
 // ─── package.get_dependencies ─────────────────────────────────────────────────────────────────
@@ -498,12 +500,13 @@ FMCPResponse Tool_GetDependencies(const FMCPRequest& Request)
 		Items.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("dependencies"), Items);
-	Out->SetNumberField(TEXT("total"), All.Num());
-	Out->SetStringField(TEXT("package_path"), PackageName);
-	Out->SetBoolField(TEXT("recursive"), bRecursive);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalDeps = All.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("dependencies"), MoveTemp(Items))
+		.Num(TEXT("total"), TotalDeps)
+		.Str(TEXT("package_path"), PackageName)
+		.Bool(TEXT("recursive"), bRecursive)
+		.BuildSuccess(Request);
 }
 
 // ─── package.get_referencers ──────────────────────────────────────────────────────────────────
@@ -563,11 +566,12 @@ FMCPResponse Tool_GetReferencers(const FMCPRequest& Request)
 		Items.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("referencers"), Items);
-	Out->SetNumberField(TEXT("total"), All.Num());
-	Out->SetStringField(TEXT("package_path"), PackageName);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalRefs = All.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("referencers"), MoveTemp(Items))
+		.Num(TEXT("total"), TotalRefs)
+		.Str(TEXT("package_path"), PackageName)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

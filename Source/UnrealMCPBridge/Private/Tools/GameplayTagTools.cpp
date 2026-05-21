@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "MCPMutatorScope.h"
 #include "UnrealMCPBridge.h"
@@ -312,12 +313,12 @@ FMCPResponse Tool_AddToContainer(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Holder->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), !bWasPresent);
-	Out->SetBoolField(TEXT("was_already_present"), bWasPresent);
-	Out->SetNumberField(TEXT("new_count"), Container->Num());
-	Out->SetStringField(TEXT("holder"), Holder->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), !bWasPresent)
+		.Bool(TEXT("was_already_present"), bWasPresent)
+		.Num(TEXT("new_count"), Container->Num())
+		.Str(TEXT("holder"), Holder->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── gameplaytag.remove_from_container ────────────────────────────────────────────────────────
@@ -376,12 +377,12 @@ FMCPResponse Tool_RemoveFromContainer(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Holder->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("removed"), bWasPresent);
-	Out->SetBoolField(TEXT("was_present"), bWasPresent);
-	Out->SetNumberField(TEXT("new_count"), Container->Num());
-	Out->SetStringField(TEXT("holder"), Holder->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), bWasPresent)
+		.Bool(TEXT("was_present"), bWasPresent)
+		.Num(TEXT("new_count"), Container->Num())
+		.Str(TEXT("holder"), Holder->GetPathName())
+		.BuildSuccess(Request);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

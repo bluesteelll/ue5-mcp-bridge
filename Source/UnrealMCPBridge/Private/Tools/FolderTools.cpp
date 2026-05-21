@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -120,11 +121,12 @@ FMCPResponse Tool_List(const FMCPRequest& Request)
 		Out.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
-	Resp->SetArrayField(TEXT("folders"), Out);
-	Resp->SetNumberField(TEXT("total_known"), Paths.Num());
-	Resp->SetStringField(TEXT("world_path"), World->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Resp);
+	const int32 PathsNum = Paths.Num();
+	return FMCPJsonBuilder()
+		.Arr(TEXT("folders"), MoveTemp(Out))
+		.Num(TEXT("total_known"), PathsNum)
+		.Str(TEXT("world_path"), World->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── folder.create ────────────────────────────────────────────────────────────────────────────
@@ -155,11 +157,11 @@ FMCPResponse Tool_Create(const FMCPRequest& Request)
 	// + the World can be re-saved with updated outliner state if the user wants persistence.
 	Scope.DirtyPackage(World->PersistentLevel ? World->PersistentLevel->GetOutermost() : World->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), bCreated);
-	Out->SetStringField(TEXT("folder_path"), Folder.ToString());
-	Out->SetStringField(TEXT("world_path"), World->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"), bCreated)
+		.Str(TEXT("folder_path"), Folder.ToString())
+		.Str(TEXT("world_path"), World->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── folder.delete ────────────────────────────────────────────────────────────────────────────
@@ -255,13 +257,13 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(World->PersistentLevel ? World->PersistentLevel->GetOutermost() : World->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("deleted"), !bStillExists);
-	Out->SetNumberField(TEXT("moved_children"), MovedChildren);
-	Out->SetStringField(TEXT("folder_path"), FolderPath);
-	Out->SetStringField(TEXT("parent_path"), ParentPath);
-	Out->SetStringField(TEXT("world_path"), World->GetPathName());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("deleted"), !bStillExists)
+		.Num(TEXT("moved_children"), MovedChildren)
+		.Str(TEXT("folder_path"), FolderPath)
+		.Str(TEXT("parent_path"), ParentPath)
+		.Str(TEXT("world_path"), World->GetPathName())
+		.BuildSuccess(Request);
 }
 
 // ─── folder.set_actor ─────────────────────────────────────────────────────────────────────────
@@ -318,12 +320,12 @@ FMCPResponse Tool_SetActor(const FMCPRequest& Request)
 		Scope.DirtyPackage(Actor->GetOutermost());
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("actor_path"),   Actor->GetPathName());
-	Out->SetStringField(TEXT("prior_folder"), Prior.ToString());
-	Out->SetStringField(TEXT("new_folder"),   Desired.ToString());
-	Out->SetStringField(TEXT("world_path"),   Actor->GetWorld() ? Actor->GetWorld()->GetPathName() : FString());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("actor_path"),   Actor->GetPathName())
+		.Str(TEXT("prior_folder"), Prior.ToString())
+		.Str(TEXT("new_folder"),   Desired.ToString())
+		.Str(TEXT("world_path"),   Actor->GetWorld() ? Actor->GetWorld()->GetPathName() : FString())
+		.BuildSuccess(Request);
 }
 
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)

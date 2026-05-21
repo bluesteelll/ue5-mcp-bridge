@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -475,13 +476,13 @@ FMCPResponse Tool_LineTrace(const FMCPRequest& Request)
 	bool bAnyBlocking = false;
 	PHY_BuildHitsArray(Hits, bMultiHit, HitsArr, bAnyBlocking);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
-	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	Out->SetNumberField(TEXT("ignored_count"), IgnoredCount);
-	Out->SetBoolField(TEXT("hit"), bAnyBlocking);
-	Out->SetArrayField(TEXT("hits"), HitsArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString())
+		.Str(TEXT("world_kind"), PHY_DescribeWorldKind(World))
+		.Num(TEXT("ignored_count"), IgnoredCount)
+		.Bool(TEXT("hit"), bAnyBlocking)
+		.Arr(TEXT("hits"), MoveTemp(HitsArr))
+		.BuildSuccess(Request);
 }
 
 // ─── physics.sweep_capsule ─────────────────────────────────────────────────────────────────────
@@ -581,13 +582,13 @@ FMCPResponse Tool_SweepCapsule(const FMCPRequest& Request)
 	bool bAnyBlocking = false;
 	PHY_BuildHitsArray(Hits, bMultiHit, HitsArr, bAnyBlocking);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
-	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	Out->SetNumberField(TEXT("ignored_count"), IgnoredCount);
-	Out->SetBoolField(TEXT("hit"), bAnyBlocking);
-	Out->SetArrayField(TEXT("hits"), HitsArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString())
+		.Str(TEXT("world_kind"), PHY_DescribeWorldKind(World))
+		.Num(TEXT("ignored_count"), IgnoredCount)
+		.Bool(TEXT("hit"), bAnyBlocking)
+		.Arr(TEXT("hits"), MoveTemp(HitsArr))
+		.BuildSuccess(Request);
 }
 
 // ─── physics.apply_impulse ─────────────────────────────────────────────────────────────────────
@@ -701,14 +702,14 @@ FMCPResponse Tool_ApplyImpulse(const FMCPRequest& Request)
 
 	Prim->AddImpulse(AppliedImpulse, NAME_None, bVelocityChange);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("applied"), true);
-	Out->SetStringField(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Prim));
-	Out->SetArrayField(TEXT("impulse"), PHY_VectorToArray(AppliedImpulse));
-	Out->SetBoolField(TEXT("velocity_change"), bVelocityChange);
-	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
-	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.Str(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Prim))
+		.Arr(TEXT("impulse"), PHY_VectorToArray(AppliedImpulse))
+		.Bool(TEXT("velocity_change"), bVelocityChange)
+		.Str(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString())
+		.Str(TEXT("world_kind"), PHY_DescribeWorldKind(World))
+		.BuildSuccess(Request);
 }
 
 // ─── physics.set_simulation ────────────────────────────────────────────────────────────────────
@@ -977,15 +978,15 @@ FMCPResponse Tool_SetVelocity(const FMCPRequest& Request)
 	const FVector NewLin = Prim->GetPhysicsLinearVelocity();
 	const FVector NewAng = Prim->GetPhysicsAngularVelocityInDegrees();
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Prim));
-	Out->SetArrayField(TEXT("prior_linear"),  PHY_VectorToArray(PriorLin));
-	Out->SetArrayField(TEXT("prior_angular"), PHY_VectorToArray(PriorAng));
-	Out->SetArrayField(TEXT("new_linear"),    PHY_VectorToArray(NewLin));
-	Out->SetArrayField(TEXT("new_angular"),   PHY_VectorToArray(NewAng));
-	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
-	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("component_path"), FMCPComponentPathUtils::BuildComponentPath(Prim))
+		.Arr(TEXT("prior_linear"),  PHY_VectorToArray(PriorLin))
+		.Arr(TEXT("prior_angular"), PHY_VectorToArray(PriorAng))
+		.Arr(TEXT("new_linear"),    PHY_VectorToArray(NewLin))
+		.Arr(TEXT("new_angular"),   PHY_VectorToArray(NewAng))
+		.Str(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString())
+		.Str(TEXT("world_kind"), PHY_DescribeWorldKind(World))
+		.BuildSuccess(Request);
 }
 
 // ─── physics.overlap_test ──────────────────────────────────────────────────────────────────────
@@ -1109,13 +1110,14 @@ FMCPResponse Tool_OverlapTest(const FMCPRequest& Request)
 		HitsArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString());
-	Out->SetStringField(TEXT("world_kind"), PHY_DescribeWorldKind(World));
-	Out->SetNumberField(TEXT("ignored_count"), IgnoredCount);
-	Out->SetNumberField(TEXT("hit_count"), HitsArr.Num());
-	Out->SetArrayField(TEXT("hits"), HitsArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 HitCount = HitsArr.Num();
+	return FMCPJsonBuilder()
+		.Str(TEXT("world"), World->GetOutermost() ? World->GetOutermost()->GetName() : FString())
+		.Str(TEXT("world_kind"), PHY_DescribeWorldKind(World))
+		.Num(TEXT("ignored_count"), IgnoredCount)
+		.Num(TEXT("hit_count"), HitCount)
+		.Arr(TEXT("hits"), MoveTemp(HitsArr))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

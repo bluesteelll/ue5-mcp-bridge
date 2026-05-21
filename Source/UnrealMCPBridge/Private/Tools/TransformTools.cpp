@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -346,11 +347,12 @@ FMCPResponse Tool_BatchSet(const FMCPRequest& Request)
 				Failures.Num() > 0 ? *Failures[0]->AsObject()->GetStringField(TEXT("reason")) : TEXT("(empty)")));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("updated"), Updated);
-	Out->SetNumberField(TEXT("failed"),  Failures.Num());
-	Out->SetArrayField(TEXT("failures"), Failures);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 FailuresNum = Failures.Num();
+	return FMCPJsonBuilder()
+		.Num(TEXT("updated"), Updated)
+		.Num(TEXT("failed"),  FailuresNum)
+		.Arr(TEXT("failures"), MoveTemp(Failures))
+		.BuildSuccess(Request);
 }
 
 // ─── transform.snap_to_floor ──────────────────────────────────────────────────────────────────
@@ -508,11 +510,11 @@ FMCPResponse Tool_SnapToFloor(const FMCPRequest& Request)
 				FirstResolutionReason.IsEmpty() ? TEXT("(empty)") : *FirstResolutionReason));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("snapped"), Snapped);
-	Out->SetNumberField(TEXT("missed"),  Missed);
-	Out->SetArrayField(TEXT("results"),  Results);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("snapped"), Snapped)
+		.Num(TEXT("missed"),  Missed)
+		.Arr(TEXT("results"),  MoveTemp(Results))
+		.BuildSuccess(Request);
 }
 
 // ─── transform.align ──────────────────────────────────────────────────────────────────────────
@@ -689,15 +691,16 @@ FMCPResponse Tool_Align(const FMCPRequest& Request)
 		++Aligned;
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("aligned"), Aligned);
-	Out->SetNumberField(TEXT("failed"),  Failures.Num());
-	Out->SetStringField(TEXT("axis"),
-		AxisIdx == 0 ? FString(TEXT("X")) : (AxisIdx == 1 ? FString(TEXT("Y")) : FString(TEXT("Z"))));
-	Out->SetNumberField(TEXT("value"),   FinalValue);
-	Out->SetStringField(TEXT("mode"),    ModeStr.ToLower());
-	Out->SetArrayField(TEXT("failures"), Failures);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 FailuresNum = Failures.Num();
+	return FMCPJsonBuilder()
+		.Num(TEXT("aligned"), Aligned)
+		.Num(TEXT("failed"),  FailuresNum)
+		.Str(TEXT("axis"),
+			AxisIdx == 0 ? FString(TEXT("X")) : (AxisIdx == 1 ? FString(TEXT("Y")) : FString(TEXT("Z"))))
+		.Num(TEXT("value"),   FinalValue)
+		.Str(TEXT("mode"),    ModeStr.ToLower())
+		.Arr(TEXT("failures"), MoveTemp(Failures))
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────────────────────

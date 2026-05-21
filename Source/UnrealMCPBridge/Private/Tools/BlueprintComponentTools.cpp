@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -337,19 +338,15 @@ FMCPResponse Tool_AddComponent(const FMCPRequest& Request)
 	// alone would only refresh the variable table — wrong for SCS topology changes.
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetStringField(TEXT("variable_name"), NewNode->GetVariableName().ToString());
-	Out->SetStringField(TEXT("component_class"), CompClass->GetPathName());
-	if (!FinalParentName.IsEmpty())
-	{
-		Out->SetStringField(TEXT("parent"), FinalParentName);
-	}
-	else
-	{
-		Out->SetField(TEXT("parent"), MakeShared<FJsonValueNull>());
-	}
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"), true)
+		.Str(TEXT("variable_name"), NewNode->GetVariableName().ToString())
+		.Str(TEXT("component_class"), CompClass->GetPathName())
+		.If(!FinalParentName.IsEmpty(),
+			[&](FMCPJsonBuilder& B) { B.Str(TEXT("parent"), FinalParentName); })
+		.If(FinalParentName.IsEmpty(),
+			[&](FMCPJsonBuilder& B) { B.Null(TEXT("parent")); })
+		.BuildSuccess(Request);
 }
 
 // ─── bp.remove_component (Lane A, PIE-guarded) ───────────────────────────────────────────────
@@ -448,10 +445,10 @@ FMCPResponse Tool_RemoveComponent(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("removed"), true);
-	Out->SetNumberField(TEXT("reparented_children_count"), static_cast<double>(ReparentedCount));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("removed"), true)
+		.Num(TEXT("reparented_children_count"), static_cast<double>(ReparentedCount))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.list_components (Lane A, NO PIE guard — read) ────────────────────────────────────────
@@ -519,22 +516,19 @@ FMCPResponse Tool_ListComponents(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	if (DefaultRoot)
-	{
-		Out->SetStringField(TEXT("root"), DefaultRoot->GetVariableName().ToString());
-	}
-	else
-	{
-		// No DefaultSceneRootNode — possible if the BP's root was promoted to a user component AND
-		// then that component was renamed. Report null; caller infers the root from components[]
-		// (the entry whose parent_variable_name is null).
-		Out->SetField(TEXT("root"), MakeShared<FJsonValueNull>());
-	}
-	Out->SetArrayField(TEXT("components"), Entries);
-	Out->SetNumberField(TEXT("total"), static_cast<double>(Entries.Num()));
-	Out->SetBoolField(TEXT("recursive"), bRecursive);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	// No DefaultSceneRootNode — possible if the BP's root was promoted to a user component AND
+	// then that component was renamed. Report null; caller infers the root from components[]
+	// (the entry whose parent_variable_name is null).
+	const int32 EntriesNum = Entries.Num();
+	return FMCPJsonBuilder()
+		.If(DefaultRoot != nullptr,
+			[&](FMCPJsonBuilder& B) { B.Str(TEXT("root"), DefaultRoot->GetVariableName().ToString()); })
+		.If(DefaultRoot == nullptr,
+			[&](FMCPJsonBuilder& B) { B.Null(TEXT("root")); })
+		.Arr(TEXT("components"), MoveTemp(Entries))
+		.Num(TEXT("total"), static_cast<double>(EntriesNum))
+		.Bool(TEXT("recursive"), bRecursive)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.set_component_default (Lane A, PIE-guarded) ──────────────────────────────────────────
@@ -662,12 +656,18 @@ FMCPResponse Tool_SetComponentDefault(const FMCPRequest& Request)
 	// pass we don't need for a leaf property change.
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("variable_name"), VariableNameStr);
-	Out->SetStringField(TEXT("property_name"), PropertyName);
-	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
-	Out->SetField(TEXT("new_value"),   NewValue.IsValid()   ? NewValue   : MakeShared<FJsonValueNull>());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const TSharedRef<FJsonValue> PriorRef = PriorValue.IsValid()
+		? PriorValue.ToSharedRef()
+		: StaticCastSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+	const TSharedRef<FJsonValue> NewRef = NewValue.IsValid()
+		? NewValue.ToSharedRef()
+		: StaticCastSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+	return FMCPJsonBuilder()
+		.Str(TEXT("variable_name"), VariableNameStr)
+		.Str(TEXT("property_name"), PropertyName)
+		.Field(TEXT("prior_value"), PriorRef)
+		.Field(TEXT("new_value"),   NewRef)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ────────────────────────────────────────────────────────────────────────────

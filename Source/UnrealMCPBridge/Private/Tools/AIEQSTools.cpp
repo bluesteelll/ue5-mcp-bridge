@@ -4,6 +4,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -137,20 +138,20 @@ FMCPResponse Tool_ListQueries(const FMCPRequest& Request)
 		QueryArr.Add(MakeShared<FJsonValueObject>(Obj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetArrayField(TEXT("queries"), QueryArr);
-	Out->SetNumberField(TEXT("total_known"), Assets.Num());
-
-	if (EndIdx < Assets.Num() && EndIdx > 0)
-	{
-		FMCPPageCursor OutCursor;
-		OutCursor.FilterHash = FilterHash;
-		OutCursor.LastAssetPath = Assets[EndIdx - 1].GetSoftObjectPath().ToString();
-		OutCursor.TotalKnownSnapshot = Assets.Num();
-		Out->SetStringField(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
-	}
-
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 TotalKnown = Assets.Num();
+	const bool bHasNextPage = (EndIdx < TotalKnown && EndIdx > 0);
+	return FMCPJsonBuilder()
+		.Arr(TEXT("queries"), MoveTemp(QueryArr))
+		.Num(TEXT("total_known"), TotalKnown)
+		.If(bHasNextPage, [&](FMCPJsonBuilder& B)
+		{
+			FMCPPageCursor OutCursor;
+			OutCursor.FilterHash = FilterHash;
+			OutCursor.LastAssetPath = Assets[EndIdx - 1].GetSoftObjectPath().ToString();
+			OutCursor.TotalKnownSnapshot = TotalKnown;
+			B.Str(TEXT("next_page_token"), FMCPPageCursorUtils::Encode(OutCursor));
+		})
+		.BuildSuccess(Request);
 }
 
 // --- ai.eqs.get_query_info -------------------------------------------------------------------
@@ -244,11 +245,12 @@ FMCPResponse Tool_GetQueryInfo(const FMCPRequest& Request)
 		OptionArr.Add(MakeShared<FJsonValueObject>(OptObj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("query_path"), QueryPath);
-	Out->SetNumberField(TEXT("options_count"), Options.Num());
-	Out->SetArrayField(TEXT("options"), OptionArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 OptionsCount = Options.Num();
+	return FMCPJsonBuilder()
+		.Str(TEXT("query_path"), QueryPath)
+		.Num(TEXT("options_count"), OptionsCount)
+		.Arr(TEXT("options"), MoveTemp(OptionArr))
+		.BuildSuccess(Request);
 }
 
 // --- ai.eqs.run_query ------------------------------------------------------------------------
@@ -419,14 +421,15 @@ FMCPResponse Tool_RunQuery(const FMCPRequest& Request)
 		ResultArr.Add(MakeShared<FJsonValueObject>(ItemObj));
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("status"), StatusStr);
-	Out->SetStringField(TEXT("mode"), ModeStr);
-	Out->SetNumberField(TEXT("items_count"), Locations.Num());
-	Out->SetArrayField(TEXT("results"), ResultArr);
-	Out->SetStringField(TEXT("query_path"), QueryPath);
-	Out->SetStringField(TEXT("querier_actor_path"), QuerierPath);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const int32 ItemsCount = Locations.Num();
+	return FMCPJsonBuilder()
+		.Str(TEXT("status"), StatusStr)
+		.Str(TEXT("mode"), ModeStr)
+		.Num(TEXT("items_count"), ItemsCount)
+		.Arr(TEXT("results"), MoveTemp(ResultArr))
+		.Str(TEXT("query_path"), QueryPath)
+		.Str(TEXT("querier_actor_path"), QuerierPath)
+		.BuildSuccess(Request);
 }
 
 // --- Registration ----------------------------------------------------------------------------

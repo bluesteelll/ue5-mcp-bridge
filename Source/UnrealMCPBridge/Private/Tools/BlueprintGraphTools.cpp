@@ -5,6 +5,7 @@
 #include "MCPSurfaceRegistry.h"
 
 #include "FMCPDispatchQueue.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -285,15 +286,9 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
 	// ─── Build response ─────────────────────────────────────────────────────────────────────────
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("node_guid"), NewNode->NodeGuid.ToString(EGuidFormats::Digits));
-	Out->SetStringField(TEXT("node_class"), NodeClass->GetPathName());
-	Out->SetStringField(TEXT("title"), NewNode->GetNodeTitle(ENodeTitleType::ListView).ToString());
-
 	TArray<TSharedPtr<FJsonValue>> PositionResp;
 	PositionResp.Add(MakeShared<FJsonValueNumber>(NewNode->NodePosX));
 	PositionResp.Add(MakeShared<FJsonValueNumber>(NewNode->NodePosY));
-	Out->SetArrayField(TEXT("position"), PositionResp);
 
 	TArray<TSharedPtr<FJsonValue>> PinArr;
 	PinArr.Reserve(NewNode->Pins.Num());
@@ -304,9 +299,14 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 			PinArr.Add(MakeShared<FJsonValueObject>(BGT_BuildPinSummary(Pin)));
 		}
 	}
-	Out->SetArrayField(TEXT("pins"), PinArr);
 
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"), NewNode->NodeGuid.ToString(EGuidFormats::Digits))
+		.Str(TEXT("node_class"), NodeClass->GetPathName())
+		.Str(TEXT("title"), NewNode->GetNodeTitle(ENodeTitleType::ListView).ToString())
+		.Arr(TEXT("position"), MoveTemp(PositionResp))
+		.Arr(TEXT("pins"), MoveTemp(PinArr))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.connect_pins ───────────────────────────────────────────────────────────────────────────
@@ -420,11 +420,11 @@ FMCPResponse Tool_ConnectPins(const FMCPRequest& Request)
 		FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("connected"), bConnected);
-	Out->SetNumberField(TEXT("broke_existing_count"), static_cast<double>(BrokeTotal));
-	Out->SetStringField(TEXT("response"), CanConnect.Message.ToString());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("connected"), bConnected)
+		.Num(TEXT("broke_existing_count"), static_cast<double>(BrokeTotal))
+		.Str(TEXT("response"), CanConnect.Message.ToString())
+		.BuildSuccess(Request);
 }
 
 // ─── bp.set_node_property ──────────────────────────────────────────────────────────────────────
@@ -525,13 +525,20 @@ FMCPResponse Tool_SetNodeProperty(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("node_guid"),     Node->NodeGuid.ToString(EGuidFormats::Digits));
-	Out->SetStringField(TEXT("node_class"),    Node->GetClass()->GetPathName());
-	Out->SetStringField(TEXT("property_name"), PropertyName);
-	Out->SetField(TEXT("prior_value"), PriorValue.IsValid() ? PriorValue : MakeShared<FJsonValueNull>());
-	Out->SetField(TEXT("new_value"),   NewValue.IsValid()   ? NewValue   : MakeShared<FJsonValueNull>());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	const TSharedRef<FJsonValue> PriorValueOut = PriorValue.IsValid()
+		? PriorValue.ToSharedRef()
+		: TSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+	const TSharedRef<FJsonValue> NewValueOut = NewValue.IsValid()
+		? NewValue.ToSharedRef()
+		: TSharedRef<FJsonValue>(MakeShared<FJsonValueNull>());
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),     Node->NodeGuid.ToString(EGuidFormats::Digits))
+		.Str(TEXT("node_class"),    Node->GetClass()->GetPathName())
+		.Str(TEXT("property_name"), PropertyName)
+		.Field(TEXT("prior_value"), PriorValueOut)
+		.Field(TEXT("new_value"),   NewValueOut)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.set_pin_default ────────────────────────────────────────────────────────────────────────
@@ -707,12 +714,12 @@ FMCPResponse Tool_SetPinDefault(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString(EGuidFormats::Digits));
-	Out->SetStringField(TEXT("pin_name"),  PinName);
-	Out->SetObjectField(TEXT("prior_default"), PriorDefault);
-	Out->SetObjectField(TEXT("new_default"),   NewDefault);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"), Node->NodeGuid.ToString(EGuidFormats::Digits))
+		.Str(TEXT("pin_name"),  PinName)
+		.ObjectShared(TEXT("prior_default"), PriorDefault)
+		.ObjectShared(TEXT("new_default"),   NewDefault)
+		.BuildSuccess(Request);
 }
 
 // ─── bp.delete_node ────────────────────────────────────────────────────────────────────────────
@@ -808,12 +815,12 @@ FMCPResponse Tool_DeleteNode(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("deleted"),         true);
-	Out->SetStringField(TEXT("node_class"),    NodeClassPath);
-	Out->SetStringField(TEXT("node_title"),    NodeTitle);
-	Out->SetNumberField(TEXT("links_broken"),  static_cast<double>(LinksToBreak));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("deleted"),       true)
+		.Str(TEXT("node_class"),     NodeClassPath)
+		.Str(TEXT("node_title"),     NodeTitle)
+		.Num(TEXT("links_broken"),   static_cast<double>(LinksToBreak))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.disconnect_pin ─────────────────────────────────────────────────────────────────────────
@@ -876,10 +883,10 @@ FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
 		// No-op succeeds — caller may be in an idempotent disconnect loop. Return links_broken=0
 		// rather than erroring so the caller's iteration completes cleanly.
 		Scope.Abort();
-		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-		Out->SetStringField(TEXT("pin_name"), PinName);
-		Out->SetNumberField(TEXT("links_broken"), 0.0);
-		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+		return FMCPJsonBuilder()
+			.Str(TEXT("pin_name"), PinName)
+			.Num(TEXT("links_broken"), 0.0)
+			.BuildSuccess(Request);
 	}
 
 	Blueprint->Modify();
@@ -897,10 +904,10 @@ FMCPResponse Tool_DisconnectPin(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("pin_name"), PinName);
-	Out->SetNumberField(TEXT("links_broken"), static_cast<double>(PriorLinks));
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("pin_name"), PinName)
+		.Num(TEXT("links_broken"), static_cast<double>(PriorLinks))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.move_node ──────────────────────────────────────────────────────────────────────────────
@@ -979,11 +986,11 @@ FMCPResponse Tool_MoveNode(const FMCPRequest& Request)
 	NewPosArr.Add(MakeShared<FJsonValueNumber>(NewX));
 	NewPosArr.Add(MakeShared<FJsonValueNumber>(NewY));
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString(EGuidFormats::Digits));
-	Out->SetArrayField(TEXT("prior_position"), PriorPosArr);
-	Out->SetArrayField(TEXT("new_position"),   NewPosArr);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"), Node->NodeGuid.ToString(EGuidFormats::Digits))
+		.Arr(TEXT("prior_position"), MoveTemp(PriorPosArr))
+		.Arr(TEXT("new_position"),   MoveTemp(NewPosArr))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.add_comment ────────────────────────────────────────────────────────────────────────────
@@ -1083,23 +1090,21 @@ FMCPResponse Tool_AddComment(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetStringField(TEXT("node_guid"),
-		CommentNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
-	Out->SetStringField(TEXT("graph_name"), GraphName);
-	Out->SetStringField(TEXT("text"), CommentText);
-
 	TArray<TSharedPtr<FJsonValue>> PosResp;
 	PosResp.Add(MakeShared<FJsonValueNumber>(PosX));
 	PosResp.Add(MakeShared<FJsonValueNumber>(PosY));
-	Out->SetArrayField(TEXT("position"), PosResp);
 
 	TArray<TSharedPtr<FJsonValue>> SizeResp;
 	SizeResp.Add(MakeShared<FJsonValueNumber>(SizeW));
 	SizeResp.Add(MakeShared<FJsonValueNumber>(SizeH));
-	Out->SetArrayField(TEXT("size"), SizeResp);
 
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),  CommentNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("graph_name"), GraphName)
+		.Str(TEXT("text"),       CommentText)
+		.Arr(TEXT("position"),   MoveTemp(PosResp))
+		.Arr(TEXT("size"),       MoveTemp(SizeResp))
+		.BuildSuccess(Request);
 }
 
 // ─── bp.delete_comment ─────────────────────────────────────────────────────────────────────────
@@ -1165,9 +1170,9 @@ FMCPResponse Tool_DeleteComment(const FMCPRequest& Request)
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("deleted"), true);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("deleted"), true)
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────

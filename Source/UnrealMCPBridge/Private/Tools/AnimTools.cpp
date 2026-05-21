@@ -6,6 +6,7 @@
 
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
+#include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -269,13 +270,13 @@ FMCPResponse Tool_CreateMontage(const FMCPRequest& Request)
 		}
 	}
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("created"), true);
-	Out->SetStringField(TEXT("asset_path"), Montage->GetPathName());
-	Out->SetStringField(TEXT("skeleton_path"), Skeleton->GetPathName());
-	Out->SetNumberField(TEXT("source_length"), SourceSeq->GetPlayLength());
-	Out->SetBoolField(TEXT("saved"), bSavedOk);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("created"),       true)
+		.Str (TEXT("asset_path"),    Montage->GetPathName())
+		.Str (TEXT("skeleton_path"), Skeleton->GetPathName())
+		.Num (TEXT("source_length"), SourceSeq->GetPlayLength())
+		.Bool(TEXT("saved"),         bSavedOk)
+		.BuildSuccess(Request);
 }
 
 // ─── anim.add_section ─────────────────────────────────────────────────────────────────────────
@@ -322,11 +323,11 @@ FMCPResponse Tool_AddSection(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Montage->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetNumberField(TEXT("section_index"), Montage->CompositeSections.Num() - 1);
-	Out->SetNumberField(TEXT("section_count"), Montage->CompositeSections.Num());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"),         true)
+		.Int (TEXT("section_index"), Montage->CompositeSections.Num() - 1)
+		.Int (TEXT("section_count"), Montage->CompositeSections.Num())
+		.BuildSuccess(Request);
 }
 
 // ─── anim.add_notify ──────────────────────────────────────────────────────────────────────────
@@ -417,12 +418,12 @@ FMCPResponse Tool_AddNotify(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Montage->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetBoolField(TEXT("added"), true);
-	Out->SetNumberField(TEXT("notify_index"), Montage->Notifies.Num() - 1);
-	Out->SetNumberField(TEXT("total_notifies"), Montage->Notifies.Num());
-	Out->SetNumberField(TEXT("track_index"), TrackIndex);
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Bool(TEXT("added"),          true)
+		.Int (TEXT("notify_index"),   Montage->Notifies.Num() - 1)
+		.Int (TEXT("total_notifies"), Montage->Notifies.Num())
+		.Int (TEXT("track_index"),    TrackIndex)
+		.BuildSuccess(Request);
 }
 
 // ─── anim.set_blend_mode ──────────────────────────────────────────────────────────────────────
@@ -471,12 +472,12 @@ FMCPResponse Tool_SetBlendMode(const FMCPRequest& Request)
 
 	Scope.DirtyPackage(Montage->GetOutermost());
 
-	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
-	Out->SetNumberField(TEXT("prior_blend_in"),  PriorIn);
-	Out->SetNumberField(TEXT("prior_blend_out"), PriorOut);
-	Out->SetNumberField(TEXT("new_blend_in"),    Montage->BlendIn.GetBlendTime());
-	Out->SetNumberField(TEXT("new_blend_out"),   Montage->BlendOut.GetBlendTime());
-	return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	return FMCPJsonBuilder()
+		.Num(TEXT("prior_blend_in"),  PriorIn)
+		.Num(TEXT("prior_blend_out"), PriorOut)
+		.Num(TEXT("new_blend_in"),    Montage->BlendIn.GetBlendTime())
+		.Num(TEXT("new_blend_out"),   Montage->BlendOut.GetBlendTime())
+		.BuildSuccess(Request);
 }
 
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
