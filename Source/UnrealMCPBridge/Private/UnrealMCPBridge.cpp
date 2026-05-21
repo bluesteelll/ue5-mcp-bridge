@@ -46,6 +46,7 @@
 #include "Tools/PhysicsTools.h"
 #include "Tools/PIETools.h"
 #include "Tools/RenderTools.h"
+#include "Tools/ScreenshotTools.h"
 #include "Tools/SequencerTools.h"
 #include "Tools/SourceControlCompositeTools.h"
 #include "Tools/SourceControlTools.h"
@@ -742,6 +743,33 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32602 / -32603.
 	// Build.cs adds DataValidation private dep (editor plugin module shipped with Engine).
 	FDataValidationTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave H Surface 4 2026-05: Extended screenshot surface (3 tools).
+	//   screenshot.high_resolution   - multiplier-driven capture (native viewport size x [1.0, 8.0]).
+	//                                   Re-uses FMCPScreenshotUtils::CaptureViewport (Draw +
+	//                                   ReadPixels + sRGB-correct FImageUtils::ImageResize) and
+	//                                   EncodeAndSaveToDisk. NOT engine HighResShot tile-rendering
+	//                                   (that path is async via FImageWriteTask, incompatible with
+	//                                   our synchronous request/response model - see
+	//                                   MCPScreenshotUtils.h). Lane A (viewport access).
+	//   screenshot.region_capture    - snapshot camera -> FocusViewportOnBox(actor AABB + padding,
+	//                                   bInstant=true) -> CaptureViewport at supplied resolution ->
+	//                                   restore camera. Best-effort restore (Slate ticks between
+	//                                   snapshot+restore could intervene - vanishingly rare on
+	//                                   the GT dispatch path). Lane A.
+	//   screenshot.diff              - pure image compute, Lane B (bThreadSafe=true). Decodes both
+	//                                   files via IImageWrapperModule::DecompressImage (any
+	//                                   recognised format), normalises both to BGRA8/sRGB via
+	//                                   FImage::ChangeFormat, walks pixels with fixed
+	//                                   5-byte/channel noise tolerance. Optional diff_output_path
+	//                                   writes a desaturated-greyscale overlay PNG with differing
+	//                                   pixels painted bright red. Dimension mismatch is a
+	//                                   well-defined "100% diff" success, NOT an error.
+	// All 3 tools are NOT PIE-guarded (screenshots are runtime ops; alpha forced opaque by
+	// FMCPScreenshotUtils::CaptureViewport). No FScopedTransaction (not undoable). Reuses
+	// existing error codes - no new codes introduced: -32004 / -32013 / -32602 / -32603.
+	// No new Build.cs deps - ImageWrapper/ImageCore already linked from Phase 2.
+	FScreenshotTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
