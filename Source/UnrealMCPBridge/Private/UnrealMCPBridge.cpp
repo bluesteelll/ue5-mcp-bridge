@@ -55,6 +55,7 @@
 #include "Tools/TestCompositeTools.h"
 #include "Tools/TestTools.h"
 #include "Tools/TextureTools.h"
+#include "Tools/ThumbnailTools.h"
 #include "Tools/TransformTools.h"
 #include "Tools/UFunctionTools.h"
 #include "Tools/UMGTools.h"
@@ -770,6 +771,33 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// existing error codes - no new codes introduced: -32004 / -32013 / -32602 / -32603.
 	// No new Build.cs deps - ImageWrapper/ImageCore already linked from Phase 2.
 	FScreenshotTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave H Surface 5 2026-05: Thumbnail manipulation surface (3 tools, all Lane A).
+	//   thumbnail.batch_generate - Render thumbnails for many assets in one round-trip via
+	//                              ThumbnailTools::RenderThumbnail(AlwaysFlush) per asset. Encodes
+	//                              to PNG (default) or JPG, writes under sandbox-resolved
+	//                              ``output_directory``. Filenames derived from sanitised asset leaf.
+	//                              Per-asset failures collected into ``failures[]`` rather than
+	//                              top-level error (partial success is normal — class-generic
+	//                              fallback assets may have no specific renderer registered).
+	//                              NO PIE guard (writes to disk-sandbox; never mutates the asset's
+	//                              package). Lane A.
+	//   thumbnail.clear_cache    - Invalidate cached thumbnails via
+	//                              ThumbnailTools::CacheEmptyThumbnail so the next UThumbnailManager
+	//                              request re-renders. Empty/missing asset_paths → walks every
+	//                              loaded package's ThumbnailMap. With force_regenerate=true,
+	//                              immediately re-renders each cleared asset (synchronous via
+	//                              AlwaysFlush) so the cache repopulates with fresh data. Lane A.
+	//   thumbnail.set_custom     - Load PNG/JPG from disk via IImageWrapperModule, normalise to
+	//                              BGRA8/sRGB via FImage::ChangeFormat, stamp into the asset's
+	//                              package as a custom FObjectThumbnail
+	//                              (SetCreatedAfterCustomThumbsEnabled). FScopedTransaction
+	//                              wraps the package mutation. MarkPackageDirty triggers the next
+	//                              SaveLoadedAsset to persist it. PIE-guarded. Lane A.
+	// Reuses existing error codes - no new codes introduced: -32004 / -32010 / -32013 / -32018 /
+	// -32027 / -32602 / -32603. No new Build.cs deps - ImageWrapper / ImageCore / UnrealEd
+	// (ThumbnailTools + ObjectTools) all already linked from Phase 2.
+	FThumbnailTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")
