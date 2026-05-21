@@ -2,6 +2,8 @@
 
 #include "CookTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "MCPToolHelpers.h"
@@ -696,3 +698,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FCookTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(CookTools, &FCookTools::Register)

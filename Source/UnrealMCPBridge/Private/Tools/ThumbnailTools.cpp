@@ -2,6 +2,8 @@
 
 #include "ThumbnailTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
@@ -605,3 +607,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FThumbnailTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(ThumbnailTools, &FThumbnailTools::Register)

@@ -2,6 +2,8 @@
 
 #include "ViewportTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -471,3 +473,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FViewportTools
+
+MCP_REGISTER_SURFACE(ViewportTools, &FViewportTools::Register)

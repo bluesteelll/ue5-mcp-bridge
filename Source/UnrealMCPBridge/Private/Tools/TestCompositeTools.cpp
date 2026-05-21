@@ -2,6 +2,8 @@
 
 #include "TestCompositeTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "MCPToolHelpers.h"
@@ -456,3 +458,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FTestCompositeTools
+
+MCP_REGISTER_SURFACE(TestCompositeTools, &FTestCompositeTools::Register)

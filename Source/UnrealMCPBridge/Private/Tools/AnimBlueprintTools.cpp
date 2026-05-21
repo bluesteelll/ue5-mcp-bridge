@@ -2,6 +2,8 @@
 
 #include "AnimBlueprintTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
 #include "MCPMutatorScope.h"
@@ -765,3 +767,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FAnimBlueprintTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(AnimBlueprintTools, &FAnimBlueprintTools::Register)

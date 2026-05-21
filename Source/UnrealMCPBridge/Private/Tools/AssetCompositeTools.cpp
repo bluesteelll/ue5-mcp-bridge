@@ -2,6 +2,8 @@
 
 #include "AssetCompositeTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "MCPToolHelpers.h"
@@ -718,3 +720,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FAssetCompositeTools
+
+MCP_REGISTER_SURFACE(AssetCompositeTools, &FAssetCompositeTools::Register)

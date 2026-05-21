@@ -2,6 +2,8 @@
 
 #include "GameplayTagTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPToolHelpers.h"
 #include "MCPMutatorScope.h"
@@ -403,3 +405,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FGameplayTagTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(GameplayTagTools, &FGameplayTagTools::Register)

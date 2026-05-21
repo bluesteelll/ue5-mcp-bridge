@@ -2,6 +2,8 @@
 
 #include "ConfigTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -1086,3 +1088,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FConfigTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(ConfigTools, &FConfigTools::Register)

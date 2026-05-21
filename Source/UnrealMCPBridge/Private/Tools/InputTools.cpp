@@ -2,6 +2,8 @@
 
 #include "InputTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
 #include "MCPToolHelpers.h"
@@ -436,3 +438,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FInputTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(InputTools, &FInputTools::Register)

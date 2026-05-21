@@ -2,6 +2,8 @@
 
 #include "FolderTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
@@ -344,3 +346,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FFolderTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(FolderTools, &FFolderTools::Register)

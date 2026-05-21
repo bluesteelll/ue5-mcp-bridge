@@ -2,6 +2,8 @@
 
 #include "CurveTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
 #include "MCPMutatorScope.h"
@@ -874,3 +876,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FCurveTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(CurveTools, &FCurveTools::Register)

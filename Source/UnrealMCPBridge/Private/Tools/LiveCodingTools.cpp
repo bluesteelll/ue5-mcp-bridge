@@ -2,6 +2,8 @@
 
 #include "LiveCodingTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "FMCPLogStream.h"
@@ -419,3 +421,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FLiveCodingTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(LiveCodingTools, &FLiveCodingTools::Register)

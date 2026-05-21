@@ -2,6 +2,8 @@
 
 #include "NavMeshTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -538,3 +540,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FNavMeshTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(NavMeshTools, &FNavMeshTools::Register)

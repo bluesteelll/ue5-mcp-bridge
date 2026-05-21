@@ -2,6 +2,8 @@
 
 #include "BlueprintCompositeTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "MCPToolHelpers.h"
@@ -269,3 +271,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FBlueprintCompositeTools
+
+MCP_REGISTER_SURFACE(BlueprintCompositeTools, &FBlueprintCompositeTools::Register)

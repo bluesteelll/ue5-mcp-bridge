@@ -2,6 +2,8 @@
 
 #include "ActorTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
@@ -2055,3 +2057,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FActorTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(ActorTools, &FActorTools::Register)

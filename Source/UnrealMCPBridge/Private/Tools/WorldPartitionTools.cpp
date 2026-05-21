@@ -2,6 +2,8 @@
 
 #include "WorldPartitionTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
 #include "MCPMutatorScope.h"
@@ -161,3 +163,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FWorldPartitionTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(WorldPartitionTools, &FWorldPartitionTools::Register)

@@ -2,6 +2,8 @@
 
 #include "LevelStreamingTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
@@ -538,3 +540,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FLevelStreamingTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(LevelStreamingTools, &FLevelStreamingTools::Register)

@@ -2,6 +2,8 @@
 
 #include "DataValidationTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPAssetLoader.h"
 #include "MCPToolHelpers.h"
@@ -443,3 +445,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FDataValidationTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(DataValidationTools, &FDataValidationTools::Register)

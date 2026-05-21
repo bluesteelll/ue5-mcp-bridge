@@ -2,6 +2,8 @@
 
 #include "AssetRegistryTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
@@ -1867,3 +1869,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 }
 
 } // namespace FAssetRegistryTools
+
+MCP_REGISTER_SURFACE(AssetRegistryTools, &FAssetRegistryTools::Register)

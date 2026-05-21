@@ -2,6 +2,8 @@
 
 #include "TransformTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
@@ -719,3 +721,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FTransformTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(TransformTools, &FTransformTools::Register)

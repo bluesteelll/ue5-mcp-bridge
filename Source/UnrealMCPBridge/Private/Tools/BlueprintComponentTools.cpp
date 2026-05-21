@@ -2,6 +2,8 @@
 
 #include "BlueprintComponentTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
@@ -692,3 +694,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FBlueprintComponentTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(BlueprintComponentTools, &FBlueprintComponentTools::Register)

@@ -2,6 +2,8 @@
 
 #include "ContentBrowserTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "FMCPJobRegistry.h"
 #include "MCPMutatorScope.h"
@@ -1311,3 +1313,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FContentBrowserTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(ContentBrowserTools, &FContentBrowserTools::Register)

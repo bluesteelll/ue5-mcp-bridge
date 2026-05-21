@@ -2,6 +2,8 @@
 
 #include "EditorTools.h"
 
+#include "MCPSurfaceRegistry.h"
+
 #include "FMCPDispatchQueue.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
@@ -1081,3 +1083,5 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 } // namespace FEditorTools
 
 #undef LOCTEXT_NAMESPACE
+
+MCP_REGISTER_SURFACE(EditorTools, &FEditorTools::Register)
