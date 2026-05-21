@@ -24,6 +24,7 @@
 #include "Tools/ComponentTools.h"
 #include "Tools/ConfigTools.h"
 #include "Tools/ContentBrowserTools.h"
+#include "Tools/CookTools.h"
 #include "Tools/CurveTools.h"
 #include "Tools/DataTableTools.h"
 #include "Tools/DataValidationTools.h"
@@ -798,6 +799,36 @@ void FUnrealMCPBridgeModule::RegisterDefaultDispatchHandlers()
 	// -32027 / -32602 / -32603. No new Build.cs deps - ImageWrapper / ImageCore / UnrealEd
 	// (ThumbnailTools + ObjectTools) all already linked from Phase 2.
 	FThumbnailTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
+
+	// Wave H Surface 6 2026-05: Cooking automation surface (3 tools, all Lane A, NO PIE guard).
+	//   cook.list_platforms      - enumerate ITargetPlatformManagerModule::GetTargetPlatforms()
+	//                               (all registered platforms + active subset annotation). Per
+	//                               entry: { name, display_name, is_server, is_client, is_editor,
+	//                               is_active }. Sorted by name for determinism. Read-only.
+	//   cook.validate_cookable   - dry-run cookability scan. Walks AR by asset_paths (default
+	//                               ['/Game']) and classifies each via cheap heuristic:
+	//                                 (1) PKG_EditorOnly package flag -> never cookable
+	//                                 (2) editor-only class names + !target.AllowsEditorObjects()
+	//                                     -> reject for non-editor targets
+	//                                 (3) AV class names + target.IsServerOnly() -> reject for
+	//                                     server-only targets
+	//                               Returns { cookable_count, uncookable_count, total_visited,
+	//                               max_assets_reached, errors[] }. Hard cap max_assets=100k.
+	//   cook.start               - submit an out-of-process cook via FMonitoredProcess wrapping
+	//                               UnrealEditor-Cmd.exe -run=Cook -TargetPlatform=<X>
+	//                               -CookOutputDir=<output> -unattended -nullrhi. Lane A
+	//                               entrypoint validates inputs + builds command line + submits
+	//                               a WORKER-thread job (bGameThreadRequired=false). Body
+	//                               launches the process, captures stdout into bounded 1 MiB
+	//                               ring via OnOutput delegate, polls Update() + cancel every
+	//                               500 ms, returns { return_code, duration_secs, cancelled,
+	//                               platform_name, output_directory, command_line, output_tail }
+	//                               via job.result. Cooperative cancel calls Cancel(KillTree=true).
+	// Reuses existing error codes - no new codes introduced: -32004 (platform_name not in TPM) /
+	// -32013 (output_directory outside sandbox) / -32016 (job submit failed) / -32602 (bad args) /
+	// -32603 (TPM/engine exe/project file resolution failure). Build.cs adds TargetPlatform +
+	// DesktopPlatform private deps.
+	FCookTools::Register(FMCPDispatchQueue::Get(), RegisteredMethodNames);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Registered dispatch handlers: kind=ExecPython → FMCPPythonEval::EvalExpression, ")

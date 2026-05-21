@@ -150,6 +150,13 @@ public class UnrealMCPBridge : ModuleRules
 				// FDataValidationContext + EDataValidationResult are in CoreUObject (already
 				// transitively linked via UnrealEd → Engine → CoreUObject).
 				"DataValidation",
+				// Wave H Surface 6 2026-05 — Cooking automation surface.
+				// ITargetPlatform / ITargetPlatformManagerModule live in the TargetPlatform module
+				// (Developer/TargetPlatform). DesktopPlatform exposes FDesktopPlatformModule which
+				// the cook subprocess helpers use for cross-platform exe path resolution helpers.
+				// FMonitoredProcess + FProcHandle live in Core (already a public dep transitively).
+				"TargetPlatform",
+				"DesktopPlatform",
 			}
 		);
 
