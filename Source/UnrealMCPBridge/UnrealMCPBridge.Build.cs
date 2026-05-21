@@ -157,6 +157,16 @@ public class UnrealMCPBridge : ModuleRules
 				// FMonitoredProcess + FProcHandle live in Core (already a public dep transitively).
 				"TargetPlatform",
 				"DesktopPlatform",
+				// Wave I Surface 6 2026-05: landscape.* read-only surface.
+				// ``Landscape`` runtime module exposes ALandscape + ULandscapeInfo + FLandscapeEditDataInterface
+				// (the latter is gated by ``#if WITH_EDITOR`` and exported via LANDSCAPE_API — the plugin is
+				// editor-only so the gate is always satisfied). LandscapeTools.cpp samples heightmap +
+				// weightmap data via the editor-only edit-data interface.
+				// ``Foliage`` is a transitive dep of LandscapeEdit.h — it includes InstancedFoliageActor.h
+				// directly so we must list the module even though LandscapeTools.cpp never names a
+				// foliage symbol itself.
+				"Landscape",
+				"Foliage",
 			}
 		);
 
