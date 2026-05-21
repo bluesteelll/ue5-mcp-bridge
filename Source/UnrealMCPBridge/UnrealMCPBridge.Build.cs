@@ -167,6 +167,15 @@ public class UnrealMCPBridge : ModuleRules
 				// foliage symbol itself.
 				"Landscape",
 				"Foliage",
+				// Wave J 2026-05: ai.* surface (6 sub-surfaces, ~19 tools — bt/bb/controller/eqs/
+				// perception/crowd). All 6 share AIModule which exports AAIController +
+				// UBehaviorTree + UBlackboardComponent + UAIPerceptionComponent + UCrowdManager +
+				// UCrowdFollowingComponent + UEnvQuery + UEnvQueryManager + the FAISenseID/
+				// UAISense_* + UBlackboardKeyType_* hierarchy. GameplayTasks is transitive via
+				// AIModule (public dep) so explicit listing is redundant. First wave using
+				// the auto-register architecture — agents touched ONLY their own AIxxxTools.{h,cpp}
+				// files + MCP_REGISTER_SURFACE macro; UnrealMCPBridge.cpp untouched.
+				"AIModule",
 			}
 		);
 
