@@ -15,6 +15,7 @@
 #include "Editor.h"
 #include "EditorViewportClient.h"
 #include "Engine/Engine.h"
+#include "Engine/Selection.h"
 #include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
 #include "IImageWrapper.h"
@@ -722,6 +723,400 @@ FMCPResponse Tool_RegionCapture(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// ─── screenshot.capture_actors ────────────────────────────────────────────────────────────────
+//
+// Wave K (2026-05-22) — complements ``screenshot.region_capture`` (single actor) with multi-actor
+// framing. Frames the UNION AABB of every supplied actor path, then captures the viewport once.
+//
+// Args:
+//   actor_paths    : string[] (required) — at least 1 entry; each resolved via FMCPActorPathUtils.
+//                    Bad / missing paths cause a hard fail (-32004) — no partial framing.
+//   viewport_index?: int (default 0)
+//   padding?       : float (default 100.0) — cm added on each side of the UNION AABB
+//   output_path?   : string (default ``<Saved>/UnrealMCP/screenshots/group_<uuid>.png``)
+//   resolution?    : [w, h] (default [1920, 1080]); per-side clamp [kSHOTRegionMin..kSHOTRegionMax]
+//
+// Response: {
+//   saved_path, width, height, bytes,
+//   resolved_actor_count: int,
+//   union_bounds: { origin: [x,y,z], extent: [x,y,z] },     // pre-padding
+//   captured_resolution: [w, h]
+// }
+//
+// Errors:
+//   -32004 ObjectNotFound   any actor_paths entry fails to resolve OR has no bounds
+//   -32013 PathEscape       output_path outside sandbox
+//   -32602 InvalidParams    actor_paths missing/empty, resolution/padding malformed
+//   -32603 Internal         no viewport / capture / encode / write failed
+FMCPResponse Tool_CaptureActors(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!Request.Args.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* PathsArr = nullptr;
+	if (!Request.Args->TryGetArrayField(TEXT("actor_paths"), PathsArr) || !PathsArr || PathsArr->Num() == 0)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			TEXT("missing required non-empty array 'actor_paths'"));
+	}
+
+	double PaddingRaw = kSHOTRegionPaddingDefault;
+	Request.Args->TryGetNumberField(TEXT("padding"), PaddingRaw);
+	if (PaddingRaw < 0.0)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			FString::Printf(TEXT("padding %g must be ≥ 0"), PaddingRaw));
+	}
+	const float Padding = static_cast<float>(PaddingRaw);
+
+	// Parse optional [w, h] resolution.
+	int32 ResW = kSHOTRegionDefaultW;
+	int32 ResH = kSHOTRegionDefaultH;
+	const TArray<TSharedPtr<FJsonValue>>* ResArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("resolution"), ResArr) && ResArr)
+	{
+		if (ResArr->Num() != 2)
+		{
+			return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+				FString::Printf(TEXT("'resolution' must be [w, h] (2 numbers); got %d entries"), ResArr->Num()));
+		}
+		double W = 0.0, H = 0.0;
+		if (!(*ResArr)[0]->TryGetNumber(W) || !(*ResArr)[1]->TryGetNumber(H))
+		{
+			return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+				TEXT("'resolution' entries must both be numbers"));
+		}
+		ResW = static_cast<int32>(W);
+		ResH = static_cast<int32>(H);
+		if (ResW < kSHOTRegionMin || ResW > kSHOTRegionMax || ResH < kSHOTRegionMin || ResH > kSHOTRegionMax)
+		{
+			return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+				FString::Printf(TEXT("'resolution' [%d, %d] outside [%d, %d]"),
+					ResW, ResH, kSHOTRegionMin, kSHOTRegionMax));
+		}
+	}
+
+	// Resolve all actors first; union their bounding boxes. Hard-fail on any miss so the caller
+	// gets a clean diagnostic rather than a silently-mis-framed screenshot.
+	FBox UnionBounds(ForceInit);
+	int32 ResolvedCount = 0;
+	for (int32 i = 0; i < PathsArr->Num(); ++i)
+	{
+		FString ActorPath;
+		if (!(*PathsArr)[i]->TryGetString(ActorPath) || ActorPath.IsEmpty())
+		{
+			return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+				FString::Printf(TEXT("actor_paths[%d] must be a non-empty string"), i));
+		}
+		bool bAmbig = false;
+		FString AmbigHint, ResolveErrMsg;
+		AActor* Actor = FMCPActorPathUtils::ResolveActor(ActorPath, /*bRejectPIE*/ false,
+			bAmbig, AmbigHint, ResolveErrMsg);
+		if (!Actor)
+		{
+			const FString Msg = bAmbig
+				? FString::Printf(TEXT("actor_paths[%d] '%s' ambiguous: %s"), i, *ActorPath, *AmbigHint)
+				: FString::Printf(TEXT("actor_paths[%d] '%s' not found: %s"), i, *ActorPath, *ResolveErrMsg);
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound, Msg);
+		}
+		FBox ActorBounds = Actor->GetComponentsBoundingBox(/*bNonColliding*/ true);
+		if (!ActorBounds.IsValid)
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("actor_paths[%d] '%s' has no valid bounding box"), i, *ActorPath));
+		}
+		UnionBounds += ActorBounds;
+		++ResolvedCount;
+	}
+
+	// Pre-padding union bounds for the response (caller may want to verify framing).
+	const FVector PreOrigin = UnionBounds.GetCenter();
+	const FVector PreExtent = UnionBounds.GetExtent();
+
+	if (Padding > 0.0f)
+	{
+		UnionBounds = UnionBounds.ExpandBy(FVector(Padding, Padding, Padding));
+	}
+
+	// Resolve viewport.
+	FMCPResponse VCErr;
+	FLevelEditorViewportClient* VC = SHOT_ResolveViewport(Request, VCErr);
+	if (!VC) { return VCErr; }
+
+	FViewport* Viewport = VC->Viewport;
+	if (!Viewport)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			TEXT("viewport client has no realised FViewport"));
+	}
+
+	// Snapshot camera state for restore.
+	const FVector PriorLocation = VC->GetViewLocation();
+	const FRotator PriorRotation = VC->GetViewRotation();
+	const float PriorFOV = VC->ViewFOV;
+
+	// Resolve output path BEFORE the camera change.
+	FString AbsPath;
+	int32 PathErrCode = 0;
+	FString PathErrMsg;
+	if (!SHOT_ResolveOutputPath(Request.Args, TEXT("png"), TEXT("group"),
+		AbsPath, PathErrCode, PathErrMsg))
+	{
+		return FMCPToolHelpers::MakeError(Request, PathErrCode, PathErrMsg);
+	}
+
+	// Frame the union AABB.
+	VC->FocusViewportOnBox(UnionBounds, /*bInstant*/ true);
+	VC->Invalidate();
+
+	const FMCPScreenshotUtils::EImageFormat Format = SHOT_FormatFromExtension(AbsPath);
+
+	// Capture.
+	TArray<uint8> Pixels;
+	int32 OutW = 0, OutH = 0;
+	FString CaptureErr;
+	if (!FMCPScreenshotUtils::CaptureViewport(Viewport, ResW, ResH, Pixels, OutW, OutH, CaptureErr))
+	{
+		VC->SetViewLocation(PriorLocation);
+		VC->SetViewRotation(PriorRotation);
+		VC->ViewFOV = PriorFOV;
+		VC->Invalidate();
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			FString::Printf(TEXT("group capture failed: %s"), *CaptureErr));
+	}
+
+	// Encode + save.
+	int64 BytesWritten = 0;
+	FString SaveErr;
+	if (!FMCPScreenshotUtils::EncodeAndSaveToDisk(
+			Pixels, OutW, OutH, Format, /*JpegQuality*/ 90, AbsPath, BytesWritten, SaveErr))
+	{
+		VC->SetViewLocation(PriorLocation);
+		VC->SetViewRotation(PriorRotation);
+		VC->ViewFOV = PriorFOV;
+		VC->Invalidate();
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
+	}
+
+	// Restore camera.
+	VC->SetViewLocation(PriorLocation);
+	VC->SetViewRotation(PriorRotation);
+	VC->ViewFOV = PriorFOV;
+	VC->Invalidate();
+
+	// Build bounds response.
+	TSharedRef<FJsonObject> BoundsObj = MakeShared<FJsonObject>();
+	BoundsObj->SetArrayField(TEXT("origin"), {
+		MakeShared<FJsonValueNumber>(PreOrigin.X),
+		MakeShared<FJsonValueNumber>(PreOrigin.Y),
+		MakeShared<FJsonValueNumber>(PreOrigin.Z),
+	});
+	BoundsObj->SetArrayField(TEXT("extent"), {
+		MakeShared<FJsonValueNumber>(PreExtent.X),
+		MakeShared<FJsonValueNumber>(PreExtent.Y),
+		MakeShared<FJsonValueNumber>(PreExtent.Z),
+	});
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("saved_path"), AbsPath)
+		.Num(TEXT("width"), OutW)
+		.Num(TEXT("height"), OutH)
+		.Num(TEXT("bytes"), static_cast<double>(BytesWritten))
+		.Int(TEXT("resolved_actor_count"), ResolvedCount)
+		.ObjectShared(TEXT("union_bounds"), BoundsObj)
+		.Arr(TEXT("captured_resolution"), {
+			MakeShared<FJsonValueNumber>(OutW),
+			MakeShared<FJsonValueNumber>(OutH),
+		})
+		.BuildSuccess(Request);
+}
+
+// ─── screenshot.capture_selection ─────────────────────────────────────────────────────────────
+//
+// Wave K (2026-05-22) — frames the CURRENT EDITOR SELECTION and captures. Returns -32602 if the
+// selection is empty. Useful for "user selected something in the outliner → AI screenshot it".
+//
+// Args:    { viewport_index?, padding?, output_path?, resolution? }
+//          (same shape as region_capture, no actor_path needed)
+// Result:  { saved_path, width, height, bytes,
+//            selected_count, selected_actor_paths: [string],
+//            union_bounds: { origin, extent }, captured_resolution: [w, h] }
+//
+// Errors:
+//   -32602 InvalidParams    selection is empty
+//   -32013 PathEscape       output_path outside sandbox
+//   -32603 Internal         viewport / capture / encode / write failed
+FMCPResponse Tool_CaptureSelection(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!GEditor)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			TEXT("GEditor unavailable"));
+	}
+
+	// Snapshot the selected actors.
+	USelection* Selection = GEditor->GetSelectedActors();
+	TArray<AActor*> Selected;
+	if (Selection)
+	{
+		for (FSelectionIterator It(*Selection); It; ++It)
+		{
+			if (AActor* A = Cast<AActor>(*It))
+			{
+				if (IsValid(A)) Selected.Add(A);
+			}
+		}
+	}
+	if (Selected.Num() == 0)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			TEXT("editor selection is empty — select at least one actor before calling screenshot.capture_selection"));
+	}
+
+	// Padding + resolution parsing — same as capture_actors.
+	double PaddingRaw = kSHOTRegionPaddingDefault;
+	if (Request.Args.IsValid()) { Request.Args->TryGetNumberField(TEXT("padding"), PaddingRaw); }
+	if (PaddingRaw < 0.0)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			FString::Printf(TEXT("padding %g must be ≥ 0"), PaddingRaw));
+	}
+	const float Padding = static_cast<float>(PaddingRaw);
+
+	int32 ResW = kSHOTRegionDefaultW;
+	int32 ResH = kSHOTRegionDefaultH;
+	if (Request.Args.IsValid())
+	{
+		const TArray<TSharedPtr<FJsonValue>>* ResArr = nullptr;
+		if (Request.Args->TryGetArrayField(TEXT("resolution"), ResArr) && ResArr && ResArr->Num() == 2)
+		{
+			double W = 0.0, H = 0.0;
+			if ((*ResArr)[0]->TryGetNumber(W) && (*ResArr)[1]->TryGetNumber(H))
+			{
+				ResW = FMath::Clamp(static_cast<int32>(W), kSHOTRegionMin, kSHOTRegionMax);
+				ResH = FMath::Clamp(static_cast<int32>(H), kSHOTRegionMin, kSHOTRegionMax);
+			}
+		}
+	}
+
+	// Union the selection's AABBs.
+	FBox UnionBounds(ForceInit);
+	TArray<FString> SelectedPaths;
+	SelectedPaths.Reserve(Selected.Num());
+	for (AActor* Actor : Selected)
+	{
+		FBox ActorBounds = Actor->GetComponentsBoundingBox(/*bNonColliding*/ true);
+		if (ActorBounds.IsValid)
+		{
+			UnionBounds += ActorBounds;
+		}
+		SelectedPaths.Add(Actor->GetPathName());
+	}
+	if (!UnionBounds.IsValid)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("none of the %d selected actors had valid bounds"), Selected.Num()));
+	}
+
+	const FVector PreOrigin = UnionBounds.GetCenter();
+	const FVector PreExtent = UnionBounds.GetExtent();
+	if (Padding > 0.0f)
+	{
+		UnionBounds = UnionBounds.ExpandBy(FVector(Padding, Padding, Padding));
+	}
+
+	// Viewport + path + capture (same flow as Tool_CaptureActors).
+	FMCPResponse VCErr;
+	FLevelEditorViewportClient* VC = SHOT_ResolveViewport(Request, VCErr);
+	if (!VC) { return VCErr; }
+	FViewport* Viewport = VC->Viewport;
+	if (!Viewport)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			TEXT("viewport client has no realised FViewport"));
+	}
+
+	const FVector PriorLocation = VC->GetViewLocation();
+	const FRotator PriorRotation = VC->GetViewRotation();
+	const float PriorFOV = VC->ViewFOV;
+
+	FString AbsPath;
+	int32 PathErrCode = 0;
+	FString PathErrMsg;
+	if (!SHOT_ResolveOutputPath(Request.Args, TEXT("png"), TEXT("selection"),
+		AbsPath, PathErrCode, PathErrMsg))
+	{
+		return FMCPToolHelpers::MakeError(Request, PathErrCode, PathErrMsg);
+	}
+
+	VC->FocusViewportOnBox(UnionBounds, /*bInstant*/ true);
+	VC->Invalidate();
+
+	const FMCPScreenshotUtils::EImageFormat Format = SHOT_FormatFromExtension(AbsPath);
+	TArray<uint8> Pixels;
+	int32 OutW = 0, OutH = 0;
+	FString CaptureErr;
+	if (!FMCPScreenshotUtils::CaptureViewport(Viewport, ResW, ResH, Pixels, OutW, OutH, CaptureErr))
+	{
+		VC->SetViewLocation(PriorLocation); VC->SetViewRotation(PriorRotation); VC->ViewFOV = PriorFOV; VC->Invalidate();
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			FString::Printf(TEXT("selection capture failed: %s"), *CaptureErr));
+	}
+
+	int64 BytesWritten = 0;
+	FString SaveErr;
+	if (!FMCPScreenshotUtils::EncodeAndSaveToDisk(
+			Pixels, OutW, OutH, Format, /*JpegQuality*/ 90, AbsPath, BytesWritten, SaveErr))
+	{
+		VC->SetViewLocation(PriorLocation); VC->SetViewRotation(PriorRotation); VC->ViewFOV = PriorFOV; VC->Invalidate();
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			FString::Printf(TEXT("encode-and-save failed: %s"), *SaveErr));
+	}
+
+	VC->SetViewLocation(PriorLocation); VC->SetViewRotation(PriorRotation); VC->ViewFOV = PriorFOV; VC->Invalidate();
+
+	// Build response.
+	TSharedRef<FJsonObject> BoundsObj = MakeShared<FJsonObject>();
+	BoundsObj->SetArrayField(TEXT("origin"), {
+		MakeShared<FJsonValueNumber>(PreOrigin.X),
+		MakeShared<FJsonValueNumber>(PreOrigin.Y),
+		MakeShared<FJsonValueNumber>(PreOrigin.Z),
+	});
+	BoundsObj->SetArrayField(TEXT("extent"), {
+		MakeShared<FJsonValueNumber>(PreExtent.X),
+		MakeShared<FJsonValueNumber>(PreExtent.Y),
+		MakeShared<FJsonValueNumber>(PreExtent.Z),
+	});
+
+	TArray<TSharedPtr<FJsonValue>> PathsJson;
+	PathsJson.Reserve(SelectedPaths.Num());
+	for (const FString& P : SelectedPaths)
+	{
+		PathsJson.Add(MakeShared<FJsonValueString>(P));
+	}
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("saved_path"), AbsPath)
+		.Num(TEXT("width"), OutW)
+		.Num(TEXT("height"), OutH)
+		.Num(TEXT("bytes"), static_cast<double>(BytesWritten))
+		.Int(TEXT("selected_count"), SelectedPaths.Num())
+		.Arr(TEXT("selected_actor_paths"), MoveTemp(PathsJson))
+		.ObjectShared(TEXT("union_bounds"), BoundsObj)
+		.Arr(TEXT("captured_resolution"), {
+			MakeShared<FJsonValueNumber>(OutW),
+			MakeShared<FJsonValueNumber>(OutH),
+		})
+		.BuildSuccess(Request);
+}
+
 // ─── screenshot.diff ───────────────────────────────────────────────────────────────────────────
 //
 // Args:
@@ -927,6 +1322,9 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// high_resolution + region_capture — Lane A (viewport access).
 	RegisterTool(TEXT("screenshot.high_resolution"), &Tool_HighResolution, /*Lane A*/ false);
 	RegisterTool(TEXT("screenshot.region_capture"),  &Tool_RegionCapture,  /*Lane A*/ false);
+	// Wave K (2026-05-22): multi-actor framing + current-selection capture.
+	RegisterTool(TEXT("screenshot.capture_actors"),    &Tool_CaptureActors,    /*Lane A*/ false);
+	RegisterTool(TEXT("screenshot.capture_selection"), &Tool_CaptureSelection, /*Lane A*/ false);
 	// diff — Lane B (pure image compute; no UObject/world access).
 	RegisterTool(TEXT("screenshot.diff"),            &Tool_Diff,           /*Lane B*/ true);
 
