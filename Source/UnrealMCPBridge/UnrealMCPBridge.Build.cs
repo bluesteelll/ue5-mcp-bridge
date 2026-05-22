@@ -180,6 +180,11 @@ public class UnrealMCPBridge : ModuleRules
 				// the auto-register architecture — agents touched ONLY their own AIxxxTools.{h,cpp}
 				// files + MCP_REGISTER_SURFACE macro; UnrealMCPBridge.cpp untouched.
 				"AIModule",
+				// Wave K 2026-05-22: render_target.* surface needs FlushRenderingCommands() from
+				// RenderCore. UTextureRenderTarget2D class itself + FReadSurfaceDataFlags +
+				// FTextureRenderTargetResource live in Engine + RHI (already transitive). Only
+				// RenderCore is missing for the GPU readback sync barrier.
+				"RenderCore",
 			}
 		);
 
