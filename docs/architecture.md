@@ -61,8 +61,32 @@ Most tools are Lane A.
 - Pure compute (path parsing, string ops, base64 encode/decode)
 - No UObject access at all
 - Result construction from pre-captured data
+- Engine APIs documented thread-safe (FApp / FPlatformMemory / IConsoleManager / GConfig reads)
+- Shared-engine-state access serialized via explicit `FCriticalSection` (collision profile + automation framework)
 
-Lane B handlers are rare but important for performance — they keep the game thread free for editor UI when the bridge is hammered.
+Lane B handlers keep the game thread free for editor UI when the bridge is hammered.
+
+#### Lane B utilization (post Refactor Phase 4.2)
+
+| Stage | Lane B count | % of total |
+|---|---|---|
+| Pre-refactor (Phase 4.2 entry) | 17 / 335 | 5.0% |
+| Phase 4.2-a (stats.* + engine.get_info/get_memory_snapshot) | +4 → 21 | 6.3% |
+| Phase 4.2-b (log.list_categories/clear + cfg.{get_cvar,set_cvar,list_cvars,read,list_sections}) | +7 → 28 | 8.4% |
+| Phase 4.2-c (collision.{list_channels,list_profiles,get_profile} + test.{list_automation_specs,get_last_results,list_categories,get_test_info} with FCriticalSection locks) | +7 → **35** | **10.5%** |
+
+#### Shared-state locks (Phase 4.2-c)
+
+When promoting reader-tools to Lane B that touch shared engine state mutated by Lane A writers, a module-scoped `FCriticalSection` is added to that surface .cpp:
+
+- **`CollisionTools.cpp::gCollisionProfileLock`** — serializes `UCollisionProfile::Get()` (`Profiles` TArray) reads vs `set_profile_response`'s `FScopedTransaction + LoadProfileConfig` mutation.
+- **`TestTools.cpp::gAutomationFrameworkLock`** — serializes `FAutomationTestFramework` reads (`TestInfo` map, `RequestedTestFilter` field) vs `run_single_test`/`cancel_current`/`set_filter_flags` writes.
+
+Lane A writers hold the lock for their FULL mutation block (including disk I/O for collision config flush). Lane B readers acquire briefly. Trade-off: Lane B reader latency is bounded by writer cycle time (up to 30s for a long-running `test.run_single_test`) — acceptable since tests are infrequent operator actions.
+
+Tools NOT promoted despite NEEDS_LOCK verdict (defensive Lane A):
+- `log.set_category_verbosity` — `FSelfRegisteringExec::StaticExec` is documented thread-safe but `FLogCategoryBase` interaction lacks explicit MT contract.
+- `cfg.write` — `GConfig::Flush(disk write)` has internal lock per Epic docs but interleaving with engine GT reads could starve an in-flight reader; a per-`IniPath` lock would be needed for full safety.
 
 ## OnEndFrame drain
 
