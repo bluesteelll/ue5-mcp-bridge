@@ -23,8 +23,30 @@ nav_order: 7
 | **Wave D** | 2026-05 | +26 → 233 | gameplaytag (4), debug (6), mesh (5), folder (4), level_streaming (4), transform (3) |
 | **Wave E** | 2026-05 | +21 → 254 | viewport (4), niagara runtime (3), hierarchy (3), texture (4), input (4), subsystem (3) |
 | **Wave F** | 2026-05 | +20 → **274** | Full BP CRUD — graph editing (5), function signatures (4), components/SCS (4), interfaces (3), metadata+comments (4) |
+| **Wave G** | 2026-05 | +23 → 297 | physics writes (4), mat graph nodes (4), navmesh (4), animbp (4), render (4), engine (3) |
+| **Wave H** | 2026-05 | +20 → 317 | data_table (4), curve (4), data_validation (3), screenshot ext (3), thumbnail (3), cook (3) |
+| **Wave I** | 2026-05 | +25 → 342 | Asset hygiene + pipeline polish — package (5), soft_ref (4), collision (4), mat_inst (5), sequencer_ext (3), landscape (4). **First parallel-agent wave; MCPSurfaceRegistry auto-register infra introduced.** |
+| **Wave J** | 2026-05 | +19 → **361** | AI runtime + authoring — ai.bt (4), ai.bb (3), ai.controller (3), ai.eqs (3), ai.perception (3), ai.crowd (3). **First wave fully on auto-register; agents touched ONLY their own files.** |
+| **Refactor** | 2026-05-22 | 0 → **361** (no new tools) | 10-stream autonomous refactor — see "Refactor 2026-05" below |
 
-## Planned — Wave G (next)
+## Refactor 2026-05 (autonomous, 10-stream)
+
+| Phase | Commit | Upstream | Win |
+|---|---|---|---|
+| 1: helper infra + tests-in-repo | `b2fd19d` | `5c274ba` | 4 helper headers (688 LOC) + 47 tests moved into Plugins/UnrealMCPBridge/Tests/python/ |
+| 2: Wave I+J migration (12 surfaces) | `8e5384c` | `785a0b1` | -754 raw LOC across 12 surfaces |
+| 3: 51 surfaces migration | `89ff08c` | `a50f289` | -2 423 raw LOC across 51 surfaces |
+| 4: -32015 disambiguation | `21e6403` | `d24cb5c` | New `-32058 OperationFailed` code |
+| 5-lite: 51 surfaces auto-register | `f286cc4` | `c62fa3b` | `UnrealMCPBridge.cpp` 865 → 273 LOC (-592). All 63 surfaces self-register via `MCP_REGISTER_SURFACE` |
+| 5: module split | `9f2786c` | `a70b1d6` | UnrealMCPBridgeCore (~10kLOC) + UnrealMCPBridge (~53kLOC) |
+| 4.2-a: Lane B promote (4 tools) | `7e306c0` | `11f4ce1` | stats + engine.* readers to worker pool |
+| 4.2-b: Lane B promote (7 tools) | `24ad2e8` | `1a606ca` | log + cfg readers to worker pool |
+| 4.2-c: Lane B with FCriticalSection (7 tools) | `ed49fe1` | `45e3220` | collision + test readers with module-scoped locks |
+| Stream 4: JSON DSL migration | `fff147d` | `30bbcc9` | ~231 tools across 62 surfaces use `FMCPJsonBuilder` fluent DSL |
+
+**Cumulative metrics**: Plugin LOC 66 065 → ~60 800 (−5 265). Lane B 17 → 35 (5.0% → **10.5%**). Tool count unchanged (361). Build GREEN at every phase. All 63/63 surfaces on shared helpers + auto-register + JSON DSL. Error catalog -32004..-32058.
+
+## Planned — Wave G (was next; now COMPLETE — see above)
 
 **Focus: most actual tools for live game dev workflow.** ~23 tools, 274 → 297.
 
