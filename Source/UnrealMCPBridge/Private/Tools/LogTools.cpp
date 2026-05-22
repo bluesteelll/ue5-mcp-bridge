@@ -436,9 +436,14 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
+	// log.set_category_verbosity stays Lane A — FSelfRegisteringExec::StaticExec is documented
+	// thread-safe but the Log Exec branch touches FLogCategoryBase fields; conservative posture.
 	RegisterTool(TEXT("log.set_category_verbosity"), &Tool_SetCategoryVerbosity, /*Lane A*/ false);
-	RegisterTool(TEXT("log.list_categories"),        &Tool_ListCategories,       /*Lane A*/ false);
-	RegisterTool(TEXT("log.clear"),                  &Tool_Clear,                /*Lane A*/ false);
+	// Phase 4.2-bonus (2026-05-22): list_categories + clear promoted to Lane B per FMCPLogStream's
+	// class docstring ("CanBeUsedOnAnyThread() = true, FCriticalSection EntriesLock on every
+	// read/write"). Both tools only snapshot FMCPLogStream state and return — no UObject access.
+	RegisterTool(TEXT("log.list_categories"),        &Tool_ListCategories,       /*Lane B*/ true);
+	RegisterTool(TEXT("log.clear"),                  &Tool_Clear,                /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk D (Logs additions): registered 3 log.* sync handlers ")

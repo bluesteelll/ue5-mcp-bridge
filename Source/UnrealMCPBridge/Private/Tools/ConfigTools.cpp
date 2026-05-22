@@ -1073,12 +1073,20 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	RegisterTool(TEXT("cfg.get_cvar"),      &Tool_GetCVar,       /*Lane A*/ false);
-	RegisterTool(TEXT("cfg.set_cvar"),      &Tool_SetCVar,       /*Lane A*/ false);
-	RegisterTool(TEXT("cfg.list_cvars"),    &Tool_ListCVars,     /*Lane A*/ false);
-	RegisterTool(TEXT("cfg.read"),          &Tool_Read,          /*Lane A*/ false);
+	// Phase 4.2-bonus (2026-05-22): 5 of 6 cfg.* tools promoted to Lane B per Epic docs:
+	//   - IConsoleManager::Get().FindConsoleObject + IConsoleVariable::Set/Get* are documented
+	//     thread-safe (internal FCriticalSection on FConsoleManager singleton).
+	//   - GConfig::GetString / GetSectionNames / ForEachConsoleObjectThatStartsWith all acquire
+	//     FConfigFile / FConfigCacheIni internal locks.
+	// No UObject access; no GEditor; no FScopedTransaction.
+	// cfg.write stays Lane A defensively — the Flush(false, IniPath) path writes to disk +
+	// interacts with other engine systems that may concurrently read GConfig from GT.
+	RegisterTool(TEXT("cfg.get_cvar"),      &Tool_GetCVar,       /*Lane B*/ true);
+	RegisterTool(TEXT("cfg.set_cvar"),      &Tool_SetCVar,       /*Lane B*/ true);
+	RegisterTool(TEXT("cfg.list_cvars"),    &Tool_ListCVars,     /*Lane B*/ true);
+	RegisterTool(TEXT("cfg.read"),          &Tool_Read,          /*Lane B*/ true);
 	RegisterTool(TEXT("cfg.write"),         &Tool_Write,         /*Lane A*/ false);
-	RegisterTool(TEXT("cfg.list_sections"), &Tool_ListSections,  /*Lane A*/ false);
+	RegisterTool(TEXT("cfg.list_sections"), &Tool_ListSections,  /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("Phase 6 Chunk C (Config/CVars): registered 6 cfg.* sync handlers ")
