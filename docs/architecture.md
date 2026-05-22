@@ -230,43 +230,178 @@ Filter mutation detection: `h` field carries the filter hash; mismatch → `-320
 
 ## Module layout
 
+**As of Phase 5 module split (2026-05-22)**, the plugin contains TWO modules under `Plugins/UnrealMCPBridge/Source/`:
+
+### UnrealMCPBridgeCore — infrastructure (~10 kLOC)
+
+Owns server, dispatch, helpers, utils, marshalling, Python eval. NO tool surfaces. Tools module's PublicDep on Core means surfaces transparently see Core's Public/ headers.
+
 ```
-Plugins/UnrealMCPBridge/Source/UnrealMCPBridge/
+UnrealMCPBridgeCore/
+├── UnrealMCPBridgeCore.Build.cs
 ├── Public/
-│   ├── MCPTypes.h           # Error codes, FMCPRequest, FMCPResponse, kMCPDefaultPort
-│   ├── FMCPDispatchQueue.h  # Lane A queue, RegisterHandler, Drain
-│   ├── FMCPServer.h         # TCP accept loop
-│   ├── FMCPJobRegistry.h    # Async jobs
-│   ├── FMCPLogStream.h      # log.* ring buffer
-│   └── UnrealMCPBridge.h    # Module entry
+│   ├── MCPTypes.h            # Error codes (-32004..-32058), FMCPRequest, FMCPResponse, LogMCP
+│   ├── MCPSurfaceRegistry.h  # MCP_REGISTER_SURFACE() macro + Meyers singleton
+│   ├── MCPToolHelpers.h      # MakeError / MakeSuccessObj / StampIds / RequireXxxField
+│   ├── MCPAssetLoader.h      # Templated path → LoadObject<T> → cast
+│   ├── MCPMutatorScope.h     # RAII: PIE-guard + FScopedTransaction + MarkPackageDirty queue
+│   ├── MCPJsonBuilder.h      # Fluent DSL for JSON response building
+│   ├── FMCPDispatchQueue.h   # Lane A queue + Lane B registration
+│   ├── FMCPServer.h          # TCP accept loop
+│   ├── FMCPJobRegistry.h     # Async job pool
+│   ├── FMCPLogStream.h       # log.* ring buffer
+│   ├── FMCPDay7Handlers.h    # job.* / log.* / tools.list (Core surfaces)
+│   ├── FMCPMarshalling.h     # marshall.* — generic FProperty IO
+│   ├── FMCPPythonEval.h      # ExecPython + Python tool registry fallback
+│   ├── FMCPPythonBootstrap.h # Python script plugin bootstrapping
+│   └── Utils/                # ALL utility headers (promoted to Public/ for Tools surfaces)
+│       ├── MCPActorPathUtils.h    # Actor path → AActor* resolution
+│       ├── MCPAssetPathUtils.h    # Asset path normalization + validation
+│       ├── MCPBlueprintUtils.h    # UBlueprint load helpers
+│       ├── MCPPageCursor.h        # Opaque keyset pagination cursor
+│       ├── MCPPinTypeUtils.h      # FEdGraphPinType ↔ JSON
+│       ├── MCPPropertyPathParser.h # Dotted property paths
+│       ├── MCPReflection.h        # Generic FProperty read/write
+│       ├── MCPWorldContext.h      # IsPIEActive, GetEditorWorld
+│       └── ...
 └── Private/
-    ├── FMCPServer.cpp / FMCPConnection.cpp / FMCPDispatchQueue.cpp
-    ├── FMCPMarshalling.cpp  # marshall.* — generic FProperty read/write
-    ├── FMCPPythonEval.cpp / FMCPPythonBootstrap.cpp  # Python integration
-    ├── UnrealMCPBridge.cpp  # Module startup, register all tool surfaces
-    ├── Tools/               # All tool implementations — one file per namespace
-    │   ├── ActorTools.cpp           # actor.*
-    │   ├── BlueprintTools.cpp       # bp.* (variables/functions/interfaces/metadata)
-    │   ├── BlueprintGraphTools.cpp  # bp.add_node/connect_pins/... (graph CRUD)
-    │   ├── BlueprintComponentTools.cpp # bp.add_component/... (SCS)
-    │   ├── DebugTools.cpp           # debug.* (draw helpers)
-    │   ├── FolderTools.cpp          # folder.* (actor outliner)
-    │   ├── HierarchyTools.cpp       # hierarchy.* (attach/detach)
-    │   ├── InputTools.cpp           # input.* (Enhanced Input)
-    │   ├── MeshTools.cpp            # mesh.*
-    │   ├── NiagaraTools.cpp         # niagara.* (params + runtime)
-    │   ├── SequencerTools.cpp       # sequencer.*
-    │   ├── SubsystemTools.cpp       # subsystem.*
-    │   ├── TextureTools.cpp         # texture.*
-    │   ├── ViewportTools.cpp        # viewport.*
-    │   └── ...
-    └── Utils/
-        ├── MCPActorPathUtils.cpp    # Actor path → AActor* resolution
-        ├── MCPAssetPathUtils.cpp    # Asset path normalization + validation
-        ├── MCPBlueprintUtils.cpp    # UBlueprint load helpers
-        ├── MCPPageCursor.cpp        # Opaque pagination cursor
-        ├── MCPPinTypeUtils.cpp      # FEdGraphPinType ↔ JSON
-        ├── MCPPropertyPathParser.cpp # Dotted property paths (Actor.Component.Field)
-        ├── MCPReflection.cpp        # Generic FProperty read/write
-        └── MCPWorldContext.cpp      # IsPIEActive, GetEditorWorld
+    ├── UnrealMCPBridgeCoreModule.cpp # IMPLEMENT_MODULE(FDefaultModuleImpl,...) + DEFINE_LOG_CATEGORY(LogMCP)
+    ├── FMCPServer.cpp / FMCPConnection.{h,cpp} / FMCPDispatchQueue.cpp
+    ├── FMCPJobRegistry.cpp / FMCPLogStream.cpp
+    ├── FMCPMarshalling.cpp / FMCPDay7Handlers.cpp
+    ├── FMCPPythonEval.cpp / FMCPPythonBootstrap.cpp / MCPConsoleCommands.cpp
+    ├── MCPSurfaceRegistry.cpp / MCPToolHelpers.cpp / MCPMutatorScope.cpp
+    └── Utils/                # .cpp implementations of Public/Utils/ headers
 ```
+
+### UnrealMCPBridge — 63 tool surfaces + module class (~53 kLOC)
+
+```
+UnrealMCPBridge/
+├── UnrealMCPBridge.Build.cs  # PublicDependencyModuleNames.Add("UnrealMCPBridgeCore")
+├── Public/
+│   └── UnrealMCPBridge.h     # Module class header (IUnrealMCPBridgeModule)
+└── Private/
+    ├── UnrealMCPBridge.cpp   # FUnrealMCPBridgeModule lifecycle (273 LOC, down from 865
+    │                         # — delegates surface registration to FMCPSurfaceRegistry::RegisterAll)
+    └── Tools/                # 63 tool surface files (~53 kLOC total)
+        ├── ActorTools.cpp / AIBehaviorTreeTools.cpp / AIBlackboardTools.cpp /
+        │   AIControllerTools.cpp / AICrowdTools.cpp / AIEQSTools.cpp /
+        │   AIPerceptionTools.cpp / AnimBlueprintTools.cpp / AnimTools.cpp /
+        │   AssetCompositeTools.cpp / AssetRegistryTools.cpp / AudioTools.cpp /
+        │   BlueprintTools.cpp / BlueprintComponentTools.cpp (BPSCS_) /
+        │   BlueprintCompositeTools.cpp / BlueprintGraphTools.cpp / CollisionTools.cpp /
+        │   ComponentTools.cpp / ConfigTools.cpp / ContentBrowserTools.cpp /
+        │   CookTools.cpp / CurveTools.cpp / DataTableTools.cpp /
+        │   DataValidationTools.cpp / DebugTools.cpp / EditorTools.cpp /
+        │   EngineTools.cpp / FolderTools.cpp / GameplayTagTools.cpp /
+        │   HierarchyTools.cpp / InputTools.cpp / LandscapeTools.cpp /
+        │   LevelTools.cpp / LevelCompositeTools.cpp / LevelStreamingTools.cpp /
+        │   LiveCodingTools.cpp / LogTools.cpp / MaterialInstanceTools.cpp /
+        │   MaterialTools.cpp / MeshTools.cpp / NavMeshTools.cpp / NiagaraTools.cpp /
+        │   PackageTools.cpp / PhysicsTools.cpp / PIETools.cpp / RenderTools.cpp /
+        │   ScreenshotTools.cpp / SequencerTools.cpp / SequencerExtTools.cpp /
+        │   SoftRefTools.cpp / SourceControlTools.cpp / SourceControlCompositeTools.cpp /
+        │   StatsTools.cpp / SubsystemTools.cpp / TestTools.cpp / TestCompositeTools.cpp /
+        │   TextureTools.cpp / ThumbnailTools.cpp / TransformTools.cpp /
+        │   UFunctionTools.cpp / UMGTools.cpp / ViewportTools.cpp /
+        │   WorldPartitionTools.cpp
+        └── (each surface auto-registers via MCP_REGISTER_SURFACE at file scope)
+```
+
+### Module load order
+
+`.uplugin` lists Core first, Tools second. Both LoadingPhase=Default. Lifecycle:
+
+1. Core DLL loads — `FDefaultModuleImpl::StartupModule` is a no-op
+2. Tools DLL loads — every surface's `MCP_REGISTER_SURFACE(SurfaceName, &FXxxTools::Register)` static initializer fires, populating `FMCPSurfaceRegistry::Get()`
+3. Tools' `FUnrealMCPBridgeModule::StartupModule` runs:
+   - Registers Python eval + unknown-method-fallback handlers
+   - Registers C++ handlers for `marshall.*` / `job.*` / `log.*` / `tools.list`
+   - Calls `FMCPSurfaceRegistry::Get().RegisterAll(...)` — all 63 surfaces wired in one call
+   - Starts `FMCPServer`
+
+## Auto-register pattern (MCP_REGISTER_SURFACE)
+
+Every surface .cpp has ONE line at TU scope:
+
+```cpp
+MCP_REGISTER_SURFACE(BlueprintTools, &FBlueprintTools::Register)
+```
+
+This expands to an anonymous-namespace `struct` with a static-init body that pushes `{Name, RegisterFn}` to `FMCPSurfaceRegistry::Get()`. When `RegisterAll(...)` iterates, every surface's `Register(FMCPDispatchQueue&, TArray<FString>&)` runs.
+
+**Benefit**: parallel-agent waves can add N surfaces concurrently without conflict on `UnrealMCPBridge.cpp` — each agent only touches its own surface .cpp.
+
+## Helper infrastructure
+
+Public headers in `UnrealMCPBridgeCore/Public/` that every surface uses:
+
+### FMCPToolHelpers
+
+```cpp
+namespace FMCPToolHelpers {
+    void StampIds(const FMCPRequest&, FMCPResponse&);
+    FMCPResponse MakeError(const FMCPRequest&, int32 Code, const FString& Message);
+    FMCPResponse MakeSuccessObj(const FMCPRequest&, TSharedRef<FJsonObject>);
+    FMCPResponse MakeSuccessObj(const FMCPRequest&, TSharedPtr<FJsonObject>); // asserts non-null
+    FMCPResponse MakeSuccessValue(const FMCPRequest&, TSharedRef<FJsonValue>);
+    bool RequireStringField(const FMCPRequest&, const TCHAR* FieldName, FString&, FMCPResponse& OutErr);
+    bool RequireNumberField / RequireIntField / RequireBoolField / RequireArrayField / RequireObjectField (...);
+}
+```
+
+**Always qualify as `FMCPToolHelpers::MakeError(...)` explicitly** — UE's `Templates/ValueOrError.h` has a free `MakeError<>` template that collides via ADL on `FMCPRequest&` arg.
+
+### FMCPAssetLoader
+
+Templated path → LoadObject → cast helper:
+
+```cpp
+int32 ErrCode = 0; FString ErrMsg;
+UDataTable* Table = FMCPAssetLoader::Load<UDataTable>(InPath, ErrCode, ErrMsg);
+if (!Table) return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
+```
+
+Sets `-32010 InvalidPath`, `-32004 ObjectNotFound`, or `-32011 WrongClass`. `LoadRaw()` variant returns `UObject*` without type check.
+
+### FMCPMutatorScope
+
+RAII guard for editor-world mutators:
+
+```cpp
+FMCPMutatorScope Scope(Request, LOCTEXT("MCP_DT_SetRow", "DataTable: Set Row"));
+if (Scope.PIEBlocked()) return Scope.Error();  // -32027 PIEActive
+Table->Modify();
+// ... mutate ...
+Scope.DirtyPackage(Table->GetPackage());
+// Destructor commits FScopedTransaction + flushes MarkPackageDirty queue.
+```
+
+**DO NOT** use in:
+- Lane B sync wrappers (would crash listener thread)
+- PIE-friendly runtime mutators (physics.apply_impulse, ai.bb.set_value, etc.)
+- Tools that already own a `FMCPWritePropertyScope` (nested-transaction concern)
+
+### FMCPJsonBuilder
+
+Fluent DSL for JSON response construction:
+
+```cpp
+return FMCPJsonBuilder()
+    .Str(TEXT("path"), AssetPath)
+    .Num(TEXT("count"), Count)
+    .Bool(TEXT("loaded"), bLoaded)
+    .Arr(TEXT("rows"), MoveTemp(RowsArray))     // cache .Num() BEFORE chain if needed
+    .OptStr(TEXT("name"), MaybeEmptyName)        // skip if empty
+    .Object(TEXT("transform"), [&](FMCPJsonBuilder& Sub) { Sub.Num(TEXT("x"), L.X); })
+    .ObjectShared(TEXT("preBuilt"), ExistingSharedRef)
+    .Field(TEXT("v"), TSharedRef<FJsonValue>(...))
+    .Null(TEXT("nullable"))
+    .If(bCondition, [&](FMCPJsonBuilder& B) { B.Str(...); })
+    .BuildSuccess(Request);
+
+// FMCPJsonArrayBuilder for array-of-objects payloads
+```
+
+62 of 63 surfaces use this builder for success-response construction.

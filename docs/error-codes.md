@@ -35,7 +35,7 @@ Every error response carries a JSON-RPC-style code from the `-32000..-32099` ser
 | `-32012` | OverlyBroadQuery | Recursive /Game scan with no filters; or hard caps (500/10k/5000) |
 | `-32013` | PathEscape | Disk path arg outside sandbox whitelist |
 | `-32014` | PathInUse | rename/duplicate/create target already exists |
-| `-32015` | StaleCursor | page_token's embedded filter_hash mismatches current filter |
+| `-32015` | StaleCursor | page_token's embedded filter_hash mismatches current filter (pagination semantic ONLY — was double-meaning until Refactor Phase 4 split engine-side refusal into `-32058 OperationFailed`) |
 | `-32016` | JobSubmitFailed | FMCPJobRegistry::SubmitJob failed |
 | `-32017` | InputTooLarge | Synchronous-batch limit exceeded (200) |
 | `-32018` | ThumbnailRenderFailed | RenderThumbnail returned empty or encode failed |
@@ -99,6 +99,7 @@ Every error response carries a JSON-RPC-style code from the `-32000..-32099` ser
 | `-32055` | NotifyTrackNotFound | anim.add_notify: notify_track_name doesn't exist | Wave C Tier 5b |
 | `-32056` | FolderNotFound | folder.delete: folder_path doesn't exist | Wave D Surface 4 |
 | `-32057` | FunctionParameterDuplicate | bp.add_function_parameter: param_name already exists | Wave F S2 |
+| `-32058` | OperationFailed | Generic "engine-side operation refused" — used when an engine API returned a recognized failure indicator (status enum, false bool with no diagnostic) that isn't covered by a more specific code. Currently raised by `ai.eqs.run_query` when `EEnvQueryStatus` is Failed/Aborted/OwnerLost/MissingParam. | Refactor Phase 4 |
 
 ## Recovery patterns
 
