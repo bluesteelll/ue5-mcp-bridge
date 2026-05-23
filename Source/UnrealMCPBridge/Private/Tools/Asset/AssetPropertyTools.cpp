@@ -8,8 +8,11 @@
 #include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
 #include "UnrealMCPBridge.h"
+#include "Utils/MCPAssetPathUtils.h"
 #include "Utils/MCPReflection.h"
 #include "Utils/MCPWorldContext.h"
+
+#include "UObject/UObjectHash.h"  // ForEachObjectWithOuter (Wave S — Package→inner descent)
 
 #include "UObject/Class.h"
 #include "UObject/Package.h"
@@ -40,13 +43,46 @@ namespace
 		{
 			return nullptr;
 		}
-		UObject* Asset = FMCPReflection::ResolveObjectPath(OutPath);
+
+		// Wave S fix (2026-05-24): when caller passes package-form path like /Game/Foo/Bar
+		// (no .AssetName suffix), FMCPReflection::ResolveObjectPath's FindObject<UObject> may
+		// return the UPackage instead of the inner asset. Downstream ResolvePropertyPath then
+		// fails with "no property X on Package". Fix: auto-canonicalise to object-path form via
+		// FMCPAssetPathUtils::ToObjectPath BEFORE resolve so the lookup always targets the inner
+		// asset. Idempotent for paths that already include .AssetName suffix.
+		const FString NormalizedPath = FMCPAssetPathUtils::Normalize(OutPath);
+		const FString ObjectPath = NormalizedPath.IsEmpty()
+			? OutPath  // fallback to raw input if Normalize rejected (preserves the original error)
+			: FMCPAssetPathUtils::ToObjectPath(NormalizedPath);
+
+		UObject* Asset = FMCPReflection::ResolveObjectPath(ObjectPath);
 		if (!Asset)
 		{
 			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 				FString::Printf(TEXT("asset_path '%s' did not resolve to a loaded UObject"), *OutPath));
 			return nullptr;
 		}
+
+		// Defensive: if we somehow still got a UPackage (e.g. path was /Memory/X with no inner
+		// asset), descend to the first non-Package inner UObject. The asset is usually the package's
+		// single primary child with name == package leaf.
+		if (Asset->IsA<UPackage>())
+		{
+			UPackage* Pkg = Cast<UPackage>(Asset);
+			UObject* Inner = nullptr;
+			ForEachObjectWithOuter(Pkg, [&Inner](UObject* Obj)
+			{
+				if (!Inner && Obj && !Obj->IsA<UPackage>())
+				{
+					Inner = Obj;
+				}
+			}, /*bIncludeNestedObjects=*/false);
+			if (Inner)
+			{
+				Asset = Inner;
+			}
+		}
+
 		return Asset;
 	}
 

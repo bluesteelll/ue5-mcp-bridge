@@ -442,7 +442,17 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	// Asset-vs-folder guard: cb.delete is per-spec single-asset only. A folder path resolves
 	// to no UPackage on disk, so DoesPackageExist returns false even though DoesDirectoryExist
 	// might say true. Treat folder paths as INVALID_PATH per M9.
-	if (!FPackageName::DoesPackageExist(NormalizedPath))
+	const bool bDiskExists = FPackageName::DoesPackageExist(NormalizedPath);
+
+	// Wave S fix (2026-05-24): in-memory unsaved assets are valid delete targets too. Discovered
+	// via stress test T10 (cleanup phase): assets created in current editor session via
+	// bp.create_blueprint / ai.bt.create_asset / etc. live in-memory until SavePackage runs.
+	// Prior cb.delete impl required disk presence, so test-artifact cleanup leaked.
+	// Fix: detect in-memory presence via FindObject; if present, force-delete it via the
+	// ForceDelete path (since there's nothing on disk to leave dangling, force semantics are
+	// strictly safer for in-memory cleanup).
+	bool bMemoryOnly = false;
+	if (!bDiskExists)
 	{
 		// Distinguish "folder" from "missing asset" — only fail INVALID if it IS a known folder.
 		if (Subsys->DoesDirectoryExist(NormalizedPath))
@@ -451,11 +461,29 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 				FString::Printf(TEXT("path '%s' is a folder, not an asset — cb.delete is single-asset only"),
 					*NormalizedPath));
 		}
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("no package on disk for '%s'"), *NormalizedPath));
+
+		// Check in-memory presence before erroring out.
+		const FString ObjectPathForFind = FMCPAssetPathUtils::ToObjectPath(NormalizedPath);
+		if (FindObject<UObject>(nullptr, *ObjectPathForFind) != nullptr)
+		{
+			// In-memory unsaved asset — auto-promote to force-delete since there's nothing on
+			// disk to redirector-leave behind.
+			bMemoryOnly = true;
+			bForce = true;
+			UE_LOG(LogMCP, Verbose, TEXT("cb.delete: in-memory only asset '%s' — auto force-delete"),
+				*NormalizedPath);
+		}
+		else
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("no package on disk OR in memory for '%s'"), *NormalizedPath));
+		}
 	}
 
-	if (!Subsys->DoesAssetExist(NormalizedPath))
+	// DoesAssetExist queries the asset registry which may not have an entry for in-memory unsaved
+	// assets (depending on whether FAssetRegistryModule::AssetCreated was called by the creator).
+	// For bMemoryOnly path we skip this check and rely on FindObject in the ForceDelete branch.
+	if (!bMemoryOnly && !Subsys->DoesAssetExist(NormalizedPath))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
@@ -474,8 +502,9 @@ FMCPResponse Tool_Delete(const FMCPRequest& Request)
 	}
 
 	// Resolve to FAssetData (force=false path) or UObject* (force=true path).
+	// bMemoryOnly skips FAssetData resolution — the ForceDelete branch uses FindObject directly.
 	FAssetData Data;
-	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
+	if (!bMemoryOnly && !FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, Data))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
 			FString::Printf(TEXT("could not resolve FAssetData for '%s'"), *NormalizedPath));
