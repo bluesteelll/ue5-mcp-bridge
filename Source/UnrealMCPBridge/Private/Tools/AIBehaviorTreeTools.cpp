@@ -7,6 +7,7 @@
 #include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
+#include "MCPAssetFactory.h"
 #include "MCPClassResolver.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -896,25 +897,9 @@ FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("path"), DestPathRaw, Err)) { return Err; }
 
-	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
-	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
-			FString::Printf(TEXT("path '%s' malformed or unknown mount"), *DestPathRaw));
-	}
-
-	const FString PackagePath = FPaths::GetPath(DestPathNorm);
-	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
-
-	if (FPackageName::DoesPackageExist(DestPathNorm) ||
-		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("path '%s' already exists"), *DestPathNorm));
-	}
-
 	// Determine root composite class: default Selector when key absent; skip root when ""
-	// (empty string) supplied; resolve when non-empty.
+	// (empty string) supplied; resolve when non-empty. Done BEFORE Create so we fail-fast
+	// without creating the BT package on an invalid class spec.
 	FString RootClassPath = TEXT("/Script/AIModule.BTComposite_Selector");
 	bool bRootRequested = true;
 	if (Request.Args.IsValid())
@@ -958,21 +943,16 @@ FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
 		if (!BBAsset) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
 	}
 
-	UPackage* BTPkg = CreatePackage(*DestPathNorm);
-	if (!BTPkg)
+	// Wave Q3 — path validation + existence check + CreatePackage + NewObject delegated to
+	// FMCPAssetFactory::Create. Per-type configure (RootNode, BlackboardAsset) follows; caller
+	// triggers Scope.DirtyPackage once with the fully-populated asset.
+	FMCPAssetCreateResult R = FMCPAssetFactory::Create<UBehaviorTree>(DestPathRaw);
+	if (!R.IsValid())
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
-			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *DestPathNorm));
+		return FMCPToolHelpers::MakeError(Request, R.ErrorCode, R.ErrorMessage);
 	}
-	BTPkg->FullyLoad();
-
-	UBehaviorTree* BT = NewObject<UBehaviorTree>(
-		BTPkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
-	if (!BT)
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
-			FString::Printf(TEXT("NewObject<UBehaviorTree> returned null for '%s'"), *DestPathNorm));
-	}
+	UBehaviorTree* BT = Cast<UBehaviorTree>(R.Asset);
+	check(BT);
 
 	if (RootClass)
 	{
@@ -984,8 +964,7 @@ FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
 
 	if (BBAsset) { BT->BlackboardAsset = BBAsset; }
 
-	FAssetRegistryModule::AssetCreated(BT);
-	Scope.DirtyPackage(BTPkg);
+	Scope.DirtyPackage(R.Package);
 
 	return FMCPJsonBuilder()
 		.Str (TEXT("asset_path"), BT->GetPathName())

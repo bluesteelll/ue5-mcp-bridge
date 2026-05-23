@@ -7,6 +7,7 @@
 #include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
+#include "MCPAssetFactory.h"
 #include "MCPClassResolver.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -476,44 +477,18 @@ FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("path"), DestPathRaw, Err)) { return Err; }
 
-	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
-	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
+	// Wave Q3 — path validation + existence check + CreatePackage + NewObject all delegated to
+	// FMCPAssetFactory::Create. Returns a result struct; caller calls Scope.DirtyPackage once
+	// (here EQS has no per-type configure step — the empty Options array is the default).
+	FMCPAssetCreateResult R = FMCPAssetFactory::Create<UEnvQuery>(DestPathRaw);
+	if (!R.IsValid())
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
-			FString::Printf(TEXT("path '%s' malformed or unknown mount"), *DestPathRaw));
+		return FMCPToolHelpers::MakeError(Request, R.ErrorCode, R.ErrorMessage);
 	}
-
-	const FString PackagePath = FPaths::GetPath(DestPathNorm);
-	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
-
-	if (FPackageName::DoesPackageExist(DestPathNorm) ||
-		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("path '%s' already exists"), *DestPathNorm));
-	}
-
-	UPackage* EQSPkg = CreatePackage(*DestPathNorm);
-	if (!EQSPkg)
-	{
-		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
-			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *DestPathNorm));
-	}
-	EQSPkg->FullyLoad();
-
-	UEnvQuery* Query = NewObject<UEnvQuery>(
-		EQSPkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
-	if (!Query)
-	{
-		return FMCPToolHelpers::MakeError(Request, kAIEQSErrorInternal,
-			FString::Printf(TEXT("NewObject<UEnvQuery> returned null for '%s'"), *DestPathNorm));
-	}
-
-	FAssetRegistryModule::AssetCreated(Query);
-	Scope.DirtyPackage(EQSPkg);
+	Scope.DirtyPackage(R.Package);
 
 	return FMCPJsonBuilder()
-		.Str(TEXT("asset_path"), Query->GetPathName())
+		.Str(TEXT("asset_path"), R.AssetPath)
 		.BuildSuccess(Request);
 }
 

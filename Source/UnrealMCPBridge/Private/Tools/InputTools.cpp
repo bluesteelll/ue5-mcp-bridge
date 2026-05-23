@@ -8,6 +8,7 @@
 #include "MCPAssetLoader.h"
 #include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
+#include "MCPAssetFactory.h"
 #include "MCPClassResolver.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
@@ -114,36 +115,9 @@ namespace
 		return true;
 	}
 
-	/**
-	 * Templated NewObject-on-fresh-package factory used by both ``input.create_input_action`` and
-	 * ``input.create_mapping_context``. Encapsulates the standard pattern:
-	 *
-	 *   1. CreatePackage + FullyLoad
-	 *   2. NewObject<T>(Pkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional)
-	 *   3. Caller initialises T-specific fields BETWEEN return and SavePackage call
-	 *   4. FAssetRegistryModule::AssetCreated
-	 *   5. MarkPackageDirty (via Scope.DirtyPackage)
-	 *
-	 * Returns the created object or nullptr on failure (caller responsible for OutError).
-	 */
-	template<typename T>
-	T* INP_CreateAssetInPackage(
-		const FString& PackagePath,
-		const FString& AssetName,
-		FMCPMutatorScope& Scope)
-	{
-		const FString PackageName = PackagePath / AssetName;
-		UPackage* Pkg = CreatePackage(*PackageName);
-		if (!Pkg) { return nullptr; }
-		Pkg->FullyLoad();
-
-		T* Asset = NewObject<T>(Pkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
-		if (!Asset) { return nullptr; }
-
-		FAssetRegistryModule::AssetCreated(Asset);
-		Scope.DirtyPackage(Pkg);
-		return Asset;
-	}
+	// INP_CreateAssetInPackage removed; replaced by FMCPAssetFactory::Create (Wave Q3 — shared
+	// across input.create_input_action / input.create_mapping_context / ai.bt.create_asset /
+	// ai.bb.create_asset / ai.eqs.create_asset).
 
 	/**
 	 * Paginated asset enumeration helper. Mirrors AnimTools::Tool_ListSequences /
@@ -732,22 +706,25 @@ FMCPResponse Tool_CreateInputAction(const FMCPRequest& Request)
 			.BuildSuccess(Request);
 	}
 
-	// Create fresh IA in a new package.
-	UInputAction* IA = INP_CreateAssetInPackage<UInputAction>(PackagePath, AssetName, Scope);
-	if (!IA)
+	// Create fresh IA — Wave Q3 delegates to FMCPAssetFactory::Create (path validation +
+	// existence check + CreatePackage + NewObject + AssetRegistry notify). Re-uses PathNorm
+	// for the helper (idempotent on already-normalized paths). Existing-asset short-circuit
+	// above means we only reach here when path is fresh.
+	FMCPAssetCreateResult R = FMCPAssetFactory::Create<UInputAction>(PathNorm);
+	if (!R.IsValid())
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
-			FString::Printf(TEXT("CreatePackage + NewObject<UInputAction> failed for '%s'"), *PathNorm));
+		return FMCPToolHelpers::MakeError(Request, R.ErrorCode, R.ErrorMessage);
 	}
+	UInputAction* IA = Cast<UInputAction>(R.Asset);
+	check(IA);
 
 	// Direct field assignment on a freshly-created object — no nested FMCPWritePropertyScope needed
 	// (outer FMCPMutatorScope already owns the transaction, and there are no editor observers on a
-	// brand-new asset yet). Mirrors the AnimTools::Tool_CreateMontage pattern (SetSkeleton, AddSlot
-	// called directly without per-field Pre/Post). MarkPackageDirty is queued by Scope.DirtyPackage
-	// inside INP_CreateAssetInPackage.
+	// brand-new asset yet). Mirrors the AnimTools::Tool_CreateMontage pattern.
 	IA->ValueType           = ValueType;
 	IA->bConsumeInput       = bConsumeInput;
 	IA->bReserveAllMappings = bReserveAllMappings;
+	Scope.DirtyPackage(R.Package);
 
 	return FMCPJsonBuilder()
 		.Str (TEXT("asset_path"),           IA->GetPathName())
@@ -800,12 +777,17 @@ FMCPResponse Tool_CreateMappingContext(const FMCPRequest& Request)
 			.BuildSuccess(Request);
 	}
 
-	UInputMappingContext* IMC = INP_CreateAssetInPackage<UInputMappingContext>(PackagePath, AssetName, Scope);
-	if (!IMC)
+	// Wave Q3 — delegate creation to shared FMCPAssetFactory::Create. Existing-asset short-circuit
+	// above ensures we only reach here on a fresh path; helper's redundant existence-check is a
+	// no-op in that case.
+	FMCPAssetCreateResult R = FMCPAssetFactory::Create<UInputMappingContext>(PathNorm);
+	if (!R.IsValid())
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
-			FString::Printf(TEXT("CreatePackage + NewObject<UInputMappingContext> failed for '%s'"), *PathNorm));
+		return FMCPToolHelpers::MakeError(Request, R.ErrorCode, R.ErrorMessage);
 	}
+	UInputMappingContext* IMC = Cast<UInputMappingContext>(R.Asset);
+	check(IMC);
+	Scope.DirtyPackage(R.Package);
 
 	return FMCPJsonBuilder()
 		.Str (TEXT("asset_path"),    IMC->GetPathName())

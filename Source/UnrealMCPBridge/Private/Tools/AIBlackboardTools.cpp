@@ -7,6 +7,7 @@
 #include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
+#include "MCPAssetFactory.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -840,24 +841,8 @@ FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("path"), DestPathRaw, Err)) { return Err; }
 
-	const FString DestPathNorm = FMCPAssetPathUtils::Normalize(DestPathRaw);
-	if (DestPathNorm.IsEmpty() || !FMCPAssetPathUtils::IsValidGameOrPlugin(DestPathNorm))
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
-			FString::Printf(TEXT("path '%s' malformed or unknown mount"), *DestPathRaw));
-	}
-
-	const FString PackagePath = FPaths::GetPath(DestPathNorm);
-	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
-
-	if (FPackageName::DoesPackageExist(DestPathNorm) ||
-		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("path '%s' already exists"), *DestPathNorm));
-	}
-
-	// Optional parent_bb resolution — must come BEFORE NewObject so we can fail-fast.
+	// Optional parent_bb resolution — must come BEFORE Create so we fail-fast without polluting
+	// the asset registry with an orphan BB if the parent is bad.
 	UBlackboardData* ParentBB = nullptr;
 	FString ParentBBPath;
 	if (Request.Args.IsValid() && Request.Args->TryGetStringField(TEXT("parent_bb"), ParentBBPath)
@@ -869,26 +854,20 @@ FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
 		if (!ParentBB) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
 	}
 
-	UPackage* BBPkg = CreatePackage(*DestPathNorm);
-	if (!BBPkg)
+	// Wave Q3 — path validation + existence check + CreatePackage + NewObject delegated to
+	// FMCPAssetFactory::Create. Per-type configure (Parent) follows; caller triggers
+	// Scope.DirtyPackage once with the fully-populated asset.
+	FMCPAssetCreateResult R = FMCPAssetFactory::Create<UBlackboardData>(DestPathRaw);
+	if (!R.IsValid())
 	{
-		return FMCPToolHelpers::MakeError(Request, kAIBBErrorInternal,
-			FString::Printf(TEXT("CreatePackage returned null for '%s'"), *DestPathNorm));
+		return FMCPToolHelpers::MakeError(Request, R.ErrorCode, R.ErrorMessage);
 	}
-	BBPkg->FullyLoad();
-
-	UBlackboardData* BB = NewObject<UBlackboardData>(
-		BBPkg, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
-	if (!BB)
-	{
-		return FMCPToolHelpers::MakeError(Request, kAIBBErrorInternal,
-			FString::Printf(TEXT("NewObject<UBlackboardData> returned null for '%s'"), *DestPathNorm));
-	}
+	UBlackboardData* BB = Cast<UBlackboardData>(R.Asset);
+	check(BB);
 
 	if (ParentBB) { BB->Parent = ParentBB; }
 
-	FAssetRegistryModule::AssetCreated(BB);
-	Scope.DirtyPackage(BBPkg);
+	Scope.DirtyPackage(R.Package);
 
 	return FMCPJsonBuilder()
 		.Str (TEXT("asset_path"), BB->GetPathName())
