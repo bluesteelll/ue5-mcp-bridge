@@ -49,6 +49,13 @@ namespace
 	static FInsightsLocalState  GInsightsLocalState;
 	static FCriticalSection     GInsightsLocalStateLock;
 
+	// Wave L+1 (2026-05-23) Lane B promotions: list_channels acquires this when iterating the live
+	// channel registry via UE::Trace::EnumerateChannels. The TraceLog module is documented as
+	// thread-safe internally but we keep a module-scoped lock for defense-in-depth against module
+	// load races (modules announce channels at load time). get_status reuses the existing
+	// GInsightsLocalStateLock — it already serialises the StartedAt fields.
+	static FCriticalSection     gInsightsTraceLock;
+
 	// Normalise the "channels" arg. Accepts either:
 	//   - string: "cpu,gpu,frame"  (comma or semicolon separators)
 	//   - array:  ["cpu","gpu","frame"]
@@ -333,10 +340,10 @@ FMCPResponse Tool_StopCapture(const FMCPRequest& Request)
 // Result (idle):    { is_tracing: false }
 //
 // Read-only. Reads engine state via FTraceAuxiliary directly (no self-state desync).
+// Wave L+1: Lane B — pure reads of FTraceAuxiliary statics + GInsightsLocalState under existing
+// lock. No UObject / GEditor / GWorld touch.
 FMCPResponse Tool_GetStatus(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
-
 	const bool bIsTracing = FTraceAuxiliary::IsConnected();
 
 	if (!bIsTracing)
@@ -391,9 +398,12 @@ FMCPResponse Tool_GetStatus(const FMCPRequest& Request)
 // function is the only viable entry point from outside the TraceLog module.
 // Channel registration is dynamic — modules announce channels at load time — so
 // the returned list reflects the current process state.
+// Wave L+1: Lane B — TraceLog module is documented as thread-safe internally; gInsightsTraceLock
+// added as defense-in-depth against rare module-load races (channels can be registered as DLLs
+// load post-startup, but the enumerator itself is safe to iterate concurrently).
 FMCPResponse Tool_ListChannels(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	FScopeLock Lock(&gInsightsTraceLock);
 
 	// Accumulator passed through the C-style callback.
 	struct FAcc
@@ -424,6 +434,133 @@ FMCPResponse Tool_ListChannels(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// --- insights.pause ---------------------------------------------------------------------------
+//
+// Args:    {}
+// Result:  { paused: true }
+//
+// Disables all currently-active trace channels without tearing down the connection. The trace
+// remains "connected" (file/network sink stays open) — events stop flowing until Resume().
+// FTraceAuxiliary::Pause() always returns true regardless of state, so we gate on IsConnected()
+// to surface a meaningful error when no trace is active.
+FMCPResponse Tool_Pause(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!FTraceAuxiliary::IsConnected())
+	{
+		return FMCPToolHelpers::MakeError(Request, kINSErrorOperationFailed,
+			TEXT("no trace is currently active (FTraceAuxiliary::IsConnected == false)"));
+	}
+
+	// Engine API returns true unconditionally (see TraceAuxiliary.cpp 1889); surface a
+	// generic OperationFailed if it ever switches to a meaningful return.
+	if (!FTraceAuxiliary::Pause())
+	{
+		return FMCPToolHelpers::MakeError(Request, kINSErrorOperationFailed,
+			TEXT("FTraceAuxiliary::Pause() returned false"));
+	}
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("paused"), true)
+		.BuildSuccess(Request);
+}
+
+// --- insights.resume --------------------------------------------------------------------------
+//
+// Args:    {}
+// Result:  { paused: false }
+//
+// Re-enables previously-paused channels. Engine tracks the paused channel set internally; we
+// gate on IsPaused() to surface a meaningful error if called against a non-paused trace.
+FMCPResponse Tool_Resume(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (!FTraceAuxiliary::IsPaused())
+	{
+		return FMCPToolHelpers::MakeError(Request, kINSErrorOperationFailed,
+			TEXT("trace is not currently paused (FTraceAuxiliary::IsPaused == false)"));
+	}
+
+	if (!FTraceAuxiliary::Resume())
+	{
+		return FMCPToolHelpers::MakeError(Request, kINSErrorOperationFailed,
+			TEXT("FTraceAuxiliary::Resume() returned false"));
+	}
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("paused"), false)
+		.BuildSuccess(Request);
+}
+
+// --- insights.write_snapshot ------------------------------------------------------------------
+//
+// Args:    { output_path?: "Saved/Profiling/MCP_snapshot.utrace" }
+// Result:  { path, file_size_bytes }
+//
+// Writes the tailing memory buffer to a .utrace file. Does NOT stop the active trace — the
+// running capture continues to record after the snapshot is written. Useful for "freeze an
+// interesting moment" workflows without disrupting an ongoing capture.
+//
+// Default path: <Saved>/Profiling/Traces/MCP_snapshot_<UTC>.utrace (same dir as start_capture
+// but with a `_snapshot_` infix to disambiguate from full captures).
+FMCPResponse Tool_WriteSnapshot(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	// 1. Resolve output path.
+	FString AbsPath;
+	FString OutputPathRaw;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetStringField(TEXT("output_path"), OutputPathRaw);
+	}
+
+	if (OutputPathRaw.IsEmpty())
+	{
+		const FString DefaultDir = FPaths::ProjectSavedDir() / TEXT("Profiling/Traces/");
+		IFileManager::Get().MakeDirectory(*DefaultDir, /*Tree=*/true);
+		// ISO 8601 has colons; sanitize for cross-platform filenames.
+		FString TimeTag = FDateTime::UtcNow().ToIso8601();
+		TimeTag.ReplaceInline(TEXT(":"), TEXT("-"));
+		AbsPath = DefaultDir / FString::Printf(TEXT("MCP_snapshot_%s.utrace"), *TimeTag);
+	}
+	else
+	{
+		FString SandboxErr;
+		if (!FMCPPathSandbox::Resolve(OutputPathRaw, AbsPath, SandboxErr))
+		{
+			return FMCPToolHelpers::MakeError(Request, kINSErrorPathEscape,
+				FString::Printf(TEXT("output_path '%s' rejected: %s"), *OutputPathRaw, *SandboxErr));
+		}
+		// Ensure parent directory exists.
+		const FString ParentDir = FPaths::GetPath(AbsPath);
+		if (!ParentDir.IsEmpty())
+		{
+			IFileManager::Get().MakeDirectory(*ParentDir, /*Tree=*/true);
+		}
+	}
+
+	// 2. WriteSnapshot returns false on path-finalize failure OR underlying snapshot failure
+	// (e.g. tracing not initialised at process level). Engine's TraceLog handles "no active
+	// trace" silently — the snapshot writes whatever's in the memory ring buffer.
+	if (!FTraceAuxiliary::WriteSnapshot(*AbsPath))
+	{
+		return FMCPToolHelpers::MakeError(Request, kINSErrorOperationFailed,
+			FString::Printf(TEXT("FTraceAuxiliary::WriteSnapshot returned false for '%s' "
+				"(trace not active, or snapshot write failed)"), *AbsPath));
+	}
+
+	int64 FileSize = IFileManager::Get().FileSize(*AbsPath);
+	if (FileSize == INDEX_NONE) { FileSize = 0; }
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("path"), AbsPath)
+		.Int(TEXT("file_size_bytes"), FileSize)
+		.BuildSuccess(Request);
+}
+
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
 	auto RegisterTool = [&](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler, bool bThreadSafe)
@@ -432,18 +569,27 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// All Lane A. Lane B promotion deferred to reviewer audit:
-	//   - get_status / list_channels are pure reads, candidates for Lane B with
-	//     defense-in-depth lock (already in place for local state). FChannel
-	//     enumeration thread-safety is unverified.
-	//   - start_capture / stop_capture call into the engine — Lane A only.
-	RegisterTool(TEXT("insights.start_capture"), &Tool_StartCapture, /*Lane A*/ false);
-	RegisterTool(TEXT("insights.stop_capture"),  &Tool_StopCapture,  /*Lane A*/ false);
-	RegisterTool(TEXT("insights.get_status"),    &Tool_GetStatus,    /*Lane A*/ false);
-	RegisterTool(TEXT("insights.list_channels"), &Tool_ListChannels, /*Lane A*/ false);
+	// Wave L+1 (2026-05-23) Lane B promotions:
+	//   - get_status: pure read via FTraceAuxiliary::IsConnected/GetTraceDestinationString plus
+	//     local state under GInsightsLocalStateLock. No GEditor / GWorld / UObject touch.
+	//   - list_channels: iterates the live channel registry via UE::Trace::EnumerateChannels
+	//     (a free function in Trace/Trace.h). TraceLog module is documented as thread-safe
+	//     internally; gInsightsTraceLock added for defense-in-depth against module-load races.
+	//
+	// start_capture/stop_capture/pause/resume/write_snapshot call into the trace machinery
+	// (Start/Stop/Pause/Resume/WriteSnapshot) which can touch logging output devices and the
+	// engine-side worker thread state — kept Lane A.
+	RegisterTool(TEXT("insights.start_capture"),  &Tool_StartCapture,  /*Lane A*/ false);
+	RegisterTool(TEXT("insights.stop_capture"),   &Tool_StopCapture,   /*Lane A*/ false);
+	RegisterTool(TEXT("insights.get_status"),     &Tool_GetStatus,     /*Lane B*/ true);
+	RegisterTool(TEXT("insights.list_channels"),  &Tool_ListChannels,  /*Lane B*/ true);
+	RegisterTool(TEXT("insights.pause"),          &Tool_Pause,         /*Lane A*/ false);
+	RegisterTool(TEXT("insights.resume"),         &Tool_Resume,        /*Lane A*/ false);
+	RegisterTool(TEXT("insights.write_snapshot"), &Tool_WriteSnapshot, /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Insights surface registered: insights.{start_capture, stop_capture, get_status, list_channels} (Lane A)"));
+		TEXT("Insights surface registered: insights.{start_capture, stop_capture, get_status, "
+			 "list_channels, pause, resume, write_snapshot} (5 Lane A + 2 Lane B)"));
 }
 
 } // namespace FInsightsTools

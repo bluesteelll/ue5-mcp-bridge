@@ -37,6 +37,12 @@ namespace
 
 	constexpr double kBytes2Mb = 1.0 / (1024.0 * 1024.0);
 
+	// Wave L+1 (2026-05-23) Lane B promotion: get_quick_stats reads FPlatformMemory statics
+	// (documented thread-safe — atomic OS counter reads) and GUObjectArray counter methods. The
+	// lock is defense-in-depth — concurrent Lane A calls (e.g. memreport.dump triggering GC)
+	// might briefly perturb the live UObject counts mid-iteration. Held for the snapshot only.
+	static FCriticalSection gMemReportStatsLock;
+
 	// Snapshot the .memreport files in the MemReport output dir so we can detect
 	// which file the engine produces.
 	void MR_SnapshotDir(const FString& Dir, TSet<FString>& OutFiles)
@@ -223,9 +229,12 @@ FMCPResponse Tool_Dump(const FMCPRequest& Request)
 // estimate, NOT a strict "alive after mark" count.
 // `seconds_since_last_gc` is clamped >= 0 (negative possible at startup before
 // the first GC pass).
+// Wave L+1: Lane B — FPlatformMemory::GetStats() is documented thread-safe (atomic OS counter
+// reads), GUObjectArray::GetObjectArrayNum* are simple int reads, GetLastGCTime() reads
+// GTimingInfo.LastGCTime (double). gMemReportStatsLock added as defense-in-depth.
 FMCPResponse Tool_GetQuickStats(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	FScopeLock Lock(&gMemReportStatsLock);
 
 	const FPlatformMemoryStats Stats  = FPlatformMemory::GetStats();
 	const FPlatformMemoryConstants& C = FPlatformMemory::GetConstants();
@@ -262,17 +271,16 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// Both Lane A initially. Lane B promotion candidates for reviewer audit:
-	//   - get_quick_stats: FPlatformMemory queries are thread-safe;
-	//     GUObjectArray::GetObjectArrayNum* are simple counter reads — strong
-	//     candidate for Lane B with defense-in-depth lock.
-	//   - dump: blocks game thread on FPlatformProcess::Sleep + invokes engine
-	//     Exec — Lane A only.
+	// Wave L+1 (2026-05-23): get_quick_stats promoted to Lane B with gMemReportStatsLock for
+	// defense-in-depth. FPlatformMemory::GetStats() is documented thread-safe; GUObjectArray
+	// counters are simple int reads; GetLastGCTime() is a double read. dump stays Lane A — blocks
+	// the calling thread on FPlatformProcess::Sleep and invokes GEngine->Exec for "MemReport".
 	RegisterTool(TEXT("memreport.dump"),            &Tool_Dump,          /*Lane A*/ false);
-	RegisterTool(TEXT("memreport.get_quick_stats"), &Tool_GetQuickStats, /*Lane A*/ false);
+	RegisterTool(TEXT("memreport.get_quick_stats"), &Tool_GetQuickStats, /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("MemReport surface registered: memreport.{dump, get_quick_stats} (Lane A)"));
+		TEXT("MemReport surface registered: memreport.{dump, get_quick_stats} "
+			 "(1 Lane A + 1 Lane B)"));
 }
 
 } // namespace FMemReportTools

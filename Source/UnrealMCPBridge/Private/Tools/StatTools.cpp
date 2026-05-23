@@ -12,8 +12,10 @@
 #include "Containers/Ticker.h"
 #include "Editor.h"
 #include "Engine/Engine.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/FileManager.h"
 #include "Misc/App.h"
+#include "Misc/CoreDelegates.h"
 #include "Misc/CString.h"
 #include "Misc/Paths.h"
 #include "Misc/OutputDeviceNull.h"
@@ -39,6 +41,11 @@ namespace
 	constexpr int32 kSTAErrorInvalidParams  = kMCPErrorInvalidParams;
 	constexpr int32 kSTAErrorPathEscape     = kMCPErrorPathEscape;
 	constexpr int32 kSTAErrorOperationFailed = kMCPErrorOperationFailed;
+
+	// Wave L+1 (2026-05-23) Lane B promotion: list_groups returns a hardcoded constant array. The
+	// lock is defense-in-depth against future code paths that might mutate kKnownStatGroups (which
+	// is constexpr today). Held for the duration of the array iteration only.
+	static FCriticalSection gStatTablesLock;
 
 	// Anti-injection: stat names are an FParse::Token followed by case-insensitive
 	// command-name compare in StatsCommand.cpp. We constrain to alphanumeric +
@@ -192,9 +199,11 @@ namespace FStatTools
 // plus well-known Engine/Renderer additions. The `stat <name>` toggle command
 // accepts ANY name regardless of presence in this list — the list is purely for
 // discovery / autocomplete affordance.
+// Wave L+1: Lane B — kKnownStatGroups is a constexpr TCHAR* array (read-only constant data).
+// gStatTablesLock guards iteration as defense-in-depth.
 FMCPResponse Tool_ListGroups(const FMCPRequest& Request)
 {
-	check(IsInGameThread());
+	FScopeLock Lock(&gStatTablesLock);
 
 	FMCPJsonArrayBuilder Groups;
 	for (const TCHAR* Name : kKnownStatGroups)
@@ -415,6 +424,75 @@ FMCPResponse Tool_DumpToFile(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// --- stat.is_enabled --------------------------------------------------------------------------
+//
+// Args:    { stat_name: string (required, regex `^[A-Za-z][A-Za-z0-9_]*$`) }
+// Result:  { stat_name, is_enabled, best_effort }
+//
+// **Uses FCoreDelegates::StatCheckEnabled — the same delegate the engine itself broadcasts to
+// inspect viewport stat state (see StatsCommand.cpp:2174 / GameViewportClient.cpp:4471). Each
+// viewport client (game viewport + editor viewports) registers a handler in its ctor; the
+// delegate populates `bCurrent` for the active-processing viewport and OR-accumulates `bOthers`
+// for the rest. We return the disjunction — true if ANY viewport currently shows the stat.**
+//
+// Name handling: the engine stores names verbatim as the user passes them to `stat <name>` (e.g.,
+// `stat fps` → "fps" in EnabledStats). We strip an optional leading "STATGROUP_" (case-insensitive)
+// to canonicalise — toggling via the official command never includes that prefix.
+//
+// Threading: the broadcast subscribers (UGameViewportClient / FEditorViewportClient) call
+// IsStatEnabled() which checks EnabledStats.Contains(); both registration and lookup happen on
+// the game thread. Run on Lane A to keep alignment.
+//
+// `best_effort` semantics:
+//   - false: the delegate has at least one bound subscriber AND returned a definitive result.
+//   - true:  delegate has no subscribers (no GameViewport / no editor viewport active —
+//     rare in -nullrhi commandlet contexts) → caller should treat as advisory.
+FMCPResponse Tool_IsEnabled(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FString StatName;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("stat_name"), StatName, Err))
+	{
+		return Err;
+	}
+
+	StatName = StatName.TrimStartAndEnd();
+	if (!STA_IsValidStatName(StatName))
+	{
+		return FMCPToolHelpers::MakeError(Request, kSTAErrorInvalidParams,
+			FString::Printf(TEXT("stat_name '%s' must match ^[A-Za-z_][A-Za-z0-9_]*$"), *StatName));
+	}
+
+	if (!GEngine)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSTAErrorInternal, TEXT("GEngine is null"));
+	}
+
+	// Strip optional leading STATGROUP_ prefix (case-insensitive). The viewport's EnabledStats
+	// set never contains the prefixed form — `stat fps` adds "fps", not "STATGROUP_fps".
+	FString Lookup = StatName;
+	if (Lookup.StartsWith(TEXT("STATGROUP_"), ESearchCase::IgnoreCase))
+	{
+		Lookup.RightChopInline(10, EAllowShrinking::No);
+	}
+
+	const bool bHasSubscribers = FCoreDelegates::StatCheckEnabled.IsBound();
+	bool bCurrent = false;
+	bool bOthers  = false;
+	FCoreDelegates::StatCheckEnabled.Broadcast(*Lookup, bCurrent, bOthers);
+
+	const bool bIsEnabled  = bCurrent || bOthers;
+	const bool bBestEffort = !bHasSubscribers;
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("stat_name"), StatName)
+		.Bool(TEXT("is_enabled"), bIsEnabled)
+		.Bool(TEXT("best_effort"), bBestEffort)
+		.BuildSuccess(Request);
+}
+
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
 	auto RegisterTool = [&](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler, bool bThreadSafe)
@@ -423,19 +501,23 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 		OutRegisteredMethodNames.Add(MethodName);
 	};
 
-	// All Lane A. Lane B promotion deferred to reviewer audit:
-	//   - list_groups returns a hardcoded array (no engine touch) — SAFE for Lane B
-	//   - get_unit_values reads extern globals (render-thread writers may race) —
-	//     NEEDS audit; reads can tear on 64-bit values but per-field worst case
-	//     is a stale-but-valid frame.
-	//   - toggle / dump_to_file call GEngine->Exec — Lane A only.
-	RegisterTool(TEXT("stat.list_groups"),     &Tool_ListGroups,    /*Lane A*/ false);
+	// Wave L+1 (2026-05-23): stat.list_groups promoted to Lane B — returns a constexpr TCHAR*[]
+	// constant set, no engine state touched. gStatTablesLock is defense-in-depth only.
+	//
+	// get_unit_values reads extern globals (GGameThreadTime / GRenderThreadTime / RHIGetGPUFrameCycles
+	// / GNumDrawCallsRHI). Render-thread writers may tear 64-bit values on 32-bit platforms — kept
+	// Lane A.
+	// toggle / dump_to_file / is_enabled all call into engine state (GEngine->Exec or
+	// FCoreDelegates::StatCheckEnabled broadcasting to viewport clients) — Lane A only.
+	RegisterTool(TEXT("stat.list_groups"),     &Tool_ListGroups,    /*Lane B*/ true);
 	RegisterTool(TEXT("stat.toggle"),          &Tool_Toggle,        /*Lane A*/ false);
 	RegisterTool(TEXT("stat.get_unit_values"), &Tool_GetUnitValues, /*Lane A*/ false);
 	RegisterTool(TEXT("stat.dump_to_file"),    &Tool_DumpToFile,    /*Lane A*/ false);
+	RegisterTool(TEXT("stat.is_enabled"),      &Tool_IsEnabled,     /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Stat surface registered: stat.{list_groups, toggle, get_unit_values, dump_to_file} (Lane A)"));
+		TEXT("Stat surface registered: stat.{list_groups, toggle, get_unit_values, dump_to_file, "
+			 "is_enabled} (4 Lane A + 1 Lane B)"));
 }
 
 } // namespace FStatTools
