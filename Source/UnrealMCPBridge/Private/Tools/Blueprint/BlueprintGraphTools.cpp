@@ -2044,10 +2044,27 @@ FMCPResponse Tool_BindComponentEvent(const FMCPRequest& Request)
 	FObjectProperty* ComponentProp = FindFProperty<FObjectProperty>(BPGenClass, ComponentFName);
 	if (!ComponentProp)
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("component property '%s' not found on GeneratedClass '%s' "
-				"(SCS variable wasn't promoted to BP class — compile the BP first)"),
-				*ComponentName, *BPGenClass->GetPathName()));
+		// Wave R fix (2026-05-24): auto-compile the BP and retry. SCS components added via
+		// bp.add_component are NOT promoted to FObjectProperty entries on GeneratedClass until
+		// the BP is compiled. Forcing the caller to invoke bp.compile between every add_component
+		// and bind_component_event is awkward; instead, compile transparently here.
+		// FKismetEditorUtilities::CompileBlueprint is the same function bp.compile uses, so the
+		// semantics match. If compile fails or property STILL doesn't appear, surface the original
+		// error to the caller.
+		FKismetEditorUtilities::CompileBlueprint(Blueprint,
+			EBlueprintCompileOptions::SkipGarbageCollection | EBlueprintCompileOptions::SkipSave);
+		BPGenClass = Blueprint->GeneratedClass;
+		ComponentProp = BPGenClass
+			? FindFProperty<FObjectProperty>(BPGenClass, ComponentFName)
+			: nullptr;
+		if (!ComponentProp)
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+				FString::Printf(TEXT("component property '%s' not found on GeneratedClass '%s' "
+					"(even after auto-compile — check BP integrity)"),
+					*ComponentName,
+					BPGenClass ? *BPGenClass->GetPathName() : TEXT("<null>")));
+		}
 	}
 
 	// EventGraph is the only valid host for component-bound events.

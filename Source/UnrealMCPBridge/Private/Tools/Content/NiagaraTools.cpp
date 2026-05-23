@@ -762,25 +762,24 @@ FMCPResponse Tool_CreateEmitter(const FMCPRequest& Request)
 				TEXT("dest_path '%s' is malformed or references an unknown mount (need /Game/... or /Plugin/...)"),
 				*DestPathRaw));
 	}
-	if (FPackageName::DoesPackageExist(DestPathNorm))
+	const FString PackagePath = FPaths::GetPath(DestPathNorm);
+	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	// Wave R dual existence check — disk + in-memory. See bp.create_blueprint for full rationale.
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
+			FString::Printf(TEXT("dest_path '%s' already exists (on disk OR in memory)"), *DestPathNorm));
 	}
 
 	bool bAddDefaultModules = true;
 	Request.Args->TryGetBoolField(TEXT("add_default_modules"), bAddDefaultModules);
 
-	// Configure factory state BEFORE IAssetTools::CreateAsset — UNiagaraEmitterFactoryNew's
-	// FactoryCreateNew reads these fields directly (ConfigureProperties only runs in interactive
-	// "New Asset" UI dialogs, which CreateAsset bypasses).
 	UNiagaraEmitterFactoryNew* Factory = NewObject<UNiagaraEmitterFactoryNew>();
 	Factory->EmitterToCopy = nullptr;
 	Factory->bUseInheritance = false;
 	Factory->bAddDefaultModulesAndRenderersToEmptyEmitter = bAddDefaultModules;
-
-	const FString PackagePath = FPaths::GetPath(DestPathNorm);
-	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
 
 	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
 	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, UNiagaraEmitter::StaticClass(), Factory);

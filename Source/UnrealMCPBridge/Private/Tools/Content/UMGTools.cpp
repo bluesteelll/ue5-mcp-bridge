@@ -330,14 +330,16 @@ FMCPResponse Tool_CreateWidgetBlueprint(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed path"), *DestPathRaw));
 	}
-	if (FPackageName::DoesPackageExist(DestPathNorm))
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
-	}
-
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	// Wave R dual existence check — disk + in-memory. See bp.create_blueprint for full rationale.
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists (on disk OR in memory)"), *DestPathNorm));
+	}
 
 	UWidgetBlueprintFactory* Factory = NewObject<UWidgetBlueprintFactory>();
 	Factory->ParentClass = ParentClass;

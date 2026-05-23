@@ -1768,16 +1768,20 @@ FMCPResponse Tool_AssetCreateDataAsset(const FMCPRequest& Request)
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path "
 				"(expected /Game/... or /<Plugin>/...)"), *DestPathRaw));
 	}
-	if (FPackageName::DoesPackageExist(DestPathNorm))
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("dest_path '%s' already exists on disk — use cb.delete first or pick a different name"),
-				*DestPathNorm));
-	}
-
 	// ─── Create via UDataAssetFactory + IAssetTools::CreateAsset ───────────────────────────────
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	// CRITICAL: dual existence check (disk + in-memory). Wave R fix (2026-05-24): the disk-only
+	// check missed in-memory unsaved assets, and IAssetTools::CreateAsset would then show a
+	// modal "Overwrite Existing Object?" dialog that BLOCKS the editor waiting for a click.
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists (on disk OR in memory) — use cb.delete first or pick a different name"),
+				*DestPathNorm));
+	}
 
 	UDataAssetFactory* Factory = NewObject<UDataAssetFactory>();
 	Factory->DataAssetClass = TargetClass;
@@ -1897,14 +1901,16 @@ FMCPResponse Tool_AssetCreate(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed asset path"), *DestPathRaw));
 	}
-	if (FPackageName::DoesPackageExist(DestPathNorm))
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
-	}
-
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName   = FPaths::GetBaseFilename(DestPathNorm);
+
+	// Wave R dual existence check — disk + in-memory. See bp.create_blueprint for full rationale.
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists (on disk OR in memory)"), *DestPathNorm));
+	}
 
 	// ─── Strategy 1: find UFactoryNew with SupportedClass == TargetClass ───────────────────────
 	UFactory* SelectedFactory = nullptr;

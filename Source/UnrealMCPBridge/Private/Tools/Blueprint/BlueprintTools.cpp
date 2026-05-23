@@ -2197,14 +2197,21 @@ FMCPResponse Tool_CreateBlueprint(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
 			FString::Printf(TEXT("dest_path '%s' is not a valid mount-prefixed path"), *DestPathRaw));
 	}
-	if (FPackageName::DoesPackageExist(DestPathNorm))
-	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
-			FString::Printf(TEXT("dest_path '%s' already exists on disk"), *DestPathNorm));
-	}
-
 	const FString PackagePath = FPaths::GetPath(DestPathNorm);
 	const FString AssetName = FPaths::GetBaseFilename(DestPathNorm);
+
+	// CRITICAL: dual existence check (disk + in-memory). FPackageName::DoesPackageExist alone
+	// MISSES in-memory unsaved assets — IAssetTools::CreateAsset detects the conflict and shows
+	// a modal "Overwrite Existing Object?" dialog that BLOCKS the editor waiting for a click.
+	// Discovered via live functional test (2026-05-24): subsequent create calls after editor
+	// crash recovery / re-run hung indefinitely until user manually clicked Cancel. Fix mirrors
+	// the FMCPAssetFactory::Create check (Wave Q3).
+	if (FPackageName::DoesPackageExist(DestPathNorm) ||
+		FindObject<UObject>(nullptr, *(DestPathNorm + TEXT(".") + AssetName)) != nullptr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathInUse,
+			FString::Printf(TEXT("dest_path '%s' already exists (on disk OR in memory)"), *DestPathNorm));
+	}
 
 	// Create via UBlueprintFactory.
 	UBlueprintFactory* Factory = NewObject<UBlueprintFactory>();
