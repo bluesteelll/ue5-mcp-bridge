@@ -208,9 +208,14 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	// Step 1: edit-const gate FIRST (early return, no transaction). Mirrors actor.set_property —
 	// CPF_BlueprintReadOnly intentionally OMITTED per wave-2 decision: bridge acts as editor
 	// surrogate, Details panel CAN write at design time even when BP code cannot at runtime.
-	const bool bBypassReadOnly = Request.Args.IsValid() &&
-		Request.Args->HasField(TEXT("bypass_readonly")) &&
-		Request.Args->GetBoolField(TEXT("bypass_readonly"));
+	// TryGetBoolField returns false on missing OR wrong type, leaving OutValue default (false).
+	// Prior pattern used HasField + GetBoolField which crashes if field exists but wrong type
+	// (e.g., caller passes `bypass_readonly: "yes"` as a string).
+	bool bBypassReadOnly = false;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetBoolField(TEXT("bypass_readonly"), bBypassReadOnly);
+	}
 	const uint64 Flags = LeafProp->PropertyFlags;
 	if (!bBypassReadOnly && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{

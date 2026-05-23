@@ -606,8 +606,11 @@ FMCPResponse Tool_SetWidgetProperty(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, ErrCode, ErrMsg);
 	}
 
-	const bool bBypass = Request.Args->HasField(TEXT("bypass_readonly")) &&
-		Request.Args->GetBoolField(TEXT("bypass_readonly"));
+	// TryGetBoolField returns false on missing OR wrong type, leaving OutValue default (false).
+	// Prior pattern (HasField + GetBoolField) crashes if field exists but wrong JSON type
+	// (e.g. caller passes `bypass_readonly: "yes"` as a string instead of a boolean).
+	bool bBypass = false;
+	Request.Args->TryGetBoolField(TEXT("bypass_readonly"), bBypass);
 	const uint64 Flags = Prop->PropertyFlags;
 	if (!bBypass && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{

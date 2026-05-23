@@ -1582,9 +1582,14 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	// "BP code can't write at runtime" but the editor's own Details panel CAN write at design
 	// time. The MCP bridge acts as editor surrogate, so should follow editor semantics. Caller
 	// can still force-bypass via args.bypass_readonly=true.
-	const bool bBypassReadOnly = Request.Args.IsValid() &&
-		Request.Args->HasField(TEXT("bypass_readonly")) &&
-		Request.Args->GetBoolField(TEXT("bypass_readonly"));
+	// TryGetBoolField returns false on missing OR wrong type, leaving OutValue default (false).
+	// Prior pattern (HasField + GetBoolField) crashes if field exists but wrong JSON type
+	// (e.g. caller passes `bypass_readonly: "yes"` as a string instead of a boolean).
+	bool bBypassReadOnly = false;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetBoolField(TEXT("bypass_readonly"), bBypassReadOnly);
+	}
 	const uint64 Flags = LeafProp->PropertyFlags;
 	if (!bBypassReadOnly && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{

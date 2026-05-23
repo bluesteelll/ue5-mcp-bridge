@@ -741,9 +741,14 @@ FMCPResponse Tool_SetProperty(const FMCPRequest& Request)
 	// BP restriction, not an editor-write restriction; the editor's Details panel happily writes
 	// to BlueprintReadOnly UPROPERTIES at design time and the MCP bridge is acting as editor
 	// surrogate. Caller can force-bypass via args.bypass_readonly=true.
-	const bool bBypassReadOnly = Request.Args.IsValid() &&
-		Request.Args->HasField(TEXT("bypass_readonly")) &&
-		Request.Args->GetBoolField(TEXT("bypass_readonly"));
+	// TryGetBoolField returns false on missing OR wrong type, leaving OutValue default (false).
+	// Prior pattern (HasField + GetBoolField) crashes if field exists but wrong JSON type
+	// (e.g. caller passes `bypass_readonly: "yes"` as a string instead of a boolean).
+	bool bBypassReadOnly = false;
+	if (Request.Args.IsValid())
+	{
+		Request.Args->TryGetBoolField(TEXT("bypass_readonly"), bBypassReadOnly);
+	}
 	const uint64 Flags = LeafProp->PropertyFlags;
 	if (!bBypassReadOnly && (Flags & (CPF_EditConst | CPF_DisableEditOnInstance)))
 	{
