@@ -185,6 +185,13 @@ public class UnrealMCPBridge : ModuleRules
 				// FTextureRenderTargetResource live in Engine + RHI (already transitive). Only
 				// RenderCore is missing for the GPU readback sync barrier.
 				"RenderCore",
+				// Wave L 2026-05-23: insights.* surface needs FTraceAuxiliary (Core header,
+				// implementation in TraceLog) + UE::Trace::FChannel::EnumerateChannels (also
+				// TraceLog). The header itself ships in Core's ProfilingDebugging/, but every
+				// concrete entry point links against TraceLog's static lib. stat.* and
+				// memreport.* surfaces transitively pick up RHIStats / RenderTimer globals
+				// from already-linked modules (RHI / RenderCore).
+				"TraceLog",
 			}
 		);
 
