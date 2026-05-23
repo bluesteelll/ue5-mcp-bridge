@@ -20,15 +20,23 @@
 #include "EdGraphNode_Comment.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
 #include "K2Node.h"
+#include "K2Node_BreakStruct.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_ComponentBoundEvent.h"
 #include "K2Node_CustomEvent.h"
+#include "K2Node_DynamicCast.h"
 #include "K2Node_Event.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_MacroInstance.h"
+#include "K2Node_MakeStruct.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
 #include "ScopedTransaction.h"
 #include "UObject/Class.h"
 #include "UObject/Package.h"
@@ -133,6 +141,172 @@ namespace
 			Pin->PinType.ContainerType == EPinContainerType::Map   ? TEXT("map") : TEXT("none"));
 		Obj->SetBoolField(TEXT("is_reference"), Pin->PinType.bIsReference);
 		return Obj;
+	}
+
+	// ─── Wave O helpers ────────────────────────────────────────────────────────────────────────────
+	//
+	// Shared infrastructure for the 7 Wave-O tools (5 specialised node spawners + 1 component-bound
+	// event + 1 full pin enumeration). All Lane A — game-thread UObject mutation.
+
+	/**
+	 * Resolve a class path (``/Script/...`` or ``/Game/...``) to a UClass, and verify it is a
+	 * subclass of ``BaseClass`` (typically ``UObject::StaticClass()`` for cast targets, or
+	 * ``AActor::StaticClass()`` for actor bound events).
+	 *
+	 * Returns the resolved class on success. On failure populates ``OutError`` with a human-readable
+	 * description and returns nullptr.
+	 *
+	 * Distinct from ``BP_ResolveClassOrError`` in BlueprintTools.cpp — this is a thin helper that
+	 * caller wraps in its own ``MakeError`` call with the appropriate code (the caller knows whether
+	 * the failure should map to -32020 ClassNotFound or -32011 WrongClass).
+	 */
+	UClass* BPG_ResolveClass(const FString& Path, UClass* BaseClass, FString& OutError)
+	{
+		if (Path.IsEmpty())
+		{
+			OutError = TEXT("class path is empty");
+			return nullptr;
+		}
+		UClass* Resolved = LoadObject<UClass>(nullptr, *Path);
+		if (!Resolved)
+		{
+			// LoadClass<T> retries with the ``_C`` suffix for Blueprint generated classes — try
+			// that path too so callers can use either ``/Game/Foo/BP_X`` or ``/Game/Foo/BP_X.BP_X_C``.
+			Resolved = LoadObject<UClass>(nullptr, *(Path + TEXT("_C")));
+		}
+		if (!Resolved)
+		{
+			OutError = FString::Printf(TEXT("class '%s' could not be loaded"), *Path);
+			return nullptr;
+		}
+		if (BaseClass && !Resolved->IsChildOf(BaseClass))
+		{
+			OutError = FString::Printf(TEXT("class '%s' is not a subclass of '%s'"),
+				*Path, *BaseClass->GetName());
+			return nullptr;
+		}
+		return Resolved;
+	}
+
+	/**
+	 * Common K2-node post-construction: AddNode + CreateNewGuid + PostPlacedNewNode +
+	 * AllocateDefaultPins. Mirrors the pattern in ``Tool_AddNode``. ``ReconstructNode`` is NOT called
+	 * here — callers that set type-binding state via dedicated setters (SetMacroGraph, TargetType,
+	 * StructType, InitializeComponentBoundEventParams, InputAction) may need to call it themselves
+	 * after AllocateDefaultPins so pin layout reflects the binding.
+	 *
+	 * ``Node->NodePosX/Y`` are set HERE (after CreateNewGuid) — guid generation does not depend on
+	 * position and we want position set before pin layout in case a subclass's AllocateDefaultPins
+	 * reads NodePosX/Y (none in stock UE do, but defensive).
+	 */
+	void BPG_FinalizeNewNode(UK2Node* Node, UEdGraph* Graph, int32 X, int32 Y)
+	{
+		check(Node);
+		check(Graph);
+		Node->NodePosX = X;
+		Node->NodePosY = Y;
+		Node->CreateNewGuid();
+		Graph->AddNode(Node, /*bUserAction*/ false, /*bSelectNewNode*/ false);
+		Node->PostPlacedNewNode();
+		Node->AllocateDefaultPins();
+	}
+
+	/** ``FBlueprintEditorUtils::MarkBlueprintAsModified(BP)`` wrapper for symmetry with other helpers. */
+	void BPG_MarkModified(UBlueprint* BP)
+	{
+		check(BP);
+		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+	}
+
+	/**
+	 * Full pin summary for ``bp.list_node_pins`` AND post-construction response arrays for the
+	 * specialised add_* tools. Compared to ``BGT_BuildPinSummary`` (the brief 5-field summary used
+	 * by ``bp.add_node`` / ``bp.connect_pins``), this emits:
+	 *   - pin_id (Guid stringified)
+	 *   - sub_category (PinType.PinSubCategory.ToString())
+	 *   - is_connected (LinkedTo.Num() > 0)
+	 *   - default_value / default_object / default_text
+	 *   - linked_pins [{node_guid, pin_id}]
+	 *   - hidden (only emitted when true, per Risk R7)
+	 *   - advanced_view (only when true)
+	 *
+	 * Reuses BGT_BuildPinSummary's category/subcategory_object/container shape so callers can
+	 * compose both shapes from the same pin without divergent field naming.
+	 */
+	TSharedRef<FJsonObject> BPG_BuildPinSummary(const UEdGraphPin* Pin)
+	{
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		if (!Pin) { return Obj; }
+
+		Obj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+		Obj->SetStringField(TEXT("direction"),
+			Pin->Direction == EGPD_Input ? TEXT("input") :
+			Pin->Direction == EGPD_Output ? TEXT("output") : TEXT("unknown"));
+		Obj->SetStringField(TEXT("pin_id"), Pin->PinId.ToString(EGuidFormats::DigitsWithHyphens));
+		Obj->SetStringField(TEXT("category"), Pin->PinType.PinCategory.ToString());
+		Obj->SetStringField(TEXT("sub_category"), Pin->PinType.PinSubCategory.ToString());
+		if (Pin->PinType.PinSubCategoryObject.IsValid())
+		{
+			Obj->SetStringField(TEXT("sub_category_object"),
+				Pin->PinType.PinSubCategoryObject->GetPathName());
+		}
+		Obj->SetStringField(TEXT("container_type"),
+			Pin->PinType.ContainerType == EPinContainerType::Array ? TEXT("array") :
+			Pin->PinType.ContainerType == EPinContainerType::Set   ? TEXT("set") :
+			Pin->PinType.ContainerType == EPinContainerType::Map   ? TEXT("map") : TEXT("none"));
+		Obj->SetBoolField(TEXT("is_reference"), Pin->PinType.bIsReference);
+		Obj->SetBoolField(TEXT("is_connected"), Pin->LinkedTo.Num() > 0);
+		Obj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+		if (Pin->DefaultObject)
+		{
+			Obj->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
+		}
+		else
+		{
+			Obj->SetField(TEXT("default_object"), MakeShared<FJsonValueNull>());
+		}
+		Obj->SetStringField(TEXT("default_text"), Pin->DefaultTextValue.ToString());
+
+		// LinkedTo: one entry per connected pin. Skip dangling pointers (corrupt BP) by guarding
+		// the owning node via GetOwningNodeUnchecked + IsValid.
+		TArray<TSharedPtr<FJsonValue>> Linked;
+		Linked.Reserve(Pin->LinkedTo.Num());
+		for (const UEdGraphPin* LinkedPin : Pin->LinkedTo)
+		{
+			if (!LinkedPin) { continue; }
+			const UEdGraphNode* OwningNode = LinkedPin->GetOwningNodeUnchecked();
+			if (!OwningNode || !IsValid(OwningNode)) { continue; }
+			TSharedRef<FJsonObject> Edge = MakeShared<FJsonObject>();
+			Edge->SetStringField(TEXT("node_guid"),
+				OwningNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+			Edge->SetStringField(TEXT("pin_id"),
+				LinkedPin->PinId.ToString(EGuidFormats::DigitsWithHyphens));
+			Linked.Add(MakeShared<FJsonValueObject>(Edge));
+		}
+		Obj->SetArrayField(TEXT("linked_pins"), Linked);
+
+		// Optional flags — only emit when true to keep the common case compact.
+		if (Pin->bHidden) { Obj->SetBoolField(TEXT("hidden"), true); }
+		if (Pin->bAdvancedView) { Obj->SetBoolField(TEXT("advanced_view"), true); }
+
+		return Obj;
+	}
+
+	/**
+	 * Build the standard ``pins: [...]`` array for a freshly-spawned node, reusing
+	 * BPG_BuildPinSummary so the add_* tools and list_node_pins emit IDENTICAL pin shapes (caller
+	 * code that consumes one can consume the other).
+	 */
+	TArray<TSharedPtr<FJsonValue>> BPG_PinsArray(const UK2Node* Node)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		if (!Node) { return Out; }
+		Out.Reserve(Node->Pins.Num());
+		for (const UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin) { Out.Add(MakeShared<FJsonValueObject>(BPG_BuildPinSummary(Pin))); }
+		}
+		return Out;
 	}
 } // namespace
 
@@ -1175,6 +1349,802 @@ FMCPResponse Tool_DeleteComment(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// ─── bp.list_node_pins (Wave O — read-only pin enumeration, Lane A) ────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, node_guid }
+// Result:  { node_guid, node_class, node_title, pins: [...full pin summaries...], total_count }
+//
+// Read-only inspection tool — caller uses the pin shape (name + pin_id + category + sub_category +
+// sub_category_object + container_type + is_connected + default_value/object/text + linked_pins +
+// hidden? + advanced_view?) to plan subsequent ``bp.connect_pins`` / ``bp.set_pin_default`` calls.
+//
+// Marked Lane A out of caution — touches UEdGraphNode + UEdGraphPin which technically live on the
+// game thread (FName lookups + UObject* dereferences). Reviewer can promote to Lane B if profiling
+// shows it's worth the audit.
+//
+// Errors: -32050 GraphNotFound, -32051 NodeNotFound, -32027 PIEActive (defensive — even read-only
+// tools refuse during PIE since BP asset state is in flux during compile-after-PIE-exit).
+FMCPResponse Tool_ListNodePins(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	if (FMCPWorldContext::IsPIEActive())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive, kMCPMessagePIEActive);
+	}
+
+	FString BlueprintPath, NodeGuidStr;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("node_guid"),      NodeGuidStr,   Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UEdGraphNode* Node = BGT_FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorNodeNotFound,
+			FString::Printf(TEXT("node '%s' not found in graph '%s'"), *NodeGuidStr, *GraphName));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Pins;
+	Pins.Reserve(Node->Pins.Num());
+	int32 TotalCount = 0;
+	for (const UEdGraphPin* Pin : Node->Pins)
+	{
+		if (Pin)
+		{
+			Pins.Add(MakeShared<FJsonValueObject>(BPG_BuildPinSummary(Pin)));
+			++TotalCount;
+		}
+	}
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),   Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("node_class"),  Node->GetClass()->GetPathName())
+		.Str(TEXT("node_title"),  Node->GetNodeTitle(ENodeTitleType::ListView).ToString())
+		.Arr(TEXT("pins"),        MoveTemp(Pins))
+		.Num(TEXT("total_count"), static_cast<double>(TotalCount))
+		.BuildSuccess(Request);
+}
+
+// ─── bp.add_cast_node (Wave O — UK2Node_DynamicCast, Lane A) ───────────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, target_class, position? }
+// Result:  { node_guid, node_class, target_class, position: [x,y], pins: [...] }
+//
+// Creates a cast node where the input "Object" pin is cast to ``target_class``. Cast result and
+// success/failure exec pins are typed correctly after ``AllocateDefaultPins`` reads ``TargetType``.
+//
+// Errors: -32050 GraphNotFound, -32020 ClassNotFound, -32011 WrongClass (not a UObject subclass),
+//         -32027 PIEActive.
+FMCPResponse Tool_AddCastNode(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddCastNode", "MCP: bp.add_cast_node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BlueprintPath, TargetClassPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("target_class"),   TargetClassPath, Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 PosX = 0, PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("position"), PositionArr) && PositionArr && PositionArr->Num() == 2)
+	{
+		PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	FString ResolveErr;
+	UClass* TargetClass = BPG_ResolveClass(TargetClassPath, UObject::StaticClass(), ResolveErr);
+	if (!TargetClass)
+	{
+		// Distinguish "not loadable" from "not a UObject subclass" — both map to the same JSON-RPC
+		// error, but ResolveErr carries the precise diagnostic.
+		return FMCPToolHelpers::MakeError(Request,
+			ResolveErr.Contains(TEXT("not a subclass")) ? kMCPErrorWrongClass : kMCPErrorClassNotFound,
+			ResolveErr);
+	}
+
+	Blueprint->Modify();
+	Graph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
+
+	UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(Graph, NAME_None, RF_Transactional);
+	CastNode->TargetType = TargetClass;
+	BPG_FinalizeNewNode(CastNode, Graph, PosX, PosY);
+
+	BPG_MarkModified(Blueprint);
+
+	TArray<TSharedPtr<FJsonValue>> PositionResp;
+	PositionResp.Add(MakeShared<FJsonValueNumber>(CastNode->NodePosX));
+	PositionResp.Add(MakeShared<FJsonValueNumber>(CastNode->NodePosY));
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),    CastNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("node_class"),   CastNode->GetClass()->GetPathName())
+		.Str(TEXT("target_class"), TargetClass->GetPathName())
+		.Arr(TEXT("position"),     MoveTemp(PositionResp))
+		.Arr(TEXT("pins"),         BPG_PinsArray(CastNode))
+		.BuildSuccess(Request);
+}
+
+// ─── bp.add_struct_break_node (Wave O — UK2Node_BreakStruct, Lane A) ───────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, struct_path, position? }
+// Result:  { node_guid, node_class, struct_path, position: [x,y], pins: [...per-member output pins...] }
+//
+// Creates a Break Struct node — input pin of struct type + one output pin per
+// BlueprintReadable struct member. ``UK2Node_BreakStruct::CanBeBroken`` precondition: struct must
+// be ``BlueprintType`` AND have at least one ``BlueprintVisible`` property AND NOT have a native
+// ``BreakXXX`` function override.
+//
+// Errors: -32004 ObjectNotFound (struct path doesn't resolve), -32058 OperationFailed (struct is
+// not breakable per CanBeBroken), -32050 GraphNotFound, -32027 PIEActive.
+FMCPResponse Tool_AddStructBreakNode(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddStructBreakNode", "MCP: bp.add_struct_break_node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BlueprintPath, StructPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("struct_path"),    StructPath,    Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 PosX = 0, PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("position"), PositionArr) && PositionArr && PositionArr->Num() == 2)
+	{
+		PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UScriptStruct* Struct = LoadObject<UScriptStruct>(nullptr, *StructPath);
+	if (!Struct)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("UScriptStruct '%s' could not be loaded — expected e.g. "
+				"'/Script/CoreUObject.Vector' or '/Game/Path/MyStruct.MyStruct'"), *StructPath));
+	}
+
+	// Mirror of ``UK2Node_BreakStruct::CanBeBroken`` (engine's static is NOT BLUEPRINTGRAPH_API
+	// exported in UE 5.7 — only the MakeStruct twin is). Same logic: must be allowable as a BP
+	// variable type, must NOT have a native ``Break<StructName>`` function override, and must
+	// expose at least one BlueprintVisible property.
+	{
+		bool bBreakable = false;
+		const bool bNoNativeBreak = !Struct->HasMetaData(FBlueprintMetadata::MD_NativeBreakFunction);
+		const bool bAllowable = UEdGraphSchema_K2::IsAllowableBlueprintVariableType(Struct, /*bForInternalUse*/ false);
+		if (bNoNativeBreak && bAllowable)
+		{
+			for (TFieldIterator<FProperty> It(Struct); It; ++It)
+			{
+				FProperty* Prop = *It;
+				if (Prop && Prop->HasAnyPropertyFlags(CPF_BlueprintVisible))
+				{
+					bBreakable = true;
+					break;
+				}
+			}
+		}
+		if (!bBreakable)
+		{
+			return FMCPToolHelpers::MakeError(Request, kMCPErrorOperationFailed,
+				FString::Printf(TEXT("struct '%s' cannot be broken (not BlueprintType, lacks BlueprintVisible "
+					"members, or has a native 'Break%s' function override)"),
+					*StructPath, *Struct->GetName()));
+		}
+	}
+
+	Blueprint->Modify();
+	Graph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
+
+	UK2Node_BreakStruct* BreakNode = NewObject<UK2Node_BreakStruct>(Graph, NAME_None, RF_Transactional);
+	// StructType lives on the UK2Node_StructOperation parent — set BEFORE AllocateDefaultPins so the
+	// per-member output pins materialise on construction.
+	BreakNode->StructType = Struct;
+	BPG_FinalizeNewNode(BreakNode, Graph, PosX, PosY);
+
+	BPG_MarkModified(Blueprint);
+
+	TArray<TSharedPtr<FJsonValue>> PositionResp;
+	PositionResp.Add(MakeShared<FJsonValueNumber>(BreakNode->NodePosX));
+	PositionResp.Add(MakeShared<FJsonValueNumber>(BreakNode->NodePosY));
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),   BreakNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("node_class"),  BreakNode->GetClass()->GetPathName())
+		.Str(TEXT("struct_path"), Struct->GetPathName())
+		.Arr(TEXT("position"),    MoveTemp(PositionResp))
+		.Arr(TEXT("pins"),        BPG_PinsArray(BreakNode))
+		.BuildSuccess(Request);
+}
+
+// ─── bp.add_struct_make_node (Wave O — UK2Node_MakeStruct, Lane A) ─────────────────────────────
+//
+// Mirror of bp.add_struct_break_node — same args/shape, different K2Node class + CanBeMade check.
+//
+// Errors: identical to add_struct_break_node.
+FMCPResponse Tool_AddStructMakeNode(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddStructMakeNode", "MCP: bp.add_struct_make_node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BlueprintPath, StructPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("struct_path"),    StructPath,    Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 PosX = 0, PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("position"), PositionArr) && PositionArr && PositionArr->Num() == 2)
+	{
+		PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	UScriptStruct* Struct = LoadObject<UScriptStruct>(nullptr, *StructPath);
+	if (!Struct)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("UScriptStruct '%s' could not be loaded"), *StructPath));
+	}
+
+	if (!UK2Node_MakeStruct::CanBeMade(Struct))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOperationFailed,
+			FString::Printf(TEXT("struct '%s' cannot be made (not BlueprintType, lacks "
+				"BlueprintVisible non-readonly members, or has a native 'Make%s' function override)"),
+				*StructPath, *Struct->GetName()));
+	}
+
+	Blueprint->Modify();
+	Graph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
+
+	UK2Node_MakeStruct* MakeNode = NewObject<UK2Node_MakeStruct>(Graph, NAME_None, RF_Transactional);
+	MakeNode->StructType = Struct;
+	BPG_FinalizeNewNode(MakeNode, Graph, PosX, PosY);
+
+	BPG_MarkModified(Blueprint);
+
+	TArray<TSharedPtr<FJsonValue>> PositionResp;
+	PositionResp.Add(MakeShared<FJsonValueNumber>(MakeNode->NodePosX));
+	PositionResp.Add(MakeShared<FJsonValueNumber>(MakeNode->NodePosY));
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),   MakeNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("node_class"),  MakeNode->GetClass()->GetPathName())
+		.Str(TEXT("struct_path"), Struct->GetPathName())
+		.Arr(TEXT("position"),    MoveTemp(PositionResp))
+		.Arr(TEXT("pins"),        BPG_PinsArray(MakeNode))
+		.BuildSuccess(Request);
+}
+
+// ─── bp.add_macro_node (Wave O — UK2Node_MacroInstance, Lane A) ────────────────────────────────
+//
+// Args:    { blueprint_path, graph_name?, macro_path, position? }
+// Result:  { node_guid, node_class, macro_path, position: [x,y], pins: [...] }
+//
+// ``macro_path`` format: ``<package_obj_path>:<graph_name>``. Example:
+//   /Engine/EditorBlueprintResources/StandardMacros.StandardMacros:ForEachLoop
+//
+// First half (before ``:``) is loaded as a UObject (typically a UBlueprint — macro libraries are
+// BPs with Macros only). Second half (after ``:``) is the macro graph's GetName() inside
+// ``MacroLib->MacroGraphs``. Split via FString::Split(..., FromEnd) so paths containing dots
+// (UE convention ``Package.Asset:Inner``) parse correctly.
+//
+// Errors: -32602 InvalidParams (malformed macro_path), -32004 ObjectNotFound (macro library or
+// inner graph not found), -32050 GraphNotFound, -32027 PIEActive.
+FMCPResponse Tool_AddMacroNode(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddMacroNode", "MCP: bp.add_macro_node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BlueprintPath, MacroPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("macro_path"),     MacroPath,     Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	int32 PosX = 0, PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("position"), PositionArr) && PositionArr && PositionArr->Num() == 2)
+	{
+		PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+	}
+
+	// Parse macro_path: split on the LAST ':' (asset object paths use ':' for sub-object refs but
+	// the convention is one ':' between asset and inner-graph; FromEnd handles the rare case where
+	// future asset names happen to contain ':' by reserving the last token for the graph name).
+	FString PackagePart, GraphPart;
+	if (!MacroPath.Split(TEXT(":"), &PackagePart, &GraphPart, ESearchCase::IgnoreCase, ESearchDir::FromEnd))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("macro_path '%s' is malformed — expected format "
+				"'<package_obj_path>:<inner_graph_name>' (e.g. "
+				"'/Engine/EditorBlueprintResources/StandardMacros.StandardMacros:ForEachLoop')"),
+				*MacroPath));
+	}
+	if (PackagePart.IsEmpty() || GraphPart.IsEmpty())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("macro_path '%s' has empty package or graph part"), *MacroPath));
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	// Macro libraries are UBlueprints with BPTYPE_MacroLibrary. LoadObject<UBlueprint> handles
+	// both ``/Game/Path/MyLib`` and ``/Game/Path/MyLib.MyLib`` forms internally.
+	UBlueprint* MacroLib = LoadObject<UBlueprint>(nullptr, *PackagePart);
+	if (!MacroLib)
+	{
+		// Retry with .LeafName suffix — LoadObject only retries for some paths.
+		const int32 LastSlash = PackagePart.Find(TEXT("/"), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+		if (LastSlash != INDEX_NONE && !PackagePart.Contains(TEXT(".")))
+		{
+			const FString LeafName = PackagePart.RightChop(LastSlash + 1);
+			MacroLib = LoadObject<UBlueprint>(nullptr, *(PackagePart + TEXT(".") + LeafName));
+		}
+	}
+	if (!MacroLib)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("macro library blueprint '%s' could not be loaded "
+				"(expected UBlueprint with macro graphs)"), *PackagePart));
+	}
+
+	// Find inner graph by name in MacroLib->MacroGraphs.
+	UEdGraph* MacroGraph = nullptr;
+	const FName MacroGraphFName(*GraphPart);
+	for (UEdGraph* G : MacroLib->MacroGraphs)
+	{
+		if (G && G->GetFName() == MacroGraphFName)
+		{
+			MacroGraph = G;
+			break;
+		}
+	}
+	if (!MacroGraph)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("inner macro graph '%s' not found in library '%s' "
+				"(%d macros available)"),
+				*GraphPart, *PackagePart, MacroLib->MacroGraphs.Num()));
+	}
+
+	Blueprint->Modify();
+	Graph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
+
+	UK2Node_MacroInstance* MacroNode = NewObject<UK2Node_MacroInstance>(Graph, NAME_None, RF_Transactional);
+	// SetMacroGraph populates MacroGraphReference; AllocateDefaultPins reads it to materialise the
+	// macro's input/output pins on the instance.
+	MacroNode->SetMacroGraph(MacroGraph);
+	BPG_FinalizeNewNode(MacroNode, Graph, PosX, PosY);
+	// Macro pins depend on the inner graph's Tunnel entry/exit nodes — ReconstructNode forces a
+	// re-read after AllocateDefaultPins so any wildcard inference / late binding finalises.
+	MacroNode->ReconstructNode();
+
+	BPG_MarkModified(Blueprint);
+
+	TArray<TSharedPtr<FJsonValue>> PositionResp;
+	PositionResp.Add(MakeShared<FJsonValueNumber>(MacroNode->NodePosX));
+	PositionResp.Add(MakeShared<FJsonValueNumber>(MacroNode->NodePosY));
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),  MacroNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("node_class"), MacroNode->GetClass()->GetPathName())
+		.Str(TEXT("macro_path"), FString::Printf(TEXT("%s:%s"),
+			*MacroLib->GetPathName(), *MacroGraph->GetName()))
+		.Arr(TEXT("position"),   MoveTemp(PositionResp))
+		.Arr(TEXT("pins"),       BPG_PinsArray(MacroNode))
+		.BuildSuccess(Request);
+}
+
+// ─── bp.add_input_action_event_node (Wave O — UK2Node_EnhancedInputAction, Lane A) ─────────────
+//
+// Args:    { blueprint_path, graph_name?, ia_path, trigger_event?, position? }
+// Result:  { node_guid, node_class, ia_path, trigger_event, position: [x,y], pins: [...] }
+//
+// ``ia_path``: ``UInputAction`` asset path (e.g. ``/Game/Input/IA_Jump``). Loaded as UInputAction
+// then assigned to the K2Node's ``InputAction`` field via reflection (no Build.cs dep on
+// InputBlueprintNodes — that module is editor-private and not in our deps).
+//
+// ``trigger_event``: informational only — the node emits ALL trigger pins (Triggered/Started/
+// Ongoing/Canceled/Completed) on AllocateDefaultPins. The caller picks which exec to wire.
+//
+// Errors: -32004 ObjectNotFound (IA path doesn't resolve), -32603 InternalError (InputBlueprintNodes
+// module not loaded — K2Node class not findable), -32602 InvalidParams (trigger_event invalid),
+// -32050 GraphNotFound, -32027 PIEActive.
+FMCPResponse Tool_AddInputActionEventNode(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddInputActionEvent", "MCP: bp.add_input_action_event_node"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BlueprintPath, IAPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"),        IAPath,        Err)) { return Err; }
+
+	FString GraphName = TEXT("EventGraph");
+	Request.Args->TryGetStringField(TEXT("graph_name"), GraphName);
+
+	FString TriggerEvent = TEXT("Triggered");
+	Request.Args->TryGetStringField(TEXT("trigger_event"), TriggerEvent);
+	// Loose validation — the K2 node exposes all 5 trigger pins regardless; this gives the caller a
+	// fast error if they mistyped. Names match the engine's ETriggerEvent enum value strings.
+	static const TCHAR* const kKnownTriggers[] = {
+		TEXT("Triggered"), TEXT("Started"), TEXT("Ongoing"), TEXT("Canceled"), TEXT("Completed")
+	};
+	bool bTriggerOk = false;
+	for (const TCHAR* Known : kKnownTriggers)
+	{
+		if (TriggerEvent.Equals(Known, ESearchCase::IgnoreCase)) { bTriggerOk = true; break; }
+	}
+	if (!bTriggerOk)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("trigger_event '%s' is not one of "
+				"Triggered/Started/Ongoing/Canceled/Completed"), *TriggerEvent));
+	}
+
+	int32 PosX = 0, PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("position"), PositionArr) && PositionArr && PositionArr->Num() == 2)
+	{
+		PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	UEdGraph* Graph = BGT_FindGraphByName(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("graph '%s' not found on blueprint '%s'"), *GraphName, *BlueprintPath));
+	}
+
+	// Load IA — UInputAction lives in EnhancedInput (already a private dep on the bridge module).
+	// Don't include its header here; use reflection-friendly UObject path then verify class.
+	UObject* IAObject = LoadObject<UObject>(nullptr, *IAPath);
+	if (!IAObject)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("UInputAction '%s' could not be loaded"), *IAPath));
+	}
+	// Soft-verify class via FindObject — avoids hard include of EnhancedInput's InputAction.h.
+	UClass* InputActionClass = FindObject<UClass>(nullptr, TEXT("/Script/EnhancedInput.InputAction"));
+	if (!InputActionClass || !IAObject->IsA(InputActionClass))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorWrongClass,
+			FString::Printf(TEXT("asset '%s' (class %s) is not a UInputAction"),
+				*IAPath, *IAObject->GetClass()->GetPathName()));
+	}
+
+	// Resolve the K2 node class via FindObject — InputBlueprintNodes is editor-only + private; we
+	// don't link against it, but the module is loaded in editor sessions so the class is reachable.
+	UClass* NodeClass = FindObject<UClass>(nullptr,
+		TEXT("/Script/InputBlueprintNodes.K2Node_EnhancedInputAction"));
+	if (!NodeClass)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			TEXT("UK2Node_EnhancedInputAction class not findable — is the InputBlueprintNodes module loaded?"));
+	}
+
+	Blueprint->Modify();
+	Graph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
+
+	UK2Node* IANode = NewObject<UK2Node>(Graph, NodeClass, NAME_None, RF_Transactional);
+	check(IANode);
+
+	// Find + write the InputAction field via reflection. Field is TObjectPtr<const UInputAction>
+	// (see K2Node_EnhancedInputAction.h:50) — its FObjectProperty is layout-compatible with a raw
+	// UObject* assignment via ContainerPtrToValuePtr.
+	FProperty* IAProp = NodeClass->FindPropertyByName(FName(TEXT("InputAction")));
+	if (!IAProp)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			TEXT("UK2Node_EnhancedInputAction has no 'InputAction' UPROPERTY — engine version mismatch?"));
+	}
+	FObjectProperty* IAObjProp = CastField<FObjectProperty>(IAProp);
+	if (!IAObjProp)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			TEXT("UK2Node_EnhancedInputAction::InputAction is not an FObjectProperty — engine version mismatch?"));
+	}
+	// FObjectProperty handles the TObjectPtr<T> shape transparently via SetObjectPropertyValue.
+	IAObjProp->SetObjectPropertyValue_InContainer(IANode, IAObject);
+
+	BPG_FinalizeNewNode(IANode, Graph, PosX, PosY);
+	// ReconstructNode after AllocateDefaultPins so all trigger pins reflect the resolved IA's
+	// value-type signature (Bool IAs have no value pin; Axis1D/2D/3D add a Value pin).
+	IANode->ReconstructNode();
+
+	BPG_MarkModified(Blueprint);
+
+	TArray<TSharedPtr<FJsonValue>> PositionResp;
+	PositionResp.Add(MakeShared<FJsonValueNumber>(IANode->NodePosX));
+	PositionResp.Add(MakeShared<FJsonValueNumber>(IANode->NodePosY));
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),     IANode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("node_class"),    NodeClass->GetPathName())
+		.Str(TEXT("ia_path"),       IAObject->GetPathName())
+		.Str(TEXT("trigger_event"), TriggerEvent)
+		.Arr(TEXT("position"),      MoveTemp(PositionResp))
+		.Arr(TEXT("pins"),          BPG_PinsArray(IANode))
+		.BuildSuccess(Request);
+}
+
+// ─── bp.bind_component_event (Wave O — UK2Node_ComponentBoundEvent, Lane A) ────────────────────
+//
+// **THE critical Wave-O tool.** Creates a component bound event in the BP's EventGraph — the
+// foundation for actor-BP reactive logic: OnComponentBeginOverlap, OnHit, OnClicked, OnDestroyed,
+// etc. Without this, an AI agent cannot author typical actor BPs end-to-end.
+//
+// Args:    { blueprint_path, component_name, delegate_name, target_function_name?, position? }
+// Result:  { node_guid, node_class, component_name, delegate_name, function_name, function_created,
+//            position: [x,y], pins: [...event signature pins...] }
+//
+// Special handling:
+//   1. The host graph is ALWAYS ``Blueprint->UbergraphPages[0]`` (the EventGraph). Components are
+//      bound at construction — bound events on a function graph would not fire.
+//   2. ``target_function_name`` (optional) renames the K2Node's ``CustomFunctionName`` so the
+//      generated event has a readable name in the graph + the event-stub function tab. If omitted,
+//      engine generates a deterministic name like ``OnComponentBeginOverlap_Sphere``.
+//   3. Duplicate detection: ``FKismetEditorUtilities::FindBoundEventForComponent`` returns the
+//      existing node if one already binds this (component, delegate) pair — we surface as
+//      -32058 OperationFailed so the caller doesn't accidentally create dual binders.
+//
+// Errors: -32004 ObjectNotFound (component / delegate / EventGraph), -32058 OperationFailed
+// (delegate already bound), -32027 PIEActive.
+FMCPResponse Tool_BindComponentEvent(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_BindComponentEvent", "MCP: bp.bind_component_event"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString BlueprintPath, ComponentName, DelegateName;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("blueprint_path"), BlueprintPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("component_name"), ComponentName, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("delegate_name"),  DelegateName,  Err)) { return Err; }
+
+	FString TargetFunctionName;
+	Request.Args->TryGetStringField(TEXT("target_function_name"), TargetFunctionName);
+
+	int32 PosX = 0, PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PositionArr = nullptr;
+	if (Request.Args->TryGetArrayField(TEXT("position"), PositionArr) && PositionArr && PositionArr->Num() == 2)
+	{
+		PosX = static_cast<int32>((*PositionArr)[0]->AsNumber());
+		PosY = static_cast<int32>((*PositionArr)[1]->AsNumber());
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UBlueprint* Blueprint = FMCPBlueprintUtils::LoadBlueprintByPath(BlueprintPath, LoadErrCode, LoadErrMsg);
+	if (!Blueprint) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	// Find component in SCS — covers BP-authored components (the usual case for actor BPs).
+	USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
+	if (!SCS)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			FString::Printf(TEXT("blueprint '%s' has no SimpleConstructionScript "
+				"(non-AActor parent class? %s)"),
+				*BlueprintPath,
+				Blueprint->ParentClass ? *Blueprint->ParentClass->GetName() : TEXT("null parent")));
+	}
+	const FName ComponentFName(*ComponentName);
+	USCS_Node* ComponentNode = SCS->FindSCSNode(ComponentFName);
+	if (!ComponentNode)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("component '%s' not found in SimpleConstructionScript of '%s'"),
+				*ComponentName, *BlueprintPath));
+	}
+	UClass* ComponentClass = ComponentNode->ComponentClass;
+	if (!ComponentClass)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			FString::Printf(TEXT("SCS node '%s' has null ComponentClass"), *ComponentName));
+	}
+
+	// Find delegate property on component class. Must walk parent classes — most overlap/hit
+	// delegates live on UPrimitiveComponent (parent of UStaticMeshComponent, USphereComponent, etc.).
+	FMulticastDelegateProperty* DelegateProp =
+		FindFProperty<FMulticastDelegateProperty>(ComponentClass, FName(*DelegateName));
+	if (!DelegateProp)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("delegate '%s' not found on component class '%s' "
+				"(checked full inheritance chain)"),
+				*DelegateName, *ComponentClass->GetPathName()));
+	}
+
+	// Find the FObjectProperty in the BP's GeneratedClass that holds the component pointer. SCS
+	// nodes generate a property on the GeneratedClass named after the variable.
+	UClass* BPGenClass = Blueprint->GeneratedClass;
+	if (!BPGenClass)
+	{
+		// Force-compile if generated class missing (rare — usually Epic regenerates on load).
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			FString::Printf(TEXT("blueprint '%s' has no GeneratedClass — needs initial compile"),
+				*BlueprintPath));
+	}
+	FObjectProperty* ComponentProp = FindFProperty<FObjectProperty>(BPGenClass, ComponentFName);
+	if (!ComponentProp)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("component property '%s' not found on GeneratedClass '%s' "
+				"(SCS variable wasn't promoted to BP class — compile the BP first)"),
+				*ComponentName, *BPGenClass->GetPathName()));
+	}
+
+	// EventGraph is the only valid host for component-bound events.
+	if (Blueprint->UbergraphPages.Num() == 0 || !Blueprint->UbergraphPages[0])
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorGraphNotFound,
+			FString::Printf(TEXT("blueprint '%s' has no UbergraphPages — no EventGraph to host the bound event"),
+				*BlueprintPath));
+	}
+	UEdGraph* EventGraph = Blueprint->UbergraphPages[0];
+
+	// Duplicate-bind check — if (component, delegate) already has a bound event, reject. Mimics
+	// the editor's right-click-add-event UI which navigates to the existing node instead.
+	if (const UK2Node_ComponentBoundEvent* Existing =
+		FKismetEditorUtilities::FindBoundEventForComponent(Blueprint, DelegateProp->GetFName(), ComponentFName))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOperationFailed,
+			FString::Printf(TEXT("delegate '%s' on component '%s' is already bound by node '%s'"),
+				*DelegateName, *ComponentName,
+				*Existing->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens)));
+	}
+
+	Blueprint->Modify();
+	EventGraph->Modify();
+	Scope.DirtyPackage(Blueprint->GetPackage());
+
+	UK2Node_ComponentBoundEvent* BoundEvent = NewObject<UK2Node_ComponentBoundEvent>(
+		EventGraph, NAME_None, RF_Transactional);
+
+	// InitializeComponentBoundEventParams auto-populates DelegatePropertyName / ComponentPropertyName
+	// / EventReference + sets the EventName the engine uses for the event-stub function. Must be
+	// called BEFORE AllocateDefaultPins so the event-signature pins (OtherActor, OtherComp, etc.)
+	// materialise from the delegate's signature.
+	BoundEvent->InitializeComponentBoundEventParams(ComponentProp, DelegateProp);
+
+	// Custom function name override — must happen BEFORE FinalizeNewNode (specifically before
+	// AllocateDefaultPins) so the generated event entry uses the desired name. The engine-default
+	// name from InitializeComponentBoundEventParams is something like ``OnComponentBeginOverlap_Sphere``;
+	// callers often want a domain-specific name like ``OnSphereOverlap_BP``.
+	const bool bRenamedEvent = !TargetFunctionName.IsEmpty();
+	if (bRenamedEvent)
+	{
+		BoundEvent->CustomFunctionName = FName(*TargetFunctionName);
+	}
+
+	// FinalizeNewNode handles guid + AddNode + PostPlacedNewNode + AllocateDefaultPins. After
+	// AllocateDefaultPins the K2Node_Event base will have manufactured per-delegate-parameter
+	// output pins (OtherActor / OtherComp / OtherBodyIndex / bFromSweep / SweepResult for begin
+	// overlap, for example).
+	BPG_FinalizeNewNode(BoundEvent, EventGraph, PosX, PosY);
+
+	BPG_MarkModified(Blueprint);
+
+	TArray<TSharedPtr<FJsonValue>> PositionResp;
+	PositionResp.Add(MakeShared<FJsonValueNumber>(BoundEvent->NodePosX));
+	PositionResp.Add(MakeShared<FJsonValueNumber>(BoundEvent->NodePosY));
+
+	// Reported function_name reflects what the caller will see in the BP — the override if set,
+	// otherwise the engine-generated default that InitializeComponentBoundEventParams produced.
+	const FString FinalFunctionName = BoundEvent->CustomFunctionName.IsNone()
+		? BoundEvent->GetFunctionName().ToString()
+		: BoundEvent->CustomFunctionName.ToString();
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("node_guid"),       BoundEvent->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens))
+		.Str(TEXT("node_class"),      BoundEvent->GetClass()->GetPathName())
+		.Str(TEXT("component_name"),  ComponentName)
+		.Str(TEXT("delegate_name"),   DelegateName)
+		.Str(TEXT("function_name"),   FinalFunctionName)
+		.Bool(TEXT("function_created"), bRenamedEvent)
+		.Arr(TEXT("position"),        MoveTemp(PositionResp))
+		.Arr(TEXT("pins"),            BPG_PinsArray(BoundEvent))
+		.BuildSuccess(Request);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -1200,10 +2170,26 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("bp.add_comment"),        &Tool_AddComment,       /*Lane A*/ false);
 	RegisterTool(TEXT("bp.delete_comment"),     &Tool_DeleteComment,    /*Lane A*/ false);
 
+	// Wave O — BP authoring gap closer. 7 specialised node spawners + pin introspection. All
+	// Lane A (UObject mutation + game-thread-only K2 node construction). Closes the "20% gap"
+	// where bp.add_node alone can't perform post-construction setup specific to certain K2 node
+	// subclasses (cast TargetType, struct break/make StructType, macro graph reference, IA field
+	// reflection, component-bound event delegate/component property pairing).
+	RegisterTool(TEXT("bp.list_node_pins"),               &Tool_ListNodePins,             /*Lane A*/ false);
+	RegisterTool(TEXT("bp.add_cast_node"),                &Tool_AddCastNode,              /*Lane A*/ false);
+	RegisterTool(TEXT("bp.add_struct_break_node"),        &Tool_AddStructBreakNode,       /*Lane A*/ false);
+	RegisterTool(TEXT("bp.add_struct_make_node"),         &Tool_AddStructMakeNode,        /*Lane A*/ false);
+	RegisterTool(TEXT("bp.add_macro_node"),               &Tool_AddMacroNode,             /*Lane A*/ false);
+	RegisterTool(TEXT("bp.add_input_action_event_node"),  &Tool_AddInputActionEventNode,  /*Lane A*/ false);
+	RegisterTool(TEXT("bp.bind_component_event"),         &Tool_BindComponentEvent,       /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
 		TEXT("BP graph surface registered: bp.add_node + bp.connect_pins (Wave B Tier 4) + "
 		     "bp.set_node_property + bp.set_pin_default + bp.delete_node + bp.disconnect_pin + "
-		     "bp.move_node (Wave F1) + bp.add_comment + bp.delete_comment (Wave F5) — all Lane A"));
+		     "bp.move_node (Wave F1) + bp.add_comment + bp.delete_comment (Wave F5) + "
+		     "bp.list_node_pins + bp.add_cast_node + bp.add_struct_break_node + bp.add_struct_make_node + "
+		     "bp.add_macro_node + bp.add_input_action_event_node + bp.bind_component_event (Wave O) "
+		     "— all Lane A"));
 }
 
 } // namespace FBlueprintGraphTools

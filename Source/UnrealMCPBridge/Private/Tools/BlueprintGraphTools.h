@@ -113,4 +113,53 @@ namespace FBlueprintGraphTools
 	// already expose — same helpers (``BGT_FindGraphByName`` / ``BGT_FindNodeByGuid``).
 	UNREALMCPBRIDGE_API FMCPResponse Tool_AddComment(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_DeleteComment(const FMCPRequest& Request);
+
+	// ─── Wave O — BP authoring gap closer (7 tools) ──────────────────────────────────────────────
+	//
+	// Specialised node spawners + pin introspection. Closes the "20% gap" identified during the BP
+	// capability review where ``bp.add_node`` (the generic one) cannot perform post-construction
+	// setup specific to certain K2 node subclasses:
+	//
+	//   bp.list_node_pins                 → full pin enumeration (name + pin_id + category +
+	//                                       sub_category[_object] + container_type + is_connected +
+	//                                       default_value / default_object / default_text +
+	//                                       linked_pins [{node_guid, pin_id}] + hidden/advanced
+	//                                       flags). Used by AI to plan subsequent
+	//                                       ``bp.connect_pins`` / ``bp.set_pin_default`` calls.
+	//   bp.add_cast_node                  → UK2Node_DynamicCast with ``TargetType`` set; cast pin
+	//                                       types correctly typed after AllocateDefaultPins.
+	//   bp.add_struct_break_node          → UK2Node_BreakStruct with ``StructType`` set (parent
+	//                                       UK2Node_StructOperation field); CanBeBroken
+	//                                       precondition check, per-member output pins.
+	//   bp.add_struct_make_node           → mirror with UK2Node_MakeStruct + CanBeMade check.
+	//   bp.add_macro_node                 → UK2Node_MacroInstance with ``MacroGraphReference`` set
+	//                                       to a macro sub-graph from a macro library BP. Path
+	//                                       format: ``<package>:<inner_graph_name>``.
+	//   bp.add_input_action_event_node    → UK2Node_EnhancedInputAction (resolved via FindObject
+	//                                       reflection — no Build.cs dep on InputBlueprintNodes
+	//                                       editor-private module). All trigger pins present
+	//                                       after AllocateDefaultPins.
+	//   bp.bind_component_event           → UK2Node_ComponentBoundEvent — THE critical gap for
+	//                                       actor BP component delegates (OnComponentBeginOverlap,
+	//                                       OnHit, OnClicked, etc.). Uses
+	//                                       ``InitializeComponentBoundEventParams`` to auto-set
+	//                                       Component/Delegate/Event refs. Always hosted on
+	//                                       EventGraph (UbergraphPages[0]).
+	//
+	// All Lane A — game-thread K2 node construction + SCS lookups + UClass property reflection.
+	// All PIE-guarded.
+	//
+	// **New error codes used** (no new ones introduced — all reused from Phase 4):
+	//   -32004 ObjectNotFound       struct / macro library / inner graph / component / delegate / IA not found
+	//   -32011 WrongClass           target_class not a UObject subclass; IA path not a UInputAction
+	//   -32020 ClassNotFound        target_class not loadable
+	//   -32050 GraphNotFound        graph_name not found; bind_component_event: no EventGraph
+	//   -32058 OperationFailed      struct not breakable/makeable; component-bound event already bound
+	UNREALMCPBRIDGE_API FMCPResponse Tool_ListNodePins(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddCastNode(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddStructBreakNode(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddStructMakeNode(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddMacroNode(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddInputActionEventNode(const FMCPRequest& Request);
+	UNREALMCPBRIDGE_API FMCPResponse Tool_BindComponentEvent(const FMCPRequest& Request);
 }
