@@ -365,52 +365,10 @@ namespace
 		return INDEX_NONE;
 	}
 
-	/**
-	 * Apply a JSON-object dict of property values onto a freshly-created subobject via
-	 * ``FMCPReflection::WritePropertyValue``. Populates ``OutApplied`` with successfully-written
-	 * property names and ``OutSkipped`` with names that were either not found on the class or
-	 * rejected by the marshalling layer (type mismatch). Returns the count of successful writes.
-	 *
-	 * The subobject is brand-new (just-constructed via ``NewObject``) so there are no editor
-	 * observers — no PreEditChange/PostEditChange dance needed for each field. The outer
-	 * ``FMCPMutatorScope`` already owns the transaction.
-	 */
-	int32 INP_ApplyProperties(
-		UObject* Target,
-		const TSharedPtr<FJsonObject>& Props,
-		TArray<FString>& OutApplied,
-		TArray<FString>& OutSkipped)
-	{
-		check(Target);
-		if (!Props.IsValid()) { return 0; }
-
-		int32 Applied = 0;
-		UClass* Cls = Target->GetClass();
-		check(Cls);
-
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
-		{
-			FProperty* Prop = Cls->FindPropertyByName(*Pair.Key);
-			if (!Prop)
-			{
-				OutSkipped.Add(Pair.Key);
-				continue;
-			}
-			FString WriteErr;
-			if (FMCPReflection::WritePropertyValue(Target, Prop, Pair.Value, WriteErr))
-			{
-				OutApplied.Add(Pair.Key);
-				++Applied;
-			}
-			else
-			{
-				UE_LOG(LogMCP, Verbose, TEXT("INP_ApplyProperties: skip '%s' on %s — %s"),
-					*Pair.Key, *Cls->GetName(), *WriteErr);
-				OutSkipped.Add(Pair.Key);
-			}
-		}
-		return Applied;
-	}
+	// INP_ApplyProperties replaced by FMCPToolHelpers::ApplyJsonProperties (Wave Q1 unification).
+	// Behavioural change: OutSkipped entries now formatted as "<name>: <reason>" instead of
+	// bare name — matches AIBT/AIEQS shape so AI callers get the rejection reason inline. Caller
+	// reads OutSkipped strings unchanged; if it needs just the name it parses on the first ":".
 
 	/**
 	 * Build a JSON summary describing a concrete UInputTrigger/UInputModifier subclass: class path,
@@ -1309,7 +1267,7 @@ FMCPResponse Tool_AddMappingTrigger(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
 		&& PropsObjPtr && PropsObjPtr->IsValid())
 	{
-		INP_ApplyProperties(NewTrigger, *PropsObjPtr, Applied, Skipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewTrigger, *PropsObjPtr, Applied, Skipped);
 	}
 
 	const int32 TriggerIdx = Mapping.Triggers.Add(NewTrigger);
@@ -1483,7 +1441,7 @@ FMCPResponse Tool_AddMappingModifier(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
 		&& PropsObjPtr && PropsObjPtr->IsValid())
 	{
-		INP_ApplyProperties(NewModifier, *PropsObjPtr, Applied, Skipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewModifier, *PropsObjPtr, Applied, Skipped);
 	}
 
 	const int32 ModifierIdx = Mapping.Modifiers.Add(NewModifier);
@@ -1633,7 +1591,7 @@ FMCPResponse Tool_AddActionTrigger(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
 		&& PropsObjPtr && PropsObjPtr->IsValid())
 	{
-		INP_ApplyProperties(NewTrigger, *PropsObjPtr, Applied, Skipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewTrigger, *PropsObjPtr, Applied, Skipped);
 	}
 
 	const int32 TriggerIdx = IA->Triggers.Add(NewTrigger);
@@ -1756,7 +1714,7 @@ FMCPResponse Tool_AddActionModifier(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
 		&& PropsObjPtr && PropsObjPtr->IsValid())
 	{
-		INP_ApplyProperties(NewModifier, *PropsObjPtr, Applied, Skipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewModifier, *PropsObjPtr, Applied, Skipped);
 	}
 
 	const int32 ModifierIdx = IA->Modifiers.Add(NewModifier);

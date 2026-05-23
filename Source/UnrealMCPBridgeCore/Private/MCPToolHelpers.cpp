@@ -2,6 +2,11 @@
 
 #include "MCPToolHelpers.h"
 
+#include "Utils/MCPReflection.h"
+
+#include "UObject/Class.h"
+#include "UObject/UnrealType.h"
+
 namespace FMCPToolHelpers
 {
 	void StampIds(const FMCPRequest& Request, FMCPResponse& Response)
@@ -135,5 +140,39 @@ namespace FMCPToolHelpers
 			return false;
 		}
 		return true;
+	}
+
+	int32 ApplyJsonProperties(
+		UObject* Target,
+		const TSharedPtr<FJsonObject>& Props,
+		TArray<FString>& OutApplied,
+		TArray<FString>& OutSkipped)
+	{
+		check(Target);
+		if (!Props.IsValid()) { return 0; }
+
+		UClass* Cls = Target->GetClass();
+		check(Cls);
+
+		const int32 InitialAppliedCount = OutApplied.Num();
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
+		{
+			const FString& PropName = Pair.Key;
+			FProperty* Prop = Cls->FindPropertyByName(FName(*PropName));
+			if (!Prop)
+			{
+				OutSkipped.Add(FString::Printf(TEXT("%s: property not found on class '%s'"),
+					*PropName, *Cls->GetName()));
+				continue;
+			}
+			FString WriteErr;
+			if (!FMCPReflection::WritePropertyValue(Target, Prop, Pair.Value, WriteErr))
+			{
+				OutSkipped.Add(FString::Printf(TEXT("%s: %s"), *PropName, *WriteErr));
+				continue;
+			}
+			OutApplied.Add(PropName);
+		}
+		return OutApplied.Num() - InitialAppliedCount;
 	}
 }

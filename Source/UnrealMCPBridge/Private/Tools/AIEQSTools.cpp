@@ -100,43 +100,7 @@ namespace
 		return Resolved;
 	}
 
-	/**
-	 * Apply a properties JSON dict to a target UObject via FMCPReflection::WritePropertyValue.
-	 * Top-level field name → property; value → FMCPReflection round-trip JSON shape.
-	 *
-	 * Populates OutApplied[] with successfully-written property names; OutSkipped[] with
-	 * descriptive skip messages (property not found / type mismatch / access denied).
-	 *
-	 * Does NOT wrap in FMCPWritePropertyScope per-property — caller owns the outer transaction
-	 * (FMCPMutatorScope holds it). PreEditChange/PostEditChangeProperty are skipped here because
-	 * the target is freshly-NewObject'd asset state, not an already-published asset — no editor
-	 * listeners are bound yet. The outer scope's MarkPackageDirty captures the change.
-	 */
-	void AIEQS_ApplyProperties(UObject* Target, const TSharedPtr<FJsonObject>& Props,
-		TArray<FString>& OutApplied, TArray<FString>& OutSkipped)
-	{
-		check(Target);
-		if (!Props.IsValid()) { return; }
-
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
-		{
-			const FString& PropName = Pair.Key;
-			FProperty* Prop = Target->GetClass()->FindPropertyByName(FName(*PropName));
-			if (!Prop)
-			{
-				OutSkipped.Add(FString::Printf(TEXT("%s: property not found on class '%s'"),
-					*PropName, *Target->GetClass()->GetName()));
-				continue;
-			}
-			FString WriteErr;
-			if (!FMCPReflection::WritePropertyValue(Target, Prop, Pair.Value, WriteErr))
-			{
-				OutSkipped.Add(FString::Printf(TEXT("%s: %s"), *PropName, *WriteErr));
-				continue;
-			}
-			OutApplied.Add(PropName);
-		}
-	}
+	// AIEQS_ApplyProperties removed; replaced by FMCPToolHelpers::ApplyJsonProperties (Wave Q1).
 } // namespace
 
 namespace FAIEQSTools
@@ -662,7 +626,7 @@ FMCPResponse Tool_AddGenerator(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObj)
 		&& PropsObj && (*PropsObj).IsValid())
 	{
-		AIEQS_ApplyProperties(NewGen, *PropsObj, PropsApplied, PropsSkipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewGen, *PropsObj, PropsApplied, PropsSkipped);
 	}
 
 	const int32 OptionIdx = Query->GetOptionsMutable().Add(NewOpt);
@@ -761,7 +725,7 @@ FMCPResponse Tool_AddTest(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObj)
 		&& PropsObj && (*PropsObj).IsValid())
 	{
-		AIEQS_ApplyProperties(NewTest, *PropsObj, PropsApplied, PropsSkipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewTest, *PropsObj, PropsApplied, PropsSkipped);
 	}
 
 	const int32 TestIdx = Option->Tests.Add(NewTest);

@@ -73,4 +73,39 @@ namespace FMCPToolHelpers
 	 * Request.Args. Surfaces typically dereference once and re-wrap as a local TSharedPtr.
 	 */
 	UNREALMCPBRIDGECORE_API bool RequireObjectField(const FMCPRequest& Request, const TCHAR* FieldName, const TSharedPtr<FJsonObject>*& OutObjectPtr, FMCPResponse& OutError);
+
+	/**
+	 * Apply a JSON properties dict to a UObject via FMCPReflection::WritePropertyValue.
+	 *
+	 * For each {key, value} in Props:
+	 *   - Looks up the FProperty by key name on Target's class via FindPropertyByName.
+	 *   - If found AND WritePropertyValue succeeds → bare key name added to OutApplied.
+	 *   - If not found → "<key>: property not found on class '<ClassName>'" added to OutSkipped.
+	 *   - If found but WritePropertyValue rejects → "<key>: <error message>" added to OutSkipped.
+	 *
+	 * **Contract:** caller owns the FMCPMutatorScope / FMCPWritePropertyScope — this helper does
+	 * NOT open a transaction or invoke Pre/PostEditChange. Designed for freshly-NewObject'd asset
+	 * state where no editor listeners are bound yet; outer scope's MarkPackageDirty captures the
+	 * change. For mutating already-published assets (Details panel observers), wrap each property
+	 * apply in its own FMCPWritePropertyScope instead.
+	 *
+	 * **Skipped format note:** OutSkipped entries are "<name>: <reason>" strings (informative for
+	 * AI debugging — caller iterates the array and parses on ":" if it needs just the name). This
+	 * supersedes the bare-name format used by the earlier per-surface INP_ApplyProperties helper
+	 * (Wave N+1); the richer format is consistent across all surfaces post-Wave-Q1 unification.
+	 *
+	 * **Replaces** Wave N+1 INP_ApplyProperties + Wave P AIBT_ApplyProperties + AIEQS_ApplyProperties
+	 * (~150 LOC of duplication across 3 surfaces / 10 call sites).
+	 *
+	 * @param Target      Non-null UObject to mutate. `check()`-asserted.
+	 * @param Props       Properties JSON object. May be invalid/null — function is no-op then.
+	 * @param OutApplied  Property names that succeeded (bare strings).
+	 * @param OutSkipped  "<name>: <reason>" entries for not-found or write-rejected fields.
+	 * @return            OutApplied.Num() — count of properties successfully written this call.
+	 */
+	UNREALMCPBRIDGECORE_API int32 ApplyJsonProperties(
+		UObject* Target,
+		const TSharedPtr<FJsonObject>& Props,
+		TArray<FString>& OutApplied,
+		TArray<FString>& OutSkipped);
 }

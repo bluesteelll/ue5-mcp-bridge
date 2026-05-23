@@ -521,37 +521,9 @@ namespace
 		return Resolved;
 	}
 
-	/**
-	 * Apply a properties JSON dict to a target node via FMCPReflection::WritePropertyValue.
-	 * Same shape/contract as AIEQS_ApplyProperties — kept per-surface to keep includes minimal.
-	 */
-	void AIBT_ApplyProperties(UObject* Target, const TSharedPtr<FJsonObject>& Props,
-		TArray<FString>& OutApplied, TArray<FString>& OutSkipped)
-	{
-		check(Target);
-		if (!Props.IsValid()) { return; }
+	// AIBT_ApplyProperties removed; replaced by FMCPToolHelpers::ApplyJsonProperties (Wave Q1).
 
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
-		{
-			const FString& PropName = Pair.Key;
-			FProperty* Prop = Target->GetClass()->FindPropertyByName(FName(*PropName));
-			if (!Prop)
-			{
-				OutSkipped.Add(FString::Printf(TEXT("%s: property not found on class '%s'"),
-					*PropName, *Target->GetClass()->GetName()));
-				continue;
-			}
-			FString WriteErr;
-			if (!FMCPReflection::WritePropertyValue(Target, Prop, Pair.Value, WriteErr))
-			{
-				OutSkipped.Add(FString::Printf(TEXT("%s: %s"), *PropName, *WriteErr));
-				continue;
-			}
-			OutApplied.Add(PropName);
-		}
-	}
-
-	/** Convert AIBT_ApplyProperties output arrays into the standard FMCPJson shape. */
+	/** Convert ApplyJsonProperties output arrays into the standard FMCPJson shape. */
 	void AIBT_AppendPropertyResults(FMCPJsonBuilder& Builder,
 		const TArray<FString>& Applied, const TArray<FString>& Skipped)
 	{
@@ -1208,7 +1180,7 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObj)
 		&& PropsObj && (*PropsObj).IsValid())
 	{
-		AIBT_ApplyProperties(NewNode, *PropsObj, PropsApplied, PropsSkipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewNode, *PropsObj, PropsApplied, PropsSkipped);
 	}
 
 	Scope.DirtyPackage(BT->GetPackage());
@@ -1309,7 +1281,7 @@ FMCPResponse Tool_AddDecorator(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObj)
 		&& PropsObj && (*PropsObj).IsValid())
 	{
-		AIBT_ApplyProperties(NewDec, *PropsObj, PropsApplied, PropsSkipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewDec, *PropsObj, PropsApplied, PropsSkipped);
 	}
 
 	int32 DecIdx = INDEX_NONE;
@@ -1424,7 +1396,7 @@ FMCPResponse Tool_AddService(const FMCPRequest& Request)
 	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObj)
 		&& PropsObj && (*PropsObj).IsValid())
 	{
-		AIBT_ApplyProperties(NewSvc, *PropsObj, PropsApplied, PropsSkipped);
+		FMCPToolHelpers::ApplyJsonProperties(NewSvc, *PropsObj, PropsApplied, PropsSkipped);
 	}
 
 	const int32 SvcIdx = TargetComp->Services.Add(NewSvc);
