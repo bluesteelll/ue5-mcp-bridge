@@ -1161,34 +1161,86 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams, TEXT("missing args object"));
 	}
 
+	// Wave M (M4): accept either image_a/image_b (new spec) OR image_a_path/image_b_path (Wave H legacy).
+	// Same for diff_output_path / output_path. New names take precedence when both supplied.
 	FString PathARaw, PathBRaw;
-	if (!Request.Args->TryGetStringField(TEXT("image_a_path"), PathARaw) || PathARaw.IsEmpty())
+	Request.Args->TryGetStringField(TEXT("image_a"), PathARaw);
+	if (PathARaw.IsEmpty()) { Request.Args->TryGetStringField(TEXT("image_a_path"), PathARaw); }
+	Request.Args->TryGetStringField(TEXT("image_b"), PathBRaw);
+	if (PathBRaw.IsEmpty()) { Request.Args->TryGetStringField(TEXT("image_b_path"), PathBRaw); }
+
+	if (PathARaw.IsEmpty())
 	{
 		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
-			TEXT("missing required string field 'image_a_path'"));
+			TEXT("missing required string field 'image_a' (or legacy 'image_a_path')"));
 	}
-	if (!Request.Args->TryGetStringField(TEXT("image_b_path"), PathBRaw) || PathBRaw.IsEmpty())
+	if (PathBRaw.IsEmpty())
 	{
 		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
-			TEXT("missing required string field 'image_b_path'"));
+			TEXT("missing required string field 'image_b' (or legacy 'image_b_path')"));
 	}
 
+	// Wave M C2: reject non-PNG inputs explicitly — FImageUtils silently fails on EXR/HDR.
+	auto IsPng = [](const FString& Path) -> bool
+	{
+		return FPaths::GetExtension(Path).ToLower() == TEXT("png");
+	};
+	if (!IsPng(PathARaw))
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			FString::Printf(TEXT("only .png files supported in v1 (got '%s')"), *PathARaw));
+	}
+	if (!IsPng(PathBRaw))
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			FString::Printf(TEXT("only .png files supported in v1 (got '%s')"), *PathBRaw));
+	}
+
+	// Threshold: blueprint spec [0, 255] (per-channel abs diff). Legacy code used [0, 1] fraction
+	// of total pixels — we preserve the legacy "identical" classification by treating Threshold > 1
+	// as the new per-channel value and Threshold <= 1 as the legacy fraction (caller can opt in via
+	// any value > 1 to get the per-channel semantics).
 	double ThresholdRaw = kSHOTDiffThresholdDefault;
 	Request.Args->TryGetNumberField(TEXT("threshold"), ThresholdRaw);
-	if (ThresholdRaw < 0.0 || ThresholdRaw > 1.0)
+	if (ThresholdRaw < 0.0 || ThresholdRaw > 255.0)
 	{
 		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
-			FString::Printf(TEXT("threshold %g out of [0.0, 1.0]"), ThresholdRaw));
+			FString::Printf(TEXT("threshold %g out of [0.0, 255.0]"), ThresholdRaw));
 	}
 	const float Threshold = static_cast<float>(ThresholdRaw);
+	const bool bThresholdIsPerChannel = (ThresholdRaw > 1.0);
+	const int32 PerChannelTolerance = bThresholdIsPerChannel
+		? FMath::FloorToInt(static_cast<float>(ThresholdRaw))
+		: kSHOTDiffChannelTolerance;   // legacy default 5
 
-	// Optional diff overlay path.
-	FString DiffOutRaw;
-	bool bWantOverlay = false;
-	if (Request.Args->TryGetStringField(TEXT("diff_output_path"), DiffOutRaw)
-		&& !DiffOutRaw.IsEmpty())
+	// diff_mode (Wave M): "highlight" (default) | "raw_abs" | "side_by_side". Determines overlay
+	// rendering style when output_path is supplied.
+	enum class EDiffMode : uint8 { Highlight, RawAbs, SideBySide };
+	EDiffMode Mode = EDiffMode::Highlight;
 	{
-		bWantOverlay = true;
+		FString ModeStr;
+		if (Request.Args->TryGetStringField(TEXT("diff_mode"), ModeStr) && !ModeStr.IsEmpty())
+		{
+			if (ModeStr.Equals(TEXT("highlight"), ESearchCase::IgnoreCase))    Mode = EDiffMode::Highlight;
+			else if (ModeStr.Equals(TEXT("raw_abs"), ESearchCase::IgnoreCase)) Mode = EDiffMode::RawAbs;
+			else if (ModeStr.Equals(TEXT("side_by_side"), ESearchCase::IgnoreCase)) Mode = EDiffMode::SideBySide;
+			else
+			{
+				return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+					FString::Printf(TEXT("diff_mode '%s' not one of: highlight, raw_abs, side_by_side"), *ModeStr));
+			}
+		}
+	}
+
+	// Optional output path (new ``output_path`` OR legacy ``diff_output_path``).
+	FString DiffOutRaw;
+	Request.Args->TryGetStringField(TEXT("output_path"), DiffOutRaw);
+	if (DiffOutRaw.IsEmpty()) { Request.Args->TryGetStringField(TEXT("diff_output_path"), DiffOutRaw); }
+	const bool bWantOverlay = !DiffOutRaw.IsEmpty();
+	if (bWantOverlay && !IsPng(DiffOutRaw))
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			FString::Printf(TEXT("only .png output supported in v1 (got '%s')"), *DiffOutRaw));
 	}
 
 	// Sandbox-resolve all paths up-front. PATH_ESCAPE before any file open is the safer order.
@@ -1197,66 +1249,67 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	if (!FMCPPathSandbox::Resolve(PathARaw, AbsA, SandboxErr))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
-			FString::Printf(TEXT("image_a_path: %s"), *SandboxErr));
+			FString::Printf(TEXT("image_a: %s"), *SandboxErr));
 	}
 	if (!FMCPPathSandbox::Resolve(PathBRaw, AbsB, SandboxErr))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
-			FString::Printf(TEXT("image_b_path: %s"), *SandboxErr));
+			FString::Printf(TEXT("image_b: %s"), *SandboxErr));
 	}
 	if (bWantOverlay && !FMCPPathSandbox::Resolve(DiffOutRaw, AbsDiffOut, SandboxErr))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
-			FString::Printf(TEXT("diff_output_path: %s"), *SandboxErr));
+			FString::Printf(TEXT("output_path: %s"), *SandboxErr));
 	}
 
-	// Existence check (LoadFileToArray would fail anyway; pre-check gives the cleaner -32004
-	// surface that callers expect for "file not found" vs ambiguous decode failure).
 	if (!FPaths::FileExists(AbsA))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("image_a_path file not found: '%s'"), *AbsA));
+			FString::Printf(TEXT("image_a file not found: '%s'"), *AbsA));
 	}
 	if (!FPaths::FileExists(AbsB))
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("image_b_path file not found: '%s'"), *AbsB));
+			FString::Printf(TEXT("image_b file not found: '%s'"), *AbsB));
 	}
 
-	// Decode both images.
 	FImage ImageA, ImageB;
 	FString DecodeErr;
 	if (!SHOT_LoadImageBGRA8(AbsA, ImageA, DecodeErr))
 	{
-		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("image_a decode: %s"), *DecodeErr));
 	}
 	if (!SHOT_LoadImageBGRA8(AbsB, ImageB, DecodeErr))
 	{
-		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
 			FString::Printf(TEXT("image_b decode: %s"), *DecodeErr));
 	}
 
-	// Build per-image dimension sub-objects (always populated, even on dimension mismatch).
+	// Build size response sub-objects + array shorthand (new spec uses [w,h] arrays).
 	TSharedRef<FJsonObject> ASizeObj = MakeShared<FJsonObject>();
 	ASizeObj->SetNumberField(TEXT("width"), ImageA.SizeX);
 	ASizeObj->SetNumberField(TEXT("height"), ImageA.SizeY);
 	TSharedRef<FJsonObject> BSizeObj = MakeShared<FJsonObject>();
 	BSizeObj->SetNumberField(TEXT("width"), ImageB.SizeX);
 	BSizeObj->SetNumberField(TEXT("height"), ImageB.SizeY);
+	TArray<TSharedPtr<FJsonValue>> ASizeArr = {
+		MakeShared<FJsonValueNumber>(ImageA.SizeX),
+		MakeShared<FJsonValueNumber>(ImageA.SizeY),
+	};
+	TArray<TSharedPtr<FJsonValue>> BSizeArr = {
+		MakeShared<FJsonValueNumber>(ImageB.SizeX),
+		MakeShared<FJsonValueNumber>(ImageB.SizeY),
+	};
 
-	// Dimension mismatch: well-defined "everything differs" result, not an error.
+	// Wave M Q6 (critique): size mismatch → ERROR (-32058 OperationFailed). Auto-resize distorts
+	// metrics; an honest failure makes the caller resize explicitly first.
 	if (ImageA.SizeX != ImageB.SizeX || ImageA.SizeY != ImageB.SizeY)
 	{
-		return FMCPJsonBuilder()
-			.Bool(TEXT("identical"), false)
-			.Num(TEXT("difference_pct"), 100.0)
-			.Num(TEXT("differing_pixels"), 0)
-			.Num(TEXT("total_pixels"), 0)
-			.ObjectShared(TEXT("image_a"), ASizeObj)
-			.ObjectShared(TEXT("image_b"), BSizeObj)
-			.Str(TEXT("note"), TEXT("dimension mismatch — diff is 100% by definition"))
-			.BuildSuccess(Request);
+		const FString ErrMsg = FString::Printf(
+			TEXT("image dimensions must match (image_a=%dx%d, image_b=%dx%d); use external resize tool first"),
+			ImageA.SizeX, ImageA.SizeY, ImageB.SizeX, ImageB.SizeY);
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorOperationFailed, ErrMsg);
 	}
 
 	TArrayView64<const FColor> PixelsA = ImageA.AsBGRA8();
@@ -1264,36 +1317,119 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	const int64 TotalPixels = PixelsA.Num();
 	check(TotalPixels == PixelsB.Num());
 
-	// Run the per-pixel compare. Allocate the differing-mask only when the caller wants an overlay
-	// (saves O(W*H) bytes on every diff call).
+	// Wave M extended pixel scan: also accumulate sum/sumsq/max for MAE/RMSE/PSNR + the differing
+	// mask (allocate only when overlay requested). Single pass for cache friendliness.
 	TArray<uint8> DifferingMask;
-	const uint64 DiffCount = SHOT_CountDifferingPixels(
-		PixelsA, PixelsB, kSHOTDiffChannelTolerance,
-		bWantOverlay ? &DifferingMask : nullptr);
+	if (bWantOverlay) { DifferingMask.SetNumZeroed(TotalPixels); }
+
+	uint64 ChangedCount = 0;
+	uint64 SumAbsDiff = 0;       // sum over channels (R+G+B)
+	uint64 SumSqDiff = 0;        // sum over channels (R^2+G^2+B^2)
+	uint8 MaxAbsDiff = 0;
+	for (int64 i = 0; i < TotalPixels; ++i)
+	{
+		const FColor& A = PixelsA[i];
+		const FColor& B = PixelsB[i];
+		const int32 DR = FMath::Abs(static_cast<int32>(A.R) - static_cast<int32>(B.R));
+		const int32 DG = FMath::Abs(static_cast<int32>(A.G) - static_cast<int32>(B.G));
+		const int32 DB = FMath::Abs(static_cast<int32>(A.B) - static_cast<int32>(B.B));
+		const int32 PerChannelMax = FMath::Max3(DR, DG, DB);
+
+		if (PerChannelMax > PerChannelTolerance)
+		{
+			++ChangedCount;
+			if (bWantOverlay) { DifferingMask[i] = 1; }
+		}
+		SumAbsDiff += static_cast<uint64>(DR + DG + DB);
+		SumSqDiff  += static_cast<uint64>(DR*DR + DG*DG + DB*DB);
+		if (static_cast<uint8>(PerChannelMax) > MaxAbsDiff)
+		{
+			MaxAbsDiff = static_cast<uint8>(PerChannelMax);
+		}
+	}
+
+	const double TotalChannels = static_cast<double>(TotalPixels) * 3.0;
+	const double MeanAbsError = TotalChannels > 0 ? static_cast<double>(SumAbsDiff) / TotalChannels : 0.0;
+	const double Rmse = TotalChannels > 0 ? FMath::Sqrt(static_cast<double>(SumSqDiff) / TotalChannels) : 0.0;
+	// PSNR (per critique N4 — replaces SSIM, 1-LOC industry standard). Identical images → infinity;
+	// we cap at 100 dB for JSON-friendliness (PNGs are byte-quantised so identical is 0 RMSE exactly,
+	// and PSNR > 50 dB is already "visually indistinguishable").
+	const double Psnr = (Rmse > 0.0) ? (20.0 * FMath::LogX(10.0, 255.0 / Rmse)) : 100.0;
 
 	const float DiffPct = TotalPixels > 0
-		? (static_cast<float>(DiffCount) / static_cast<float>(TotalPixels)) * 100.0f
+		? (static_cast<float>(ChangedCount) / static_cast<float>(TotalPixels)) * 100.0f
 		: 0.0f;
-	const bool bIdentical = (DiffCount == 0) || (DiffPct <= Threshold * 100.0f);
+	// "identical" classification: legacy semantics when threshold is in [0,1] (fraction of pixels);
+	// strict zero-diff when per-channel semantics.
+	const bool bIdentical = bThresholdIsPerChannel
+		? (ChangedCount == 0)
+		: ((ChangedCount == 0) || (DiffPct <= Threshold * 100.0f));
 
-	// Optionally render + save the overlay.
+	// Build (and save) the diff visualization if requested.
 	FString DiffWritePath;
 	bool bOverlayWritten = false;
+	int64 DiffImageBytes = 0;
 	if (bWantOverlay)
 	{
 		FImage Overlay;
-		SHOT_BuildDiffOverlay(PixelsA, DifferingMask, ImageA.SizeX, ImageA.SizeY, Overlay);
+		switch (Mode)
+		{
+		case EDiffMode::Highlight:
+			SHOT_BuildDiffOverlay(PixelsA, DifferingMask, ImageA.SizeX, ImageA.SizeY, Overlay);
+			break;
+		case EDiffMode::RawAbs:
+		{
+			// Grayscale image of per-pixel max abs diff (R,G,B channel max scaled to 0..255 directly).
+			Overlay.Init(ImageA.SizeX, ImageA.SizeY, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+			TArrayView64<FColor> Out = Overlay.AsBGRA8();
+			for (int64 i = 0; i < TotalPixels; ++i)
+			{
+				const FColor& A = PixelsA[i];
+				const FColor& B = PixelsB[i];
+				const int32 DR = FMath::Abs(static_cast<int32>(A.R) - static_cast<int32>(B.R));
+				const int32 DG = FMath::Abs(static_cast<int32>(A.G) - static_cast<int32>(B.G));
+				const int32 DB = FMath::Abs(static_cast<int32>(A.B) - static_cast<int32>(B.B));
+				const uint8 V = static_cast<uint8>(FMath::Min(255, FMath::Max3(DR, DG, DB)));
+				Out[i] = FColor(V, V, V, 255);
+			}
+			break;
+		}
+		case EDiffMode::SideBySide:
+		{
+			// [A | B] horizontal concatenation. Output size = (2*W, H).
+			const int32 W = ImageA.SizeX;
+			const int32 H = ImageA.SizeY;
+			Overlay.Init(W * 2, H, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+			TArrayView64<FColor> Out = Overlay.AsBGRA8();
+			for (int32 y = 0; y < H; ++y)
+			{
+				const int64 RowSrc = static_cast<int64>(y) * W;
+				const int64 RowDst = static_cast<int64>(y) * (W * 2);
+				// Left half = A.
+				for (int32 x = 0; x < W; ++x)
+				{
+					Out[RowDst + x] = PixelsA[RowSrc + x];
+				}
+				// Right half = B.
+				for (int32 x = 0; x < W; ++x)
+				{
+					Out[RowDst + W + x] = PixelsB[RowSrc + x];
+				}
+			}
+			break;
+		}
+		}
+
 		FString WriteErr;
 		if (SHOT_SaveImageAsPNG(Overlay, AbsDiffOut, WriteErr))
 		{
 			DiffWritePath = AbsDiffOut;
 			bOverlayWritten = true;
+			DiffImageBytes = IFileManager::Get().FileSize(*AbsDiffOut);
+			if (DiffImageBytes < 0) { DiffImageBytes = 0; }
 		}
 		else
 		{
-			// Don't fail the whole diff just because the overlay couldn't be written — report
-			// the diff result + a warning. The caller's machine-readable success branch is the
-			// {identical, difference_pct} pair which is already known by this point.
 			UE_LOG(LogMCP, Warning, TEXT("screenshot.diff overlay write failed: %s"), *WriteErr);
 		}
 	}
@@ -1301,12 +1437,445 @@ FMCPResponse Tool_Diff(const FMCPRequest& Request)
 	return FMCPJsonBuilder()
 		.Bool(TEXT("identical"), bIdentical)
 		.Num(TEXT("difference_pct"), DiffPct)
-		.Num(TEXT("differing_pixels"), static_cast<double>(DiffCount))
+		.Num(TEXT("changed_pixels"), static_cast<double>(ChangedCount))
+		.Num(TEXT("differing_pixels"), static_cast<double>(ChangedCount))    // legacy alias
 		.Num(TEXT("total_pixels"), static_cast<double>(TotalPixels))
+		.Num(TEXT("changed_pct"), DiffPct)
+		.Num(TEXT("mean_abs_error"), MeanAbsError)
+		.Num(TEXT("max_abs_error"), MaxAbsDiff)
+		.Num(TEXT("rmse"), Rmse)
+		.Num(TEXT("psnr"), Psnr)
+		.Bool(TEXT("size_match"), true)
+		.Arr(TEXT("size_a"), MoveTemp(ASizeArr))
+		.Arr(TEXT("size_b"), MoveTemp(BSizeArr))
 		.ObjectShared(TEXT("image_a"), ASizeObj)
 		.ObjectShared(TEXT("image_b"), BSizeObj)
 		.Num(TEXT("threshold"), Threshold)
-		.If(bOverlayWritten, [&](FMCPJsonBuilder& B) { B.Str(TEXT("diff_image_path"), DiffWritePath); })
+		.If(bOverlayWritten, [&](FMCPJsonBuilder& B)
+		{
+			B.Str(TEXT("output_path"), DiffWritePath);
+			B.Str(TEXT("diff_image_path"), DiffWritePath);     // legacy alias
+			B.Num(TEXT("diff_image_size_bytes"), static_cast<double>(DiffImageBytes));
+		})
+		.BuildSuccess(Request);
+}
+
+// ─── screenshot.annotate (Wave M M5) ──────────────────────────────────────────────────────────
+//
+// Args:
+//   image_path     : string (required)            — sandboxed PNG input
+//   annotations    : array (required)             — list of annotation objects
+//   output_path    : string (required)            — sandboxed PNG output
+//
+// Annotation object types (per critique decision: text SKIP in v1, returned in ``annotations_skipped``):
+//   { type: "box",    min: [x,y],    max: [x,y],    color: [r,g,b,a?], thickness?: int }
+//   { type: "line",   start: [x,y],  end: [x,y],    color: [r,g,b,a?], thickness?: int }
+//   { type: "circle", center: [x,y], radius: int,   color: [r,g,b,a?], thickness?: int }
+//   { type: "text",   ... }                       — UNSUPPORTED in v1 (returns annotations_skipped)
+//
+// ``thickness=0`` means filled (box/circle); ``thickness>=1`` means outline. Default thickness=1.
+// Color alpha defaults to 255 when only [r,g,b] supplied (per critique N5).
+// Out-of-bounds whole shapes are reported in ``annotations_skipped``; partial-bounds shapes are
+// clipped to the image rect (no segfault).
+//
+// Result:
+//   {
+//     output_path: string,
+//     size_bytes:  int,
+//     annotations_applied: int,
+//     annotations_skipped: [{ index: int, reason: string }]
+//   }
+//
+// Lane A initially (file IO); reviewer audits Lane B promotion in followup. Pure-compute eligible.
+FMCPResponse Tool_Annotate(const FMCPRequest& Request)
+{
+	// NO check(IsInGameThread()) — pure file IO + compute.
+
+	if (!Request.Args.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams, TEXT("missing args object"));
+	}
+
+	FString ImagePathRaw, OutPathRaw;
+	if (!Request.Args->TryGetStringField(TEXT("image_path"), ImagePathRaw) || ImagePathRaw.IsEmpty())
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			TEXT("missing required string field 'image_path'"));
+	}
+	if (!Request.Args->TryGetStringField(TEXT("output_path"), OutPathRaw) || OutPathRaw.IsEmpty())
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			TEXT("missing required string field 'output_path'"));
+	}
+
+	auto IsPng = [](const FString& Path) -> bool
+	{
+		return FPaths::GetExtension(Path).ToLower() == TEXT("png");
+	};
+	if (!IsPng(ImagePathRaw))
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			FString::Printf(TEXT("only .png input supported in v1 (got '%s')"), *ImagePathRaw));
+	}
+	if (!IsPng(OutPathRaw))
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			FString::Printf(TEXT("only .png output supported in v1 (got '%s')"), *OutPathRaw));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* AnnotArrPtr = nullptr;
+	if (!Request.Args->TryGetArrayField(TEXT("annotations"), AnnotArrPtr) || !AnnotArrPtr)
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInvalidParams,
+			TEXT("missing required array field 'annotations'"));
+	}
+
+	// Sandbox.
+	FString AbsIn, AbsOut, SandboxErr;
+	if (!FMCPPathSandbox::Resolve(ImagePathRaw, AbsIn, SandboxErr))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
+			FString::Printf(TEXT("image_path: %s"), *SandboxErr));
+	}
+	if (!FMCPPathSandbox::Resolve(OutPathRaw, AbsOut, SandboxErr))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPathEscape,
+			FString::Printf(TEXT("output_path: %s"), *SandboxErr));
+	}
+	if (!FPaths::FileExists(AbsIn))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("image_path file not found: '%s'"), *AbsIn));
+	}
+
+	FImage Img;
+	FString DecodeErr;
+	if (!SHOT_LoadImageBGRA8(AbsIn, Img, DecodeErr))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorThumbnailRenderFailed,
+			FString::Printf(TEXT("image_path decode: %s"), *DecodeErr));
+	}
+
+	const int32 W = Img.SizeX;
+	const int32 H = Img.SizeY;
+	TArrayView64<FColor> Pixels = Img.AsBGRA8();
+
+	// ── Helpers (capture-by-reference on Pixels/W/H/TotalPixels). ─────────────────────────────
+	const int64 TotalPixels = static_cast<int64>(W) * static_cast<int64>(H);
+	check(Pixels.Num() == TotalPixels);
+
+	auto BlendPixel = [&](int32 X, int32 Y, const FColor& Src)
+	{
+		if (X < 0 || X >= W || Y < 0 || Y >= H) { return; }
+		const int64 Idx = static_cast<int64>(Y) * W + X;
+		FColor& Dst = Pixels[Idx];
+		if (Src.A == 255)
+		{
+			// Full opaque — overwrite (Img is BGRA8 + sRGB; FColor channel order matches).
+			Dst.R = Src.R; Dst.G = Src.G; Dst.B = Src.B;
+		}
+		else if (Src.A > 0)
+		{
+			const float A = static_cast<float>(Src.A) / 255.0f;
+			const float InvA = 1.0f - A;
+			Dst.R = static_cast<uint8>(FMath::Clamp(Src.R * A + Dst.R * InvA, 0.0f, 255.0f));
+			Dst.G = static_cast<uint8>(FMath::Clamp(Src.G * A + Dst.G * InvA, 0.0f, 255.0f));
+			Dst.B = static_cast<uint8>(FMath::Clamp(Src.B * A + Dst.B * InvA, 0.0f, 255.0f));
+		}
+	};
+
+	auto DrawHLine = [&](int32 X0, int32 X1, int32 Y, const FColor& Col)
+	{
+		if (Y < 0 || Y >= H) { return; }
+		const int32 Lo = FMath::Clamp(FMath::Min(X0, X1), 0, W - 1);
+		const int32 Hi = FMath::Clamp(FMath::Max(X0, X1), 0, W - 1);
+		for (int32 X = Lo; X <= Hi; ++X) { BlendPixel(X, Y, Col); }
+	};
+	auto DrawVLine = [&](int32 X, int32 Y0, int32 Y1, const FColor& Col)
+	{
+		if (X < 0 || X >= W) { return; }
+		const int32 Lo = FMath::Clamp(FMath::Min(Y0, Y1), 0, H - 1);
+		const int32 Hi = FMath::Clamp(FMath::Max(Y0, Y1), 0, H - 1);
+		for (int32 Y = Lo; Y <= Hi; ++Y) { BlendPixel(X, Y, Col); }
+	};
+
+	// Bresenham's line with thickness extension (draw concentric offset lines perpendicular to dir).
+	auto DrawLine = [&](int32 X0, int32 Y0, int32 X1, int32 Y1, int32 Thickness, const FColor& Col)
+	{
+		Thickness = FMath::Max(1, Thickness);
+		auto PutThick = [&](int32 X, int32 Y)
+		{
+			// For thickness > 1, paint a small square (cheap and consistent across angles).
+			const int32 Half = (Thickness - 1) / 2;
+			for (int32 DY = -Half; DY <= Thickness - 1 - Half; ++DY)
+			{
+				for (int32 DX = -Half; DX <= Thickness - 1 - Half; ++DX)
+				{
+					BlendPixel(X + DX, Y + DY, Col);
+				}
+			}
+		};
+		int32 DX =  FMath::Abs(X1 - X0);
+		int32 SX = X0 < X1 ? 1 : -1;
+		int32 DY = -FMath::Abs(Y1 - Y0);
+		int32 SY = Y0 < Y1 ? 1 : -1;
+		int32 Err = DX + DY;
+		int32 X = X0, Y = Y0;
+		while (true)
+		{
+			PutThick(X, Y);
+			if (X == X1 && Y == Y1) break;
+			const int32 E2 = 2 * Err;
+			if (E2 >= DY) { Err += DY; X += SX; }
+			if (E2 <= DX) { Err += DX; Y += SY; }
+		}
+	};
+
+	// Outlined or filled box.
+	auto DrawBox = [&](int32 X0, int32 Y0, int32 X1, int32 Y1, int32 Thickness, const FColor& Col)
+	{
+		const int32 Lo_X = FMath::Min(X0, X1);
+		const int32 Hi_X = FMath::Max(X0, X1);
+		const int32 Lo_Y = FMath::Min(Y0, Y1);
+		const int32 Hi_Y = FMath::Max(Y0, Y1);
+		if (Thickness <= 0)
+		{
+			// Filled — scan-line fill (clipped).
+			const int32 LoYC = FMath::Clamp(Lo_Y, 0, H - 1);
+			const int32 HiYC = FMath::Clamp(Hi_Y, 0, H - 1);
+			for (int32 Y = LoYC; Y <= HiYC; ++Y) { DrawHLine(Lo_X, Hi_X, Y, Col); }
+		}
+		else
+		{
+			// Outlined — top + bottom + left + right (each "thickness" pixels thick).
+			for (int32 T = 0; T < Thickness; ++T)
+			{
+				DrawHLine(Lo_X, Hi_X, Lo_Y + T, Col);
+				DrawHLine(Lo_X, Hi_X, Hi_Y - T, Col);
+				DrawVLine(Lo_X + T, Lo_Y, Hi_Y, Col);
+				DrawVLine(Hi_X - T, Lo_Y, Hi_Y, Col);
+			}
+		}
+	};
+
+	// Midpoint circle with 8-way symmetry; ring thickness > 1 draws concentric rings.
+	auto DrawCircleRing = [&](int32 CX, int32 CY, int32 Radius, const FColor& Col)
+	{
+		if (Radius <= 0) { return; }
+		int32 X = Radius;
+		int32 Y = 0;
+		int32 Err = 1 - X;
+		while (X >= Y)
+		{
+			BlendPixel(CX + X, CY + Y, Col);
+			BlendPixel(CX + Y, CY + X, Col);
+			BlendPixel(CX - Y, CY + X, Col);
+			BlendPixel(CX - X, CY + Y, Col);
+			BlendPixel(CX - X, CY - Y, Col);
+			BlendPixel(CX - Y, CY - X, Col);
+			BlendPixel(CX + Y, CY - X, Col);
+			BlendPixel(CX + X, CY - Y, Col);
+			++Y;
+			if (Err <= 0) { Err += 2*Y + 1; }
+			else          { --X; Err += 2*(Y - X) + 1; }
+		}
+	};
+	auto DrawCircle = [&](int32 CX, int32 CY, int32 Radius, int32 Thickness, const FColor& Col)
+	{
+		if (Thickness <= 0)
+		{
+			// Filled — scan-line fill.
+			for (int32 Y = -Radius; Y <= Radius; ++Y)
+			{
+				const int32 RowY = CY + Y;
+				if (RowY < 0 || RowY >= H) { continue; }
+				const int32 DX = static_cast<int32>(FMath::Sqrt(static_cast<float>(Radius*Radius - Y*Y)));
+				DrawHLine(CX - DX, CX + DX, RowY, Col);
+			}
+		}
+		else
+		{
+			for (int32 T = 0; T < Thickness; ++T)
+			{
+				DrawCircleRing(CX, CY, Radius - T, Col);
+			}
+		}
+	};
+
+	auto ParseColor = [](const TArray<TSharedPtr<FJsonValue>>* Arr, FColor& OutCol) -> bool
+	{
+		if (!Arr) return false;
+		if (Arr->Num() != 3 && Arr->Num() != 4) return false;
+		double R = 0, G = 0, B = 0, A = 255;
+		if (!(*Arr)[0]->TryGetNumber(R)) return false;
+		if (!(*Arr)[1]->TryGetNumber(G)) return false;
+		if (!(*Arr)[2]->TryGetNumber(B)) return false;
+		if (Arr->Num() == 4 && !(*Arr)[3]->TryGetNumber(A)) return false;
+		OutCol = FColor(
+			static_cast<uint8>(FMath::Clamp(R, 0.0, 255.0)),
+			static_cast<uint8>(FMath::Clamp(G, 0.0, 255.0)),
+			static_cast<uint8>(FMath::Clamp(B, 0.0, 255.0)),
+			static_cast<uint8>(FMath::Clamp(A, 0.0, 255.0)));
+		return true;
+	};
+	auto ParseIntArray2 = [](const TArray<TSharedPtr<FJsonValue>>* Arr, int32& OutX, int32& OutY) -> bool
+	{
+		if (!Arr || Arr->Num() != 2) return false;
+		double X = 0, Y = 0;
+		if (!(*Arr)[0]->TryGetNumber(X)) return false;
+		if (!(*Arr)[1]->TryGetNumber(Y)) return false;
+		OutX = static_cast<int32>(X);
+		OutY = static_cast<int32>(Y);
+		return true;
+	};
+
+	int32 Applied = 0;
+	FMCPJsonArrayBuilder Skipped;
+	auto SkipReason = [&](int32 Index, const TCHAR* Reason)
+	{
+		Skipped.AddObject([&](FMCPJsonBuilder& B)
+		{
+			B.Int(TEXT("index"), Index).Str(TEXT("reason"), Reason);
+		});
+	};
+
+	// ── Iterate annotations. ──────────────────────────────────────────────────────────────────
+	for (int32 i = 0; i < AnnotArrPtr->Num(); ++i)
+	{
+		const TSharedPtr<FJsonValue>& Val = (*AnnotArrPtr)[i];
+		const TSharedPtr<FJsonObject>* AnnotObjPtr = nullptr;
+		if (!Val.IsValid() || !Val->TryGetObject(AnnotObjPtr) || !AnnotObjPtr || !AnnotObjPtr->IsValid())
+		{
+			SkipReason(i, TEXT("annotation entry is not an object"));
+			continue;
+		}
+		const TSharedPtr<FJsonObject>& AnnotObj = *AnnotObjPtr;
+
+		FString Type;
+		if (!AnnotObj->TryGetStringField(TEXT("type"), Type) || Type.IsEmpty())
+		{
+			SkipReason(i, TEXT("missing 'type' field"));
+			continue;
+		}
+
+		// Color (optional; default opaque white).
+		FColor Col(255, 255, 255, 255);
+		{
+			const TArray<TSharedPtr<FJsonValue>>* ColArr = nullptr;
+			if (AnnotObj->TryGetArrayField(TEXT("color"), ColArr) && ColArr && !ParseColor(ColArr, Col))
+			{
+				SkipReason(i, TEXT("'color' must be [r,g,b] or [r,g,b,a] of numbers in [0,255]"));
+				continue;
+			}
+		}
+
+		// Thickness (default 1; 0 = filled for box/circle).
+		int32 Thickness = 1;
+		{
+			int32 Raw = 1;
+			if (AnnotObj->TryGetNumberField(TEXT("thickness"), Raw))
+			{
+				Thickness = FMath::Max(0, Raw);
+			}
+		}
+
+		if (Type.Equals(TEXT("box"), ESearchCase::IgnoreCase))
+		{
+			const TArray<TSharedPtr<FJsonValue>>* MinArr = nullptr;
+			const TArray<TSharedPtr<FJsonValue>>* MaxArr = nullptr;
+			int32 X0=0, Y0=0, X1=0, Y1=0;
+			if (!AnnotObj->TryGetArrayField(TEXT("min"), MinArr) || !ParseIntArray2(MinArr, X0, Y0)
+				|| !AnnotObj->TryGetArrayField(TEXT("max"), MaxArr) || !ParseIntArray2(MaxArr, X1, Y1))
+			{
+				SkipReason(i, TEXT("box: 'min' and 'max' must be [x,y] numbers"));
+				continue;
+			}
+			// Whole-shape OOB check: if both min AND max are outside image rect on same axis side.
+			const int32 LoX = FMath::Min(X0, X1), HiX = FMath::Max(X0, X1);
+			const int32 LoY = FMath::Min(Y0, Y1), HiY = FMath::Max(Y0, Y1);
+			if (HiX < 0 || LoX >= W || HiY < 0 || LoY >= H)
+			{
+				SkipReason(i, TEXT("box entirely out of image bounds"));
+				continue;
+			}
+			DrawBox(X0, Y0, X1, Y1, Thickness, Col);
+			++Applied;
+		}
+		else if (Type.Equals(TEXT("line"), ESearchCase::IgnoreCase))
+		{
+			const TArray<TSharedPtr<FJsonValue>>* StartArr = nullptr;
+			const TArray<TSharedPtr<FJsonValue>>* EndArr = nullptr;
+			int32 X0=0, Y0=0, X1=0, Y1=0;
+			if (!AnnotObj->TryGetArrayField(TEXT("start"), StartArr) || !ParseIntArray2(StartArr, X0, Y0)
+				|| !AnnotObj->TryGetArrayField(TEXT("end"), EndArr) || !ParseIntArray2(EndArr, X1, Y1))
+			{
+				SkipReason(i, TEXT("line: 'start' and 'end' must be [x,y] numbers"));
+				continue;
+			}
+			// Lines may extend off-image; we clip per-pixel during draw via BlendPixel bounds check.
+			// Only fully-OOB-on-same-side skip:
+			const int32 LoX = FMath::Min(X0, X1), HiX = FMath::Max(X0, X1);
+			const int32 LoY = FMath::Min(Y0, Y1), HiY = FMath::Max(Y0, Y1);
+			if (HiX < 0 || LoX >= W || HiY < 0 || LoY >= H)
+			{
+				SkipReason(i, TEXT("line entirely out of image bounds"));
+				continue;
+			}
+			DrawLine(X0, Y0, X1, Y1, Thickness, Col);
+			++Applied;
+		}
+		else if (Type.Equals(TEXT("circle"), ESearchCase::IgnoreCase))
+		{
+			const TArray<TSharedPtr<FJsonValue>>* CenterArr = nullptr;
+			int32 CX=0, CY=0;
+			if (!AnnotObj->TryGetArrayField(TEXT("center"), CenterArr) || !ParseIntArray2(CenterArr, CX, CY))
+			{
+				SkipReason(i, TEXT("circle: 'center' must be [x,y] numbers"));
+				continue;
+			}
+			int32 Radius = 0;
+			if (!AnnotObj->TryGetNumberField(TEXT("radius"), Radius) || Radius <= 0)
+			{
+				SkipReason(i, TEXT("circle: 'radius' must be > 0"));
+				continue;
+			}
+			// Whole-OOB check: bbox of circle fully outside image rect.
+			if (CX + Radius < 0 || CX - Radius >= W || CY + Radius < 0 || CY - Radius >= H)
+			{
+				SkipReason(i, TEXT("circle entirely out of image bounds"));
+				continue;
+			}
+			DrawCircle(CX, CY, Radius, Thickness, Col);
+			++Applied;
+		}
+		else if (Type.Equals(TEXT("text"), ESearchCase::IgnoreCase))
+		{
+			// Critique decision: SKIP in v1. Document as the only unsupported type.
+			SkipReason(i, TEXT("text annotation type not supported in v1; available in Wave M+1"));
+			continue;
+		}
+		else
+		{
+			SkipReason(i, TEXT("unknown annotation type; must be one of: box, line, circle"));
+			continue;
+		}
+	}
+
+	// Save the annotated image.
+	FString WriteErr;
+	if (!SHOT_SaveImageAsPNG(Img, AbsOut, WriteErr))
+	{
+		return FMCPToolHelpers::MakeError(Request, kSHOTErrorInternal,
+			FString::Printf(TEXT("output write failed: %s"), *WriteErr));
+	}
+	int64 OutBytes = IFileManager::Get().FileSize(*AbsOut);
+	if (OutBytes < 0) { OutBytes = 0; }
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("output_path"), AbsOut)
+		.Num(TEXT("size_bytes"), static_cast<double>(OutBytes))
+		.Int(TEXT("annotations_applied"), Applied)
+		.Arr(TEXT("annotations_skipped"), Skipped.ToValueArray())
 		.BuildSuccess(Request);
 }
 
@@ -1325,12 +1894,18 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// Wave K (2026-05-22): multi-actor framing + current-selection capture.
 	RegisterTool(TEXT("screenshot.capture_actors"),    &Tool_CaptureActors,    /*Lane A*/ false);
 	RegisterTool(TEXT("screenshot.capture_selection"), &Tool_CaptureSelection, /*Lane A*/ false);
-	// diff — Lane B (pure image compute; no UObject/world access).
+	// diff — Lane B (pure image compute; no UObject/world access). Wave M enhanced with MAE/RMSE/
+	// PSNR + diff_mode (highlight/raw_abs/side_by_side) + PNG-only enforcement + size-mismatch
+	// promoted from "100% diff" to honest -32058 OperationFailed error.
 	RegisterTool(TEXT("screenshot.diff"),            &Tool_Diff,           /*Lane B*/ true);
+	// Wave M (M5) annotate — Lane A initially (file IO); reviewer audits Lane B promotion. Pure
+	// compute eligible (BlendPixel + DrawBox/DrawLine/DrawCircle are no-UObject).
+	RegisterTool(TEXT("screenshot.annotate"),        &Tool_Annotate,       /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Screenshot extended surface registered: 3 screenshot.* tools "
-			 "(high_resolution + region_capture Lane A; diff Lane B), no PIE guard"));
+		TEXT("Screenshot extended surface registered: 6 screenshot.* tools "
+			 "(high_resolution + region_capture + capture_actors + capture_selection + annotate Lane A; "
+			 "diff Lane B; Wave M added annotate + diff enhancements), no PIE guard"));
 }
 
 } // namespace FScreenshotTools

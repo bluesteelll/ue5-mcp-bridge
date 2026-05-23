@@ -708,6 +708,338 @@ FMCPResponse Tool_AssetFindDependents(const FMCPRequest& Request)
 {
 	return AR_RunDependencyQuery(Request, /*bReferencers*/ false, TEXT("dependents"));
 }
+
+// ─── asset.dependency_graph (Wave M M2 — BFS over Package deps + referencers) ────────────────
+//
+// Args:
+//   asset_path   : string (required)         — package path or object path of the root asset
+//   direction?   : "dependencies" (default) | "referencers" | "both"
+//   max_depth?   : int (default 3, clamp [1, 10])
+//   type_filter? : string[]                  — class short-names whitelist (e.g. ["Material","Texture2D"])
+//                                              applied to nodes at depth >= 1 (root always included)
+//   include_engine?: bool (default false)    — when false, skip /Engine/, /Script/, /Game/Developers/
+//   max_nodes?   : int (default 500, clamp [10, 5000])
+//
+// Result:
+//   {
+//     root: string,
+//     direction: "dependencies"|"referencers"|"both",
+//     max_depth: int,
+//     nodes: [{ path: string, depth: int, class: string, package_size_bytes: int }],
+//     edges: [{ from: string, to: string, direction: "dependency"|"referencer" }],
+//     total_nodes: int,
+//     total_edges: int,
+//     truncated_by_depth: bool,
+//     truncated_by_max_nodes: bool
+//   }
+//
+// Errors:
+//   -32004 ObjectNotFound  root asset_path doesn't resolve
+//   -32602 InvalidParams   missing/invalid args
+//
+// Algorithm: BFS from root. Per critique C4, explicitly pass UE::AssetRegistry::EDependencyCategory::Package.
+// Per critique Q3 decision, edges carry an explicit ``direction`` field. ``package_size_bytes`` is
+// best-effort on-disk size (-1 / null when package is in-memory-only, per critique N2).
+//
+// Lane A initially (per critique Q4); reviewer audits Lane B promotion in followup. Auto-register
+// already covers this surface — no change to MCP_REGISTER_SURFACE line needed.
+FMCPResponse Tool_AssetDependencyGraph(const FMCPRequest& Request)
+{
+	FString NormalizedPath;
+	FMCPResponse Err;
+	if (!AR_RequirePath(Request, NormalizedPath, Err)) { return Err; }
+
+	FAssetData RootData;
+	if (!FMCPAssetPathUtils::ResolveAssetData(NormalizedPath, RootData))
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no AssetRegistry entry for '%s'"), *NormalizedPath));
+	}
+
+	// ── Parse direction. ──────────────────────────────────────────────────────────────────────
+	enum class EDir : uint8 { Dependencies, Referencers, Both };
+	EDir Direction = EDir::Dependencies;
+	if (Request.Args.IsValid())
+	{
+		FString DirStr;
+		if (Request.Args->TryGetStringField(TEXT("direction"), DirStr) && !DirStr.IsEmpty())
+		{
+			if (DirStr.Equals(TEXT("dependencies"), ESearchCase::IgnoreCase))
+			{
+				Direction = EDir::Dependencies;
+			}
+			else if (DirStr.Equals(TEXT("referencers"), ESearchCase::IgnoreCase))
+			{
+				Direction = EDir::Referencers;
+			}
+			else if (DirStr.Equals(TEXT("both"), ESearchCase::IgnoreCase))
+			{
+				Direction = EDir::Both;
+			}
+			else
+			{
+				return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+					FString::Printf(TEXT("'direction' must be one of: dependencies, referencers, both (got '%s')"), *DirStr));
+			}
+		}
+	}
+
+	// ── Parse caps. ───────────────────────────────────────────────────────────────────────────
+	int32 MaxDepth = 3;
+	int32 MaxNodes = 500;
+	bool bIncludeEngine = false;
+	TSet<FString> TypeFilter;     // empty = no filter
+	if (Request.Args.IsValid())
+	{
+		int32 RawDepth = MaxDepth;
+		if (Request.Args->TryGetNumberField(TEXT("max_depth"), RawDepth))
+		{
+			MaxDepth = FMath::Clamp(RawDepth, 1, 10);
+		}
+		int32 RawNodes = MaxNodes;
+		if (Request.Args->TryGetNumberField(TEXT("max_nodes"), RawNodes))
+		{
+			MaxNodes = FMath::Clamp(RawNodes, 10, 5000);
+		}
+		Request.Args->TryGetBoolField(TEXT("include_engine"), bIncludeEngine);
+
+		const TArray<TSharedPtr<FJsonValue>>* TypeArr = nullptr;
+		if (Request.Args->TryGetArrayField(TEXT("type_filter"), TypeArr) && TypeArr)
+		{
+			for (const TSharedPtr<FJsonValue>& V : *TypeArr)
+			{
+				FString Cls;
+				if (V.IsValid() && V->TryGetString(Cls) && !Cls.IsEmpty())
+				{
+					TypeFilter.Add(Cls);
+				}
+			}
+		}
+	}
+
+	IAssetRegistry& IAR = FAssetRegistryModule::GetRegistry();
+	const UE::AssetRegistry::EDependencyCategory Category = UE::AssetRegistry::EDependencyCategory::Package;
+	const UE::AssetRegistry::FDependencyQuery Query = UE::AssetRegistry::FDependencyQuery(); // unfiltered Package
+
+	// ── BFS. Nodes keyed by PackageName (FName). ──────────────────────────────────────────────
+	struct FNodeInfo
+	{
+		FName PackageName;
+		int32 Depth;
+		FAssetData Data;          // may be invalid (.IsValid()==false) if AR has no entry — still report the package
+		bool bHasData;
+	};
+	struct FEdgeInfo
+	{
+		FName From;
+		FName To;
+		bool bIsDependency;       // true → "dependency" direction; false → "referencer"
+	};
+
+	auto ShouldSkipForEngineFilter = [bIncludeEngine](const FString& PackageNameStr) -> bool
+	{
+		if (bIncludeEngine) { return false; }
+		return PackageNameStr.StartsWith(TEXT("/Engine/"))
+			|| PackageNameStr.StartsWith(TEXT("/Script/"))
+			|| PackageNameStr.StartsWith(TEXT("/Game/Developers/"));
+	};
+
+	auto MatchesTypeFilter = [&TypeFilter](const FAssetData& Data) -> bool
+	{
+		if (TypeFilter.Num() == 0) { return true; }
+		if (!Data.IsValid()) { return false; }
+		// AssetClassPath::GetAssetName returns FName like "Material" / "Texture2D".
+		return TypeFilter.Contains(Data.AssetClassPath.GetAssetName().ToString());
+	};
+
+	TMap<FName, FNodeInfo> Nodes;
+	TArray<FEdgeInfo> Edges;
+	TQueue<FName> Frontier;
+	bool bTruncatedByDepth = false;
+	bool bTruncatedByMaxNodes = false;
+
+	// Seed with root (always included regardless of include_engine / type_filter — caller asked
+	// for this asset specifically).
+	const FName RootPackage = RootData.PackageName;
+	{
+		FNodeInfo RootInfo;
+		RootInfo.PackageName = RootPackage;
+		RootInfo.Depth = 0;
+		RootInfo.Data = RootData;
+		RootInfo.bHasData = true;
+		Nodes.Add(RootPackage, RootInfo);
+		Frontier.Enqueue(RootPackage);
+	}
+
+	while (!Frontier.IsEmpty())
+	{
+		FName Current;
+		Frontier.Dequeue(Current);
+		const int32 CurDepth = Nodes[Current].Depth;
+
+		if (CurDepth >= MaxDepth)
+		{
+			bTruncatedByDepth = true;
+			continue;
+		}
+
+		auto ProcessHop = [&](bool bDirIsDependencies)
+		{
+			TArray<FAssetDependency> Hop;
+			const FAssetIdentifier Id(Current);
+			if (bDirIsDependencies)
+			{
+				IAR.GetDependencies(Id, Hop, Category, Query);
+			}
+			else
+			{
+				IAR.GetReferencers(Id, Hop, Category, Query);
+			}
+			for (const FAssetDependency& Dep : Hop)
+			{
+				const FName Next = Dep.AssetId.PackageName;
+				if (Next.IsNone()) { continue; }
+
+				// Filter check on the NEXT node (depth >= 1 always). Root already added above
+				// unconditionally; this code only sees children/parents.
+				const FString NextStr = Next.ToString();
+				if (ShouldSkipForEngineFilter(NextStr)) { continue; }
+
+				// Look up AR data for the next package (may be invalid for stale-/script-deps).
+				FAssetData NextData;
+				bool bHasData = false;
+				{
+					const FString ObjectPath = FString::Printf(TEXT("%s.%s"),
+						*NextStr, *FPackageName::GetShortName(NextStr));
+					NextData = IAR.GetAssetByObjectPath(FSoftObjectPath(ObjectPath),
+						/*bIncludeOnlyOnDiskAssets*/ false);
+					bHasData = NextData.IsValid();
+				}
+
+				// Type-filter applies to depth >= 1 nodes only (root always present).
+				if (!MatchesTypeFilter(NextData)) { continue; }
+
+				// Add the node if not already visited.
+				FNodeInfo* Existing = Nodes.Find(Next);
+				if (!Existing)
+				{
+					if (Nodes.Num() >= MaxNodes)
+					{
+						bTruncatedByMaxNodes = true;
+						// Do NOT add the node, do NOT emit the edge — we'd produce an edge with no
+						// matching node which makes the graph malformed.
+						continue;
+					}
+					FNodeInfo NewInfo;
+					NewInfo.PackageName = Next;
+					NewInfo.Depth = CurDepth + 1;
+					NewInfo.Data = NextData;
+					NewInfo.bHasData = bHasData;
+					Nodes.Add(Next, NewInfo);
+					Frontier.Enqueue(Next);
+				}
+
+				// Emit edge (always — duplicates possible across direction passes in "both" mode,
+				// but distinct direction fields prevent collapse).
+				FEdgeInfo E;
+				if (bDirIsDependencies)
+				{
+					E.From = Current;
+					E.To   = Next;
+				}
+				else
+				{
+					E.From = Next;       // referencer points TO current
+					E.To   = Current;
+				}
+				E.bIsDependency = bDirIsDependencies;
+				Edges.Add(E);
+			}
+		};
+
+		if (Direction == EDir::Dependencies || Direction == EDir::Both)
+		{
+			ProcessHop(/*bDirIsDependencies*/ true);
+		}
+		if (Direction == EDir::Referencers || Direction == EDir::Both)
+		{
+			ProcessHop(/*bDirIsDependencies*/ false);
+		}
+	}
+
+	// ── Build response. Sort nodes by depth then path for stable output. ──────────────────────
+	TArray<FNodeInfo> SortedNodes;
+	SortedNodes.Reserve(Nodes.Num());
+	for (const TPair<FName, FNodeInfo>& Pair : Nodes)
+	{
+		SortedNodes.Add(Pair.Value);
+	}
+	SortedNodes.Sort([](const FNodeInfo& A, const FNodeInfo& B)
+	{
+		if (A.Depth != B.Depth) return A.Depth < B.Depth;
+		return A.PackageName.LexicalLess(B.PackageName);
+	});
+
+	FMCPJsonArrayBuilder NodesArr;
+	for (const FNodeInfo& Info : SortedNodes)
+	{
+		const FString PkgStr = Info.PackageName.ToString();
+		const FString ClassStr = Info.bHasData ? Info.Data.AssetClassPath.ToString() : FString();
+
+		// Best-effort on-disk package size (-1 if not on disk / in-memory only).
+		int64 PackageBytes = -1;
+		{
+			FString Filename;
+			if (FPackageName::DoesPackageExist(PkgStr, &Filename))
+			{
+				const int64 Sz = IFileManager::Get().FileSize(*Filename);
+				if (Sz >= 0) { PackageBytes = Sz; }
+			}
+		}
+
+		TSharedRef<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+		NodeObj->SetStringField(TEXT("path"), PkgStr);
+		NodeObj->SetNumberField(TEXT("depth"), Info.Depth);
+		NodeObj->SetStringField(TEXT("class"), ClassStr);
+		if (PackageBytes >= 0)
+		{
+			NodeObj->SetNumberField(TEXT("package_size_bytes"), static_cast<double>(PackageBytes));
+		}
+		else
+		{
+			NodeObj->SetField(TEXT("package_size_bytes"), MakeShared<FJsonValueNull>());
+		}
+		NodesArr.AddValue(MakeShared<FJsonValueObject>(NodeObj));
+	}
+
+	FMCPJsonArrayBuilder EdgesArr;
+	for (const FEdgeInfo& E : Edges)
+	{
+		TSharedRef<FJsonObject> EdgeObj = MakeShared<FJsonObject>();
+		EdgeObj->SetStringField(TEXT("from"), E.From.ToString());
+		EdgeObj->SetStringField(TEXT("to"), E.To.ToString());
+		EdgeObj->SetStringField(TEXT("direction"),
+			E.bIsDependency ? TEXT("dependency") : TEXT("referencer"));
+		EdgesArr.AddValue(MakeShared<FJsonValueObject>(EdgeObj));
+	}
+
+	const TCHAR* DirStr =
+		(Direction == EDir::Dependencies) ? TEXT("dependencies") :
+		(Direction == EDir::Referencers)  ? TEXT("referencers")  : TEXT("both");
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("root"), RootData.PackageName.ToString())
+		.Str(TEXT("direction"), DirStr)
+		.Int(TEXT("max_depth"), MaxDepth)
+		.Arr(TEXT("nodes"), NodesArr.ToValueArray())
+		.Arr(TEXT("edges"), EdgesArr.ToValueArray())
+		.Int(TEXT("total_nodes"), Nodes.Num())
+		.Int(TEXT("total_edges"), Edges.Num())
+		.Bool(TEXT("truncated_by_depth"), bTruncatedByDepth)
+		.Bool(TEXT("truncated_by_max_nodes"), bTruncatedByMaxNodes)
+		.BuildSuccess(Request);
+}
+
 // ─── asset.search_by_class ───────────────────────────────────────────────────────────────────
 FMCPResponse Tool_AssetSearchByClass(const FMCPRequest& Request)
 {
@@ -1845,7 +2177,11 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// Generic asset creation for any UClass (UFactoryNew + NewObject fallback).
 	RegisterTool(TEXT("asset.create"),                  &Tool_AssetCreate,                /*Lane A*/          false);
 
-	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 13 asset.* handlers (all Lane A — UE 5.7 AR not thread-safe)"));
+	// Wave M (M2) — recursive dep/referencer graph (BFS). All Lane A per critique Q4 ("ship working
+	// tools first, optimise threading separately"); reviewer audits Lane B promotion in followup.
+	RegisterTool(TEXT("asset.dependency_graph"),        &Tool_AssetDependencyGraph,       /*Lane A*/          false);
+
+	UE_LOG(LogMCP, Log, TEXT("Phase 2 hotfix: registered 14 asset.* handlers (all Lane A — UE 5.7 AR not thread-safe; Wave M added dependency_graph)"));
 }
 
 } // namespace FAssetRegistryTools

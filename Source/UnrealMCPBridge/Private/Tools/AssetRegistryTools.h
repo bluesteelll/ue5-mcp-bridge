@@ -49,4 +49,7 @@ namespace FAssetRegistryTools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_AssetGetClassHierarchy(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_AssetIsDirty(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_AssetGetOutermostPackage(const FMCPRequest& Request);
+
+	// ─── Wave M (M2) — recursive dep/referencer graph (BFS) ────────────────────────────────────
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AssetDependencyGraph(const FMCPRequest& Request);
 }

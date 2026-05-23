@@ -60,4 +60,7 @@ namespace FScreenshotTools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_HighResolution(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_RegionCapture(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_Diff(const FMCPRequest& Request);
+
+	// Wave M (M5) — pixel annotation overlay (box/line/circle).
+	UNREALMCPBRIDGE_API FMCPResponse Tool_Annotate(const FMCPRequest& Request);
 }
