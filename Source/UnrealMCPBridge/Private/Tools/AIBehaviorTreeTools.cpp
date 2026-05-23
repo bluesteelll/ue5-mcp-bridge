@@ -7,6 +7,7 @@
 #include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
+#include "MCPClassResolver.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -474,52 +475,9 @@ namespace
 		return false;
 	}
 
-	/**
-	 * Resolve a class path string to a UClass*, verifying descent from BaseClass.
-	 * Tries verbatim path, then "_C" suffix. Returns nullptr + OutError on failure.
-	 * Shared shape with AIEQS_ResolveSubclassOf but kept per-surface to avoid header bloat.
-	 */
-	UClass* AIBT_ResolveSubclassOf(const FString& ClassPath, UClass* BaseClass, FString& OutError)
-	{
-		if (ClassPath.IsEmpty())
-		{
-			OutError = TEXT("class path is empty");
-			return nullptr;
-		}
-		if (!ClassPath.StartsWith(TEXT("/")) || ClassPath.Contains(TEXT("\\")))
-		{
-			OutError = FString::Printf(
-				TEXT("class path '%s' must start with '/' and use forward slashes only"), *ClassPath);
-			return nullptr;
-		}
-
-		UClass* Resolved = LoadClass<UObject>(nullptr, *ClassPath);
-		if (!Resolved)
-		{
-			const FString WithC = ClassPath.EndsWith(TEXT("_C")) ? ClassPath : (ClassPath + TEXT("_C"));
-			Resolved = LoadClass<UObject>(nullptr, *WithC);
-		}
-		if (!Resolved)
-		{
-			OutError = FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath);
-			return nullptr;
-		}
-		if (Resolved->HasAnyClassFlags(CLASS_Abstract))
-		{
-			OutError = FString::Printf(TEXT("class '%s' is abstract — cannot instantiate"),
-				*Resolved->GetPathName());
-			return nullptr;
-		}
-		if (BaseClass && !Resolved->IsChildOf(BaseClass))
-		{
-			OutError = FString::Printf(
-				TEXT("class '%s' is not a subclass of '%s' (got family '%s')"),
-				*Resolved->GetPathName(), *BaseClass->GetPathName(),
-				Resolved->GetSuperClass() ? *Resolved->GetSuperClass()->GetPathName() : TEXT("?"));
-			return nullptr;
-		}
-		return Resolved;
-	}
+	// AIBT_ResolveSubclassOf removed; replaced by FMCPClassResolver::Resolve (Wave Q2).
+	// Default options match the prior behaviour: bRequirePathPrefix=true, bTryClassSuffix=true,
+	// bRejectAbstract=true, bRejectDeprecated=true. Caller passes BaseClass via Options.BaseClass.
 
 	// AIBT_ApplyProperties removed; replaced by FMCPToolHelpers::ApplyJsonProperties (Wave Q1).
 
@@ -973,7 +931,7 @@ FMCPResponse Tool_CreateAsset(const FMCPRequest& Request)
 	if (bRootRequested)
 	{
 		FString ResolveErr;
-		RootClass = AIBT_ResolveSubclassOf(RootClassPath, UBTCompositeNode::StaticClass(), ResolveErr);
+		RootClass = FMCPClassResolver::ResolveStrict(RootClassPath, UBTCompositeNode::StaticClass(), ResolveErr);
 		if (!RootClass)
 		{
 			if (ResolveErr.Contains(TEXT("is not a subclass")))
@@ -1079,7 +1037,7 @@ FMCPResponse Tool_AddNode(const FMCPRequest& Request)
 
 	// Resolve node class. Must be UBTNode (will be further restricted to Composite/Task below).
 	FString ResolveErr;
-	UClass* NodeClass = AIBT_ResolveSubclassOf(NodeClassPath, UBTNode::StaticClass(), ResolveErr);
+	UClass* NodeClass = FMCPClassResolver::ResolveStrict(NodeClassPath, UBTNode::StaticClass(), ResolveErr);
 	if (!NodeClass)
 	{
 		if (ResolveErr.Contains(TEXT("is not a subclass")))
@@ -1238,7 +1196,7 @@ FMCPResponse Tool_AddDecorator(const FMCPRequest& Request)
 	if (!BT) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
 
 	FString ResolveErr;
-	UClass* DecClass = AIBT_ResolveSubclassOf(DecClassPath, UBTDecorator::StaticClass(), ResolveErr);
+	UClass* DecClass = FMCPClassResolver::ResolveStrict(DecClassPath, UBTDecorator::StaticClass(), ResolveErr);
 	if (!DecClass)
 	{
 		if (ResolveErr.Contains(TEXT("is not a subclass")))
@@ -1354,7 +1312,7 @@ FMCPResponse Tool_AddService(const FMCPRequest& Request)
 	if (!BT) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
 
 	FString ResolveErr;
-	UClass* SvcClass = AIBT_ResolveSubclassOf(SvcClassPath, UBTService::StaticClass(), ResolveErr);
+	UClass* SvcClass = FMCPClassResolver::ResolveStrict(SvcClassPath, UBTService::StaticClass(), ResolveErr);
 	if (!SvcClass)
 	{
 		if (ResolveErr.Contains(TEXT("is not a subclass")))

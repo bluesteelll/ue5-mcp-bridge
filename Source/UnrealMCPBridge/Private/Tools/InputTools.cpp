@@ -8,6 +8,7 @@
 #include "MCPAssetLoader.h"
 #include "MCPJsonBuilder.h"
 #include "MCPToolHelpers.h"
+#include "MCPClassResolver.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -246,12 +247,10 @@ namespace
 
 	/**
 	 * Strip the conventional ``InputTrigger`` / ``InputModifier`` prefix from a UClass name so the
-	 * remainder is a short alias the caller can pass instead of a full path. Mirrors the convention
-	 * used in the Editor's pin-class dropdown which displays the meta=(DisplayName=...) value but
-	 * still accepts the stripped C++ name for search.
-	 *
-	 * Returns the stripped form (e.g. ``"Hold"`` for ``"InputTriggerHold"``). If neither prefix
-	 * matches, returns the input string unchanged.
+	 * remainder is a short alias the caller can pass instead of a full path. Retained as a tiny
+	 * file-static utility for ``INP_BuildClassSummary`` (discovery response's ``short_name`` field).
+	 * The class-resolution path now delegates to FMCPClassResolver::Resolve which takes the same
+	 * prefix as a TCHAR* — this helper keeps the per-base-class encoding in one place.
 	 */
 	FString INP_StripSubclassPrefix(UClass* BaseClass, const FString& Name)
 	{
@@ -268,79 +267,28 @@ namespace
 	}
 
 	/**
-	 * Resolve a trigger/modifier UClass from one of three identifier forms:
-	 *   1. ``/Script/EnhancedInput.InputTriggerHold`` — full class path; LoadClass round-trip.
-	 *   2. ``/Game/...`` or other mount-prefixed path — Blueprint-generated class lookup.
-	 *   3. Short name (case-insensitive) — matched against DisplayName meta first, then stripped
-	 *      C++ name (``"Hold"`` for ``UInputTriggerHold``), then full C++ name.
+	 * Trigger/modifier class resolver — thin wrapper around the shared FMCPClassResolver::Resolve
+	 * (Wave Q2). Picks the correct strip prefix per BaseClass and enables short-name lookup so AI
+	 * callers can pass "Hold" / "DeadZone" instead of "/Script/EnhancedInput.InputTriggerHold".
 	 *
-	 * Returns nullptr on failure; populates ``OutError`` with a diagnostic the caller surfaces as
-	 * a -32602 InvalidParams response. Refuses abstract / deprecated classes (cannot be
-	 * instantiated). Refuses classes flagged ``HideDropdown`` (Editor convention: not user-facing —
-	 * e.g. ``UInputTriggerChordBlocker`` which is auto-spawned by the chord system).
-	 *
-	 * BaseClass must be either ``UInputTrigger::StaticClass()`` or ``UInputModifier::StaticClass()``.
+	 * INP_ResolveSubclass body was inlined into the shared helper in Wave Q2 — this wrapper
+	 * remains for call-site stability (4 call sites unchanged) and to keep the per-base-class
+	 * strip-prefix encoding here next to the EnhancedInput includes.
 	 */
 	UClass* INP_ResolveSubclass(UClass* BaseClass, const FString& Identifier, FString& OutError)
 	{
 		check(BaseClass);
+		const TCHAR* StripPrefix = (BaseClass == UInputTrigger::StaticClass())
+			? TEXT("InputTrigger")
+			: (BaseClass == UInputModifier::StaticClass() ? TEXT("InputModifier") : nullptr);
 
-		if (Identifier.IsEmpty())
-		{
-			OutError = TEXT("identifier is empty");
-			return nullptr;
-		}
-
-		// Path form (/Script/... or /Game/... or any /<Mount>/...).
-		if (Identifier.StartsWith(TEXT("/")))
-		{
-			UClass* Found = LoadClass<UObject>(nullptr, *Identifier);
-			if (!Found)
-			{
-				OutError = FString::Printf(TEXT("class '%s' not loadable as a UClass"), *Identifier);
-				return nullptr;
-			}
-			if (!Found->IsChildOf(BaseClass))
-			{
-				OutError = FString::Printf(TEXT("class '%s' is not a subclass of %s"),
-					*Identifier, *BaseClass->GetName());
-				return nullptr;
-			}
-			if (Found->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated))
-			{
-				OutError = FString::Printf(TEXT("class '%s' is abstract or deprecated — cannot instantiate"),
-					*Identifier);
-				return nullptr;
-			}
-			return Found;
-		}
-
-		// Short-name form — iterate every UClass derived from BaseClass.
-		for (TObjectIterator<UClass> It; It; ++It)
-		{
-			UClass* C = *It;
-			if (!C || !C->IsChildOf(BaseClass) || C == BaseClass) { continue; }
-			if (C->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)) { continue; }
-			if (C->HasMetaData(TEXT("HideDropdown"))) { continue; }
-
-			const FString DisplayName = C->GetMetaData(TEXT("DisplayName"));
-			const FString Name        = C->GetName();
-			const FString Stripped    = INP_StripSubclassPrefix(BaseClass, Name);
-
-			if (Identifier.Equals(DisplayName, ESearchCase::IgnoreCase) ||
-				Identifier.Equals(Stripped,    ESearchCase::IgnoreCase) ||
-				Identifier.Equals(Name,        ESearchCase::IgnoreCase))
-			{
-				return C;
-			}
-		}
-
-		OutError = FString::Printf(
-			TEXT("class '%s' not found; use full path '/Script/EnhancedInput.Input%s<X>' or short name "
-				"like 'Hold' / 'DeadZone'"),
-			*Identifier,
-			BaseClass == UInputTrigger::StaticClass() ? TEXT("Trigger") : TEXT("Modifier"));
-		return nullptr;
+		FMCPClassResolveOptions Opts;
+		Opts.BaseClass             = BaseClass;
+		Opts.bAllowShortName       = true;
+		Opts.bTryClassSuffix       = false;  // trigger/modifier classes are native — no _C suffix
+		Opts.bRequirePathPrefix    = false;  // short-name mode disables prefix requirement
+		Opts.ShortNameStripPrefix  = StripPrefix;
+		return FMCPClassResolver::Resolve(Identifier, Opts, OutError);
 	}
 
 	/**

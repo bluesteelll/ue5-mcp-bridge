@@ -7,6 +7,7 @@
 #include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
+#include "MCPClassResolver.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPActorPathUtils.h"
 #include "Utils/MCPAssetPathUtils.h"
@@ -58,47 +59,7 @@ namespace
 	 * Tries the path verbatim first, then with a "_C" suffix (Blueprint generated class convention).
 	 * Returns nullptr + populates OutError on any failure mode.
 	 */
-	UClass* AIEQS_ResolveSubclassOf(const FString& ClassPath, UClass* BaseClass, FString& OutError)
-	{
-		if (ClassPath.IsEmpty())
-		{
-			OutError = TEXT("class path is empty");
-			return nullptr;
-		}
-		if (!ClassPath.StartsWith(TEXT("/")) || ClassPath.Contains(TEXT("\\")))
-		{
-			OutError = FString::Printf(
-				TEXT("class path '%s' must start with '/' and use forward slashes only"), *ClassPath);
-			return nullptr;
-		}
-
-		UClass* Resolved = LoadClass<UObject>(nullptr, *ClassPath);
-		if (!Resolved)
-		{
-			const FString WithC = ClassPath.EndsWith(TEXT("_C")) ? ClassPath : (ClassPath + TEXT("_C"));
-			Resolved = LoadClass<UObject>(nullptr, *WithC);
-		}
-		if (!Resolved)
-		{
-			OutError = FString::Printf(TEXT("could not LoadClass '%s' (also tried _C suffix)"), *ClassPath);
-			return nullptr;
-		}
-		if (Resolved->HasAnyClassFlags(CLASS_Abstract))
-		{
-			OutError = FString::Printf(TEXT("class '%s' is abstract — cannot instantiate"),
-				*Resolved->GetPathName());
-			return nullptr;
-		}
-		if (BaseClass && !Resolved->IsChildOf(BaseClass))
-		{
-			OutError = FString::Printf(
-				TEXT("class '%s' is not a subclass of '%s' (got family '%s')"),
-				*Resolved->GetPathName(), *BaseClass->GetPathName(),
-				Resolved->GetSuperClass() ? *Resolved->GetSuperClass()->GetPathName() : TEXT("?"));
-			return nullptr;
-		}
-		return Resolved;
-	}
+	// AIEQS_ResolveSubclassOf removed; replaced by FMCPClassResolver::Resolve (Wave Q2).
 
 	// AIEQS_ApplyProperties removed; replaced by FMCPToolHelpers::ApplyJsonProperties (Wave Q1).
 } // namespace
@@ -591,7 +552,7 @@ FMCPResponse Tool_AddGenerator(const FMCPRequest& Request)
 	if (!Query) { return FMCPToolHelpers::MakeError(Request, LoadErr, LoadMsg); }
 
 	FString ResolveErr;
-	UClass* GenClass = AIEQS_ResolveSubclassOf(GeneratorClassPath, UEnvQueryGenerator::StaticClass(), ResolveErr);
+	UClass* GenClass = FMCPClassResolver::ResolveStrict(GeneratorClassPath, UEnvQueryGenerator::StaticClass(), ResolveErr);
 	if (!GenClass)
 	{
 		// Distinguish family mismatch from "class not found" / "syntactically invalid". The string
@@ -699,7 +660,7 @@ FMCPResponse Tool_AddTest(const FMCPRequest& Request)
 	}
 
 	FString ResolveErr;
-	UClass* TestClass = AIEQS_ResolveSubclassOf(TestClassPath, UEnvQueryTest::StaticClass(), ResolveErr);
+	UClass* TestClass = FMCPClassResolver::ResolveStrict(TestClassPath, UEnvQueryTest::StaticClass(), ResolveErr);
 	if (!TestClass)
 	{
 		if (ResolveErr.Contains(TEXT("is not a subclass")))

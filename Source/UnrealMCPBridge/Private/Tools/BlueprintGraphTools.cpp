@@ -8,6 +8,7 @@
 #include "MCPJsonBuilder.h"
 #include "MCPMutatorScope.h"
 #include "MCPToolHelpers.h"
+#include "MCPClassResolver.h"
 #include "UnrealMCPBridge.h"
 #include "Utils/MCPBlueprintUtils.h"
 #include "Utils/MCPPinTypeUtils.h"
@@ -160,33 +161,10 @@ namespace
 	 * caller wraps in its own ``MakeError`` call with the appropriate code (the caller knows whether
 	 * the failure should map to -32020 ClassNotFound or -32011 WrongClass).
 	 */
-	UClass* BPG_ResolveClass(const FString& Path, UClass* BaseClass, FString& OutError)
-	{
-		if (Path.IsEmpty())
-		{
-			OutError = TEXT("class path is empty");
-			return nullptr;
-		}
-		UClass* Resolved = LoadObject<UClass>(nullptr, *Path);
-		if (!Resolved)
-		{
-			// LoadClass<T> retries with the ``_C`` suffix for Blueprint generated classes — try
-			// that path too so callers can use either ``/Game/Foo/BP_X`` or ``/Game/Foo/BP_X.BP_X_C``.
-			Resolved = LoadObject<UClass>(nullptr, *(Path + TEXT("_C")));
-		}
-		if (!Resolved)
-		{
-			OutError = FString::Printf(TEXT("class '%s' could not be loaded"), *Path);
-			return nullptr;
-		}
-		if (BaseClass && !Resolved->IsChildOf(BaseClass))
-		{
-			OutError = FString::Printf(TEXT("class '%s' is not a subclass of '%s'"),
-				*Path, *BaseClass->GetName());
-			return nullptr;
-		}
-		return Resolved;
-	}
+	// BPG_ResolveClass removed; replaced by FMCPClassResolver::Resolve (Wave Q2).
+	// Lenient options: bRejectAbstract=false (cast TargetType / generic ClassRef pins accept
+	// abstract bases like AActor); bRequirePathPrefix=false (BPG was tolerant of unprefixed
+	// names historically; the shared helper's default is stricter, so we opt out here).
 
 	/**
 	 * Common K2-node post-construction: AddNode + CreateNewGuid + PostPlacedNewNode +
@@ -1467,7 +1445,7 @@ FMCPResponse Tool_AddCastNode(const FMCPRequest& Request)
 	}
 
 	FString ResolveErr;
-	UClass* TargetClass = BPG_ResolveClass(TargetClassPath, UObject::StaticClass(), ResolveErr);
+	UClass* TargetClass = FMCPClassResolver::ResolveLenient(TargetClassPath, UObject::StaticClass(), ResolveErr);
 	if (!TargetClass)
 	{
 		// Distinguish "not loadable" from "not a UObject subclass" — both map to the same JSON-RPC
