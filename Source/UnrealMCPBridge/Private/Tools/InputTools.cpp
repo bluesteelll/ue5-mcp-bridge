@@ -35,6 +35,8 @@
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UObjectIterator.h"
+#include "Utils/MCPReflection.h"
 #include "Kismet/GameplayStatics.h"
 
 #include "Dom/JsonObject.h"
@@ -236,6 +238,234 @@ namespace
 		}
 
 		return FMCPToolHelpers::MakeSuccessObj(Request, Out);
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────────────────────────
+	// Wave N+1 helpers — trigger/modifier subclass resolution + JSON property apply.
+	// ──────────────────────────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Strip the conventional ``InputTrigger`` / ``InputModifier`` prefix from a UClass name so the
+	 * remainder is a short alias the caller can pass instead of a full path. Mirrors the convention
+	 * used in the Editor's pin-class dropdown which displays the meta=(DisplayName=...) value but
+	 * still accepts the stripped C++ name for search.
+	 *
+	 * Returns the stripped form (e.g. ``"Hold"`` for ``"InputTriggerHold"``). If neither prefix
+	 * matches, returns the input string unchanged.
+	 */
+	FString INP_StripSubclassPrefix(UClass* BaseClass, const FString& Name)
+	{
+		FString Stripped = Name;
+		if (BaseClass == UInputTrigger::StaticClass())
+		{
+			Stripped.RemoveFromStart(TEXT("InputTrigger"));
+		}
+		else if (BaseClass == UInputModifier::StaticClass())
+		{
+			Stripped.RemoveFromStart(TEXT("InputModifier"));
+		}
+		return Stripped;
+	}
+
+	/**
+	 * Resolve a trigger/modifier UClass from one of three identifier forms:
+	 *   1. ``/Script/EnhancedInput.InputTriggerHold`` — full class path; LoadClass round-trip.
+	 *   2. ``/Game/...`` or other mount-prefixed path — Blueprint-generated class lookup.
+	 *   3. Short name (case-insensitive) — matched against DisplayName meta first, then stripped
+	 *      C++ name (``"Hold"`` for ``UInputTriggerHold``), then full C++ name.
+	 *
+	 * Returns nullptr on failure; populates ``OutError`` with a diagnostic the caller surfaces as
+	 * a -32602 InvalidParams response. Refuses abstract / deprecated classes (cannot be
+	 * instantiated). Refuses classes flagged ``HideDropdown`` (Editor convention: not user-facing —
+	 * e.g. ``UInputTriggerChordBlocker`` which is auto-spawned by the chord system).
+	 *
+	 * BaseClass must be either ``UInputTrigger::StaticClass()`` or ``UInputModifier::StaticClass()``.
+	 */
+	UClass* INP_ResolveSubclass(UClass* BaseClass, const FString& Identifier, FString& OutError)
+	{
+		check(BaseClass);
+
+		if (Identifier.IsEmpty())
+		{
+			OutError = TEXT("identifier is empty");
+			return nullptr;
+		}
+
+		// Path form (/Script/... or /Game/... or any /<Mount>/...).
+		if (Identifier.StartsWith(TEXT("/")))
+		{
+			UClass* Found = LoadClass<UObject>(nullptr, *Identifier);
+			if (!Found)
+			{
+				OutError = FString::Printf(TEXT("class '%s' not loadable as a UClass"), *Identifier);
+				return nullptr;
+			}
+			if (!Found->IsChildOf(BaseClass))
+			{
+				OutError = FString::Printf(TEXT("class '%s' is not a subclass of %s"),
+					*Identifier, *BaseClass->GetName());
+				return nullptr;
+			}
+			if (Found->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated))
+			{
+				OutError = FString::Printf(TEXT("class '%s' is abstract or deprecated — cannot instantiate"),
+					*Identifier);
+				return nullptr;
+			}
+			return Found;
+		}
+
+		// Short-name form — iterate every UClass derived from BaseClass.
+		for (TObjectIterator<UClass> It; It; ++It)
+		{
+			UClass* C = *It;
+			if (!C || !C->IsChildOf(BaseClass) || C == BaseClass) { continue; }
+			if (C->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)) { continue; }
+			if (C->HasMetaData(TEXT("HideDropdown"))) { continue; }
+
+			const FString DisplayName = C->GetMetaData(TEXT("DisplayName"));
+			const FString Name        = C->GetName();
+			const FString Stripped    = INP_StripSubclassPrefix(BaseClass, Name);
+
+			if (Identifier.Equals(DisplayName, ESearchCase::IgnoreCase) ||
+				Identifier.Equals(Stripped,    ESearchCase::IgnoreCase) ||
+				Identifier.Equals(Name,        ESearchCase::IgnoreCase))
+			{
+				return C;
+			}
+		}
+
+		OutError = FString::Printf(
+			TEXT("class '%s' not found; use full path '/Script/EnhancedInput.Input%s<X>' or short name "
+				"like 'Hold' / 'DeadZone'"),
+			*Identifier,
+			BaseClass == UInputTrigger::StaticClass() ? TEXT("Trigger") : TEXT("Modifier"));
+		return nullptr;
+	}
+
+	/**
+	 * Find the first FEnhancedActionKeyMapping whose ``(Action, Key)`` matches the supplied pair in
+	 * the IMC's DefaultKeyMappings.Mappings array. Returns ``INDEX_NONE`` if not found.
+	 *
+	 * NOTE: When multiple mappings share the same (IA, Key) — UE permits this — only the FIRST is
+	 * returned. Documented in the tool-level header.
+	 */
+	int32 INP_FindMappingIndex(UInputMappingContext* IMC, const UInputAction* IA, FKey Key)
+	{
+		check(IMC);
+		check(IA);
+		const TArray<FEnhancedActionKeyMapping>& Mappings = IMC->GetMappings();
+		for (int32 i = 0; i < Mappings.Num(); ++i)
+		{
+			if (Mappings[i].Action == IA && Mappings[i].Key == Key)
+			{
+				return i;
+			}
+		}
+		return INDEX_NONE;
+	}
+
+	/**
+	 * Apply a JSON-object dict of property values onto a freshly-created subobject via
+	 * ``FMCPReflection::WritePropertyValue``. Populates ``OutApplied`` with successfully-written
+	 * property names and ``OutSkipped`` with names that were either not found on the class or
+	 * rejected by the marshalling layer (type mismatch). Returns the count of successful writes.
+	 *
+	 * The subobject is brand-new (just-constructed via ``NewObject``) so there are no editor
+	 * observers — no PreEditChange/PostEditChange dance needed for each field. The outer
+	 * ``FMCPMutatorScope`` already owns the transaction.
+	 */
+	int32 INP_ApplyProperties(
+		UObject* Target,
+		const TSharedPtr<FJsonObject>& Props,
+		TArray<FString>& OutApplied,
+		TArray<FString>& OutSkipped)
+	{
+		check(Target);
+		if (!Props.IsValid()) { return 0; }
+
+		int32 Applied = 0;
+		UClass* Cls = Target->GetClass();
+		check(Cls);
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
+		{
+			FProperty* Prop = Cls->FindPropertyByName(*Pair.Key);
+			if (!Prop)
+			{
+				OutSkipped.Add(Pair.Key);
+				continue;
+			}
+			FString WriteErr;
+			if (FMCPReflection::WritePropertyValue(Target, Prop, Pair.Value, WriteErr))
+			{
+				OutApplied.Add(Pair.Key);
+				++Applied;
+			}
+			else
+			{
+				UE_LOG(LogMCP, Verbose, TEXT("INP_ApplyProperties: skip '%s' on %s — %s"),
+					*Pair.Key, *Cls->GetName(), *WriteErr);
+				OutSkipped.Add(Pair.Key);
+			}
+		}
+		return Applied;
+	}
+
+	/**
+	 * Build a JSON summary describing a concrete UInputTrigger/UInputModifier subclass: class path,
+	 * short alias, display name, base class, blueprint/abstract flags, and a list of CDO-defaulted
+	 * editable properties (each ``{name, type, default}``).
+	 *
+	 * Only properties with the ``CPF_Edit`` flag (i.e. visible in the Details panel) are emitted —
+	 * runtime-only state like ``UInputTrigger::LastValue`` (BlueprintReadOnly without EditAnywhere)
+	 * is omitted to keep the response payload focused on what the caller can actually configure.
+	 */
+	TSharedRef<FJsonObject> INP_BuildClassSummary(UClass* C, UClass* BaseClass)
+	{
+		check(C);
+		check(BaseClass);
+
+		TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+
+		const FString Name        = C->GetName();
+		const FString DisplayName = C->GetMetaData(TEXT("DisplayName"));
+		const FString Stripped    = INP_StripSubclassPrefix(BaseClass, Name);
+
+		Out->SetStringField(TEXT("class_path"),   C->GetPathName());
+		Out->SetStringField(TEXT("short_name"),   Stripped);
+		Out->SetStringField(TEXT("display_name"), DisplayName.IsEmpty() ? Stripped : DisplayName);
+		Out->SetStringField(TEXT("base_class"),
+			C->GetSuperClass() ? C->GetSuperClass()->GetPathName() : FString());
+		Out->SetBoolField(TEXT("is_blueprint"), C->ClassGeneratedBy != nullptr);
+		Out->SetBoolField(TEXT("is_abstract"),  C->HasAnyClassFlags(CLASS_Abstract));
+
+		// Read CDO defaults via reflection. CDO is guaranteed non-null for any concrete UClass.
+		UObject* CDO = C->GetDefaultObject();
+		check(CDO);
+
+		TArray<TSharedPtr<FJsonValue>> PropArr;
+		for (TFieldIterator<FProperty> It(C); It; ++It)
+		{
+			FProperty* Prop = *It;
+			if (!Prop) { continue; }
+			// Editable-only filter — skips internal state like LastValue / HeldDuration / TriggerCount.
+			if (!Prop->HasAnyPropertyFlags(CPF_Edit)) { continue; }
+
+			TSharedRef<FJsonObject> PObj = MakeShared<FJsonObject>();
+			PObj->SetStringField(TEXT("name"), Prop->GetName());
+			PObj->SetStringField(TEXT("type"), FMCPReflection::DescribePropertyType(Prop));
+
+			TSharedPtr<FJsonValue> Default = FMCPReflection::ReadPropertyValue(CDO, Prop);
+			if (Default.IsValid())
+			{
+				PObj->SetField(TEXT("default"), Default);
+			}
+			PropArr.Add(MakeShared<FJsonValueObject>(PObj));
+		}
+		Out->SetArrayField(TEXT("properties"), PropArr);
+
+		return Out;
 	}
 } // namespace
 
@@ -885,6 +1115,720 @@ FMCPResponse Tool_AddContextToPlayer(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// ─── Wave N+1: Trigger/Modifier Authoring (10 tools) ──────────────────────────────────────────────
+//
+// Closes the per-binding and per-IA trigger/modifier configuration gap. Wave E shipped read-only
+// introspection (``get_context_bindings`` surfaces class names of currently-attached triggers /
+// modifiers) and Wave N shipped the IA/IMC/mapping CRUD; Wave N+1 layers the inner array CRUD on
+// top so a caller can fully author input mappings without opening the editor.
+//
+// **Two scopes** where triggers/modifiers live (mirroring the engine's UPROPERTY layout):
+//   1. IA-level: ``UInputAction::Triggers`` / ``UInputAction::Modifiers`` — applies to EVERY
+//      binding of that IA. Lives on the IA asset.
+//   2. Mapping-level: ``FEnhancedActionKeyMapping::Triggers`` / ``Modifiers`` — applies only to
+//      one specific (IA, Key) binding. Lives inside the IMC asset's
+//      ``DefaultKeyMappings.Mappings`` array.
+//
+// Both arrays are ``TArray<TObjectPtr<UInput[Trigger|Modifier]>>`` with the ``Instanced`` UPROPERTY
+// meta flag — they OWN their subobjects. Subobjects are created via
+// ``NewObject<...>(Owner, Class, NAME_None, RF_Public | RF_Transactional)`` with Owner = IMC or IA
+// so the Instanced semantics hold and undo/redo works.
+//
+// **Discovery tools (1, 2)** are Lane A only because ``TObjectIterator<UClass>`` plus CDO property
+// reads require the game thread. They could be promoted to Lane B post-audit (read-only + no
+// UObject mutation), but the cost is low enough that lane consistency wins.
+//
+// **CRUD tools (3-10)** all use the proven Wave N pattern: ``FMCPMutatorScope`` + ``Asset->Modify()``
+// + ``Scope.DirtyPackage()``. The single outer transaction owns undo; ``NewObject`` with
+// ``RF_Transactional`` makes the orphan-on-undo behaviour correct. NO nested
+// ``FMCPWritePropertyScope`` — Wave N's ``add_mapping`` proves that ``IMC->Modify()`` alone is
+// sufficient for the editor's "save dirty package" surfacing, and double-stacked transactions
+// would leak a redundant Pre/PostEditChange pair per mutation.
+
+// ─── input.list_trigger_classes ────────────────────────────────────────────────────────────────
+//
+// Args:    none
+// Result:  { classes: [{ class_path, short_name, display_name, base_class, is_blueprint,
+//                        is_abstract, properties: [{name, type, default}] }],
+//            total_count: int }
+//
+// Enumerates every NON-ABSTRACT, NON-DEPRECATED, NON-HideDropdown UClass derived from
+// ``UInputTrigger``. CDO is read for default values via ``FMCPReflection::ReadPropertyValue``.
+// Properties are filtered to ``CPF_Edit`` only (visible in Details panel) — runtime-only state
+// like ``LastValue`` / ``HeldDuration`` is omitted.
+//
+// Lane A. Read-only — no PIE guard.
+FMCPResponse Tool_ListTriggerClasses(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	TArray<TSharedPtr<FJsonValue>> Classes;
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		UClass* C = *It;
+		if (!C || !C->IsChildOf(UInputTrigger::StaticClass()) || C == UInputTrigger::StaticClass()) { continue; }
+		if (C->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)) { continue; }
+		if (C->HasMetaData(TEXT("HideDropdown"))) { continue; }
+
+		Classes.Add(MakeShared<FJsonValueObject>(
+			INP_BuildClassSummary(C, UInputTrigger::StaticClass())));
+	}
+
+	// Stable sort by class_path so callers can rely on deterministic ordering.
+	Classes.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		FString AP, BP;
+		A->AsObject()->TryGetStringField(TEXT("class_path"), AP);
+		B->AsObject()->TryGetStringField(TEXT("class_path"), BP);
+		return AP < BP;
+	});
+
+	return FMCPJsonBuilder()
+		.Arr(TEXT("classes"), MoveTemp(Classes))
+		.Int(TEXT("total_count"), Classes.Num())
+		.BuildSuccess(Request);
+}
+
+// ─── input.list_modifier_classes ───────────────────────────────────────────────────────────────
+//
+// Identical shape to ``list_trigger_classes`` but for ``UInputModifier`` derived classes.
+//
+// Lane A. Read-only — no PIE guard.
+FMCPResponse Tool_ListModifierClasses(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	TArray<TSharedPtr<FJsonValue>> Classes;
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		UClass* C = *It;
+		if (!C || !C->IsChildOf(UInputModifier::StaticClass()) || C == UInputModifier::StaticClass()) { continue; }
+		if (C->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)) { continue; }
+		if (C->HasMetaData(TEXT("HideDropdown"))) { continue; }
+
+		Classes.Add(MakeShared<FJsonValueObject>(
+			INP_BuildClassSummary(C, UInputModifier::StaticClass())));
+	}
+
+	Classes.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		FString AP, BP;
+		A->AsObject()->TryGetStringField(TEXT("class_path"), AP);
+		B->AsObject()->TryGetStringField(TEXT("class_path"), BP);
+		return AP < BP;
+	});
+
+	return FMCPJsonBuilder()
+		.Arr(TEXT("classes"), MoveTemp(Classes))
+		.Int(TEXT("total_count"), Classes.Num())
+		.BuildSuccess(Request);
+}
+
+// ─── input.add_mapping_trigger ─────────────────────────────────────────────────────────────────
+//
+// Args:    { imc_path: string (required),
+//            ia_path:  string (required),
+//            key:      string (required, FKey name),
+//            trigger_class: string (required, full path OR short name e.g. "Hold"),
+//            properties?: object (e.g. {"HoldTimeThreshold": 0.5, "bIsOneShot": true}) }
+// Result:  { imc_path, ia_path, key, trigger_class, trigger_index, total_triggers,
+//            properties_applied: [...], properties_skipped: [...] }
+//
+// Adds a new ``UInputTrigger`` subobject to the matching (IA, Key) mapping's ``Triggers`` array.
+// Subobject owned by the IMC; created with ``RF_Public | RF_Transactional`` so undo/redo works.
+// Properties dict is applied via ``FMCPReflection::WritePropertyValue`` — unknown / mismatched
+// names land in ``properties_skipped`` rather than erroring out (so a caller can iteratively
+// probe an unknown trigger class without per-property roundtrips).
+//
+// Multiple mappings sharing the same (IA, Key) — UE permits this — match the FIRST entry only;
+// disambiguation by index is a future-Wave concern.
+//
+// Errors: -32004 ObjectNotFound (IMC/IA/mapping); -32602 InvalidParams (bad key, bad class);
+//         -32027 PIEActive.
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_AddMappingTrigger(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddMappingTrigger", "MCP: add input mapping trigger"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IMCPath, IAPath, KeyStr, TriggerClassStr;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("imc_path"),      IMCPath,         Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"),       IAPath,          Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key"),           KeyStr,          Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("trigger_class"), TriggerClassStr, Err)) { return Err; }
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputMappingContext* IMC = FMCPAssetLoader::Load<UInputMappingContext>(IMCPath, LoadErrCode, LoadErrMsg);
+	if (!IMC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	const FKey ParsedKey(*KeyStr);
+	if (!ParsedKey.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("key '%s' is not a recognised FKey name"), *KeyStr));
+	}
+
+	FString ResolveErr;
+	UClass* TriggerClass = INP_ResolveSubclass(UInputTrigger::StaticClass(), TriggerClassStr, ResolveErr);
+	if (!TriggerClass)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ResolveErr);
+	}
+
+	const int32 MappingIdx = INP_FindMappingIndex(IMC, IA, ParsedKey);
+	if (MappingIdx == INDEX_NONE)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(
+				TEXT("no mapping in '%s' for (IA='%s', Key='%s'); create one via input.add_mapping first"),
+				*IMC->GetPathName(), *IA->GetPathName(), *KeyStr));
+	}
+
+	IMC->Modify();
+	FEnhancedActionKeyMapping& Mapping = IMC->GetMapping(MappingIdx);
+
+	UInputTrigger* NewTrigger = NewObject<UInputTrigger>(
+		IMC, TriggerClass, NAME_None, RF_Public | RF_Transactional);
+	if (!NewTrigger)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			FString::Printf(TEXT("NewObject<UInputTrigger>(%s) returned null"),
+				*TriggerClass->GetPathName()));
+	}
+
+	TArray<FString> Applied;
+	TArray<FString> Skipped;
+	const TSharedPtr<FJsonObject>* PropsObjPtr = nullptr;
+	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
+		&& PropsObjPtr && PropsObjPtr->IsValid())
+	{
+		INP_ApplyProperties(NewTrigger, *PropsObjPtr, Applied, Skipped);
+	}
+
+	const int32 TriggerIdx = Mapping.Triggers.Add(NewTrigger);
+	Scope.DirtyPackage(IMC->GetOutermost());
+
+	TArray<TSharedPtr<FJsonValue>> AppliedArr;
+	AppliedArr.Reserve(Applied.Num());
+	for (const FString& N : Applied) { AppliedArr.Add(MakeShared<FJsonValueString>(N)); }
+	TArray<TSharedPtr<FJsonValue>> SkippedArr;
+	SkippedArr.Reserve(Skipped.Num());
+	for (const FString& N : Skipped) { SkippedArr.Add(MakeShared<FJsonValueString>(N)); }
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("imc_path"),       IMC->GetPathName())
+		.Str(TEXT("ia_path"),        IA->GetPathName())
+		.Str(TEXT("key"),            KeyStr)
+		.Str(TEXT("trigger_class"),  TriggerClass->GetPathName())
+		.Int(TEXT("trigger_index"),  TriggerIdx)
+		.Int(TEXT("total_triggers"), Mapping.Triggers.Num())
+		.Arr(TEXT("properties_applied"), MoveTemp(AppliedArr))
+		.Arr(TEXT("properties_skipped"), MoveTemp(SkippedArr))
+		.BuildSuccess(Request);
+}
+
+// ─── input.remove_mapping_trigger ──────────────────────────────────────────────────────────────
+//
+// Args:    { imc_path: string (required),
+//            ia_path:  string (required),
+//            key:      string (required),
+//            trigger_index: int (required, 0-based) }
+// Result:  { imc_path, ia_path, key, removed_class, remaining_triggers }
+//
+// Removes by index from the matching mapping's ``Triggers`` array. GC reclaims the orphaned
+// subobject; no explicit MarkAsGarbage required (TObjectPtr handles unreachability).
+//
+// Errors: -32004 ObjectNotFound (mapping not found, or index OOB); -32602 InvalidParams (bad key);
+//         -32027 PIEActive.
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_RemoveMappingTrigger(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_RemoveMappingTrigger", "MCP: remove input mapping trigger"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IMCPath, IAPath, KeyStr;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("imc_path"), IMCPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"),  IAPath,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key"),      KeyStr,  Err)) { return Err; }
+
+	int32 TriggerIdx = -1;
+	if (!FMCPToolHelpers::RequireIntField(Request, TEXT("trigger_index"), TriggerIdx, Err))
+	{
+		return Err;
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputMappingContext* IMC = FMCPAssetLoader::Load<UInputMappingContext>(IMCPath, LoadErrCode, LoadErrMsg);
+	if (!IMC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	const FKey ParsedKey(*KeyStr);
+	if (!ParsedKey.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("key '%s' is not a recognised FKey name"), *KeyStr));
+	}
+
+	const int32 MappingIdx = INP_FindMappingIndex(IMC, IA, ParsedKey);
+	if (MappingIdx == INDEX_NONE)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no mapping in '%s' for (IA='%s', Key='%s')"),
+				*IMC->GetPathName(), *IA->GetPathName(), *KeyStr));
+	}
+
+	IMC->Modify();
+	FEnhancedActionKeyMapping& Mapping = IMC->GetMapping(MappingIdx);
+
+	if (TriggerIdx < 0 || TriggerIdx >= Mapping.Triggers.Num())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(
+				TEXT("trigger_index %d out of range [0,%d) for mapping (IA='%s', Key='%s')"),
+				TriggerIdx, Mapping.Triggers.Num(), *IA->GetPathName(), *KeyStr));
+	}
+
+	const FString RemovedClass = (Mapping.Triggers[TriggerIdx] && Mapping.Triggers[TriggerIdx]->GetClass())
+		? Mapping.Triggers[TriggerIdx]->GetClass()->GetPathName()
+		: FString();
+	Mapping.Triggers.RemoveAt(TriggerIdx);
+	Scope.DirtyPackage(IMC->GetOutermost());
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("imc_path"),          IMC->GetPathName())
+		.Str(TEXT("ia_path"),           IA->GetPathName())
+		.Str(TEXT("key"),               KeyStr)
+		.Str(TEXT("removed_class"),     RemovedClass)
+		.Int(TEXT("remaining_triggers"), Mapping.Triggers.Num())
+		.BuildSuccess(Request);
+}
+
+// ─── input.add_mapping_modifier ────────────────────────────────────────────────────────────────
+//
+// Identical shape to ``add_mapping_trigger`` but targets ``Mapping.Modifiers``.
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_AddMappingModifier(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddMappingModifier", "MCP: add input mapping modifier"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IMCPath, IAPath, KeyStr, ModifierClassStr;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("imc_path"),       IMCPath,          Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"),        IAPath,           Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key"),            KeyStr,           Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("modifier_class"), ModifierClassStr, Err)) { return Err; }
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputMappingContext* IMC = FMCPAssetLoader::Load<UInputMappingContext>(IMCPath, LoadErrCode, LoadErrMsg);
+	if (!IMC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	const FKey ParsedKey(*KeyStr);
+	if (!ParsedKey.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("key '%s' is not a recognised FKey name"), *KeyStr));
+	}
+
+	FString ResolveErr;
+	UClass* ModifierClass = INP_ResolveSubclass(UInputModifier::StaticClass(), ModifierClassStr, ResolveErr);
+	if (!ModifierClass)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ResolveErr);
+	}
+
+	const int32 MappingIdx = INP_FindMappingIndex(IMC, IA, ParsedKey);
+	if (MappingIdx == INDEX_NONE)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(
+				TEXT("no mapping in '%s' for (IA='%s', Key='%s'); create one via input.add_mapping first"),
+				*IMC->GetPathName(), *IA->GetPathName(), *KeyStr));
+	}
+
+	IMC->Modify();
+	FEnhancedActionKeyMapping& Mapping = IMC->GetMapping(MappingIdx);
+
+	UInputModifier* NewModifier = NewObject<UInputModifier>(
+		IMC, ModifierClass, NAME_None, RF_Public | RF_Transactional);
+	if (!NewModifier)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			FString::Printf(TEXT("NewObject<UInputModifier>(%s) returned null"),
+				*ModifierClass->GetPathName()));
+	}
+
+	TArray<FString> Applied;
+	TArray<FString> Skipped;
+	const TSharedPtr<FJsonObject>* PropsObjPtr = nullptr;
+	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
+		&& PropsObjPtr && PropsObjPtr->IsValid())
+	{
+		INP_ApplyProperties(NewModifier, *PropsObjPtr, Applied, Skipped);
+	}
+
+	const int32 ModifierIdx = Mapping.Modifiers.Add(NewModifier);
+	Scope.DirtyPackage(IMC->GetOutermost());
+
+	TArray<TSharedPtr<FJsonValue>> AppliedArr;
+	AppliedArr.Reserve(Applied.Num());
+	for (const FString& N : Applied) { AppliedArr.Add(MakeShared<FJsonValueString>(N)); }
+	TArray<TSharedPtr<FJsonValue>> SkippedArr;
+	SkippedArr.Reserve(Skipped.Num());
+	for (const FString& N : Skipped) { SkippedArr.Add(MakeShared<FJsonValueString>(N)); }
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("imc_path"),        IMC->GetPathName())
+		.Str(TEXT("ia_path"),         IA->GetPathName())
+		.Str(TEXT("key"),             KeyStr)
+		.Str(TEXT("modifier_class"),  ModifierClass->GetPathName())
+		.Int(TEXT("modifier_index"),  ModifierIdx)
+		.Int(TEXT("total_modifiers"), Mapping.Modifiers.Num())
+		.Arr(TEXT("properties_applied"), MoveTemp(AppliedArr))
+		.Arr(TEXT("properties_skipped"), MoveTemp(SkippedArr))
+		.BuildSuccess(Request);
+}
+
+// ─── input.remove_mapping_modifier ─────────────────────────────────────────────────────────────
+//
+// Identical shape to ``remove_mapping_trigger`` but targets ``Mapping.Modifiers``.
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_RemoveMappingModifier(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_RemoveMappingModifier", "MCP: remove input mapping modifier"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IMCPath, IAPath, KeyStr;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("imc_path"), IMCPath, Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"),  IAPath,  Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("key"),      KeyStr,  Err)) { return Err; }
+
+	int32 ModifierIdx = -1;
+	if (!FMCPToolHelpers::RequireIntField(Request, TEXT("modifier_index"), ModifierIdx, Err))
+	{
+		return Err;
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputMappingContext* IMC = FMCPAssetLoader::Load<UInputMappingContext>(IMCPath, LoadErrCode, LoadErrMsg);
+	if (!IMC) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	const FKey ParsedKey(*KeyStr);
+	if (!ParsedKey.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(TEXT("key '%s' is not a recognised FKey name"), *KeyStr));
+	}
+
+	const int32 MappingIdx = INP_FindMappingIndex(IMC, IA, ParsedKey);
+	if (MappingIdx == INDEX_NONE)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no mapping in '%s' for (IA='%s', Key='%s')"),
+				*IMC->GetPathName(), *IA->GetPathName(), *KeyStr));
+	}
+
+	IMC->Modify();
+	FEnhancedActionKeyMapping& Mapping = IMC->GetMapping(MappingIdx);
+
+	if (ModifierIdx < 0 || ModifierIdx >= Mapping.Modifiers.Num())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(
+				TEXT("modifier_index %d out of range [0,%d) for mapping (IA='%s', Key='%s')"),
+				ModifierIdx, Mapping.Modifiers.Num(), *IA->GetPathName(), *KeyStr));
+	}
+
+	const FString RemovedClass = (Mapping.Modifiers[ModifierIdx] && Mapping.Modifiers[ModifierIdx]->GetClass())
+		? Mapping.Modifiers[ModifierIdx]->GetClass()->GetPathName()
+		: FString();
+	Mapping.Modifiers.RemoveAt(ModifierIdx);
+	Scope.DirtyPackage(IMC->GetOutermost());
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("imc_path"),            IMC->GetPathName())
+		.Str(TEXT("ia_path"),             IA->GetPathName())
+		.Str(TEXT("key"),                 KeyStr)
+		.Str(TEXT("removed_class"),       RemovedClass)
+		.Int(TEXT("remaining_modifiers"), Mapping.Modifiers.Num())
+		.BuildSuccess(Request);
+}
+
+// ─── input.add_action_trigger ──────────────────────────────────────────────────────────────────
+//
+// Args:    { ia_path: string (required),
+//            trigger_class: string (required, full path OR short name),
+//            properties?: object }
+// Result:  { ia_path, trigger_class, trigger_index, total_triggers,
+//            properties_applied: [...], properties_skipped: [...] }
+//
+// Adds a ``UInputTrigger`` to the IA's TOP-LEVEL Triggers array — applies to every binding of the
+// IA across every IMC. Owner is the IA itself.
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_AddActionTrigger(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddActionTrigger", "MCP: add input action trigger"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IAPath, TriggerClassStr;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"),       IAPath,          Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("trigger_class"), TriggerClassStr, Err)) { return Err; }
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	FString ResolveErr;
+	UClass* TriggerClass = INP_ResolveSubclass(UInputTrigger::StaticClass(), TriggerClassStr, ResolveErr);
+	if (!TriggerClass)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ResolveErr);
+	}
+
+	IA->Modify();
+
+	UInputTrigger* NewTrigger = NewObject<UInputTrigger>(
+		IA, TriggerClass, NAME_None, RF_Public | RF_Transactional);
+	if (!NewTrigger)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			FString::Printf(TEXT("NewObject<UInputTrigger>(%s) returned null"),
+				*TriggerClass->GetPathName()));
+	}
+
+	TArray<FString> Applied;
+	TArray<FString> Skipped;
+	const TSharedPtr<FJsonObject>* PropsObjPtr = nullptr;
+	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
+		&& PropsObjPtr && PropsObjPtr->IsValid())
+	{
+		INP_ApplyProperties(NewTrigger, *PropsObjPtr, Applied, Skipped);
+	}
+
+	const int32 TriggerIdx = IA->Triggers.Add(NewTrigger);
+	Scope.DirtyPackage(IA->GetOutermost());
+
+	TArray<TSharedPtr<FJsonValue>> AppliedArr;
+	AppliedArr.Reserve(Applied.Num());
+	for (const FString& N : Applied) { AppliedArr.Add(MakeShared<FJsonValueString>(N)); }
+	TArray<TSharedPtr<FJsonValue>> SkippedArr;
+	SkippedArr.Reserve(Skipped.Num());
+	for (const FString& N : Skipped) { SkippedArr.Add(MakeShared<FJsonValueString>(N)); }
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("ia_path"),        IA->GetPathName())
+		.Str(TEXT("trigger_class"),  TriggerClass->GetPathName())
+		.Int(TEXT("trigger_index"),  TriggerIdx)
+		.Int(TEXT("total_triggers"), IA->Triggers.Num())
+		.Arr(TEXT("properties_applied"), MoveTemp(AppliedArr))
+		.Arr(TEXT("properties_skipped"), MoveTemp(SkippedArr))
+		.BuildSuccess(Request);
+}
+
+// ─── input.remove_action_trigger ───────────────────────────────────────────────────────────────
+//
+// Args:    { ia_path: string (required), trigger_index: int (required, 0-based) }
+// Result:  { ia_path, removed_class, remaining_triggers }
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_RemoveActionTrigger(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_RemoveActionTrigger", "MCP: remove input action trigger"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IAPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"), IAPath, Err)) { return Err; }
+
+	int32 TriggerIdx = -1;
+	if (!FMCPToolHelpers::RequireIntField(Request, TEXT("trigger_index"), TriggerIdx, Err))
+	{
+		return Err;
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	if (TriggerIdx < 0 || TriggerIdx >= IA->Triggers.Num())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(
+				TEXT("trigger_index %d out of range [0,%d) on '%s'"),
+				TriggerIdx, IA->Triggers.Num(), *IA->GetPathName()));
+	}
+
+	IA->Modify();
+	const FString RemovedClass = (IA->Triggers[TriggerIdx] && IA->Triggers[TriggerIdx]->GetClass())
+		? IA->Triggers[TriggerIdx]->GetClass()->GetPathName()
+		: FString();
+	IA->Triggers.RemoveAt(TriggerIdx);
+	Scope.DirtyPackage(IA->GetOutermost());
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("ia_path"),            IA->GetPathName())
+		.Str(TEXT("removed_class"),      RemovedClass)
+		.Int(TEXT("remaining_triggers"), IA->Triggers.Num())
+		.BuildSuccess(Request);
+}
+
+// ─── input.add_action_modifier ─────────────────────────────────────────────────────────────────
+//
+// Args:    { ia_path: string (required),
+//            modifier_class: string (required, full path OR short name),
+//            properties?: object }
+// Result:  { ia_path, modifier_class, modifier_index, total_modifiers,
+//            properties_applied: [...], properties_skipped: [...] }
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_AddActionModifier(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_AddActionModifier", "MCP: add input action modifier"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IAPath, ModifierClassStr;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"),        IAPath,           Err)) { return Err; }
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("modifier_class"), ModifierClassStr, Err)) { return Err; }
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	FString ResolveErr;
+	UClass* ModifierClass = INP_ResolveSubclass(UInputModifier::StaticClass(), ModifierClassStr, ResolveErr);
+	if (!ModifierClass)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams, ResolveErr);
+	}
+
+	IA->Modify();
+
+	UInputModifier* NewModifier = NewObject<UInputModifier>(
+		IA, ModifierClass, NAME_None, RF_Public | RF_Transactional);
+	if (!NewModifier)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInternal,
+			FString::Printf(TEXT("NewObject<UInputModifier>(%s) returned null"),
+				*ModifierClass->GetPathName()));
+	}
+
+	TArray<FString> Applied;
+	TArray<FString> Skipped;
+	const TSharedPtr<FJsonObject>* PropsObjPtr = nullptr;
+	if (Request.Args.IsValid() && Request.Args->TryGetObjectField(TEXT("properties"), PropsObjPtr)
+		&& PropsObjPtr && PropsObjPtr->IsValid())
+	{
+		INP_ApplyProperties(NewModifier, *PropsObjPtr, Applied, Skipped);
+	}
+
+	const int32 ModifierIdx = IA->Modifiers.Add(NewModifier);
+	Scope.DirtyPackage(IA->GetOutermost());
+
+	TArray<TSharedPtr<FJsonValue>> AppliedArr;
+	AppliedArr.Reserve(Applied.Num());
+	for (const FString& N : Applied) { AppliedArr.Add(MakeShared<FJsonValueString>(N)); }
+	TArray<TSharedPtr<FJsonValue>> SkippedArr;
+	SkippedArr.Reserve(Skipped.Num());
+	for (const FString& N : Skipped) { SkippedArr.Add(MakeShared<FJsonValueString>(N)); }
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("ia_path"),         IA->GetPathName())
+		.Str(TEXT("modifier_class"),  ModifierClass->GetPathName())
+		.Int(TEXT("modifier_index"),  ModifierIdx)
+		.Int(TEXT("total_modifiers"), IA->Modifiers.Num())
+		.Arr(TEXT("properties_applied"), MoveTemp(AppliedArr))
+		.Arr(TEXT("properties_skipped"), MoveTemp(SkippedArr))
+		.BuildSuccess(Request);
+}
+
+// ─── input.remove_action_modifier ──────────────────────────────────────────────────────────────
+//
+// Args:    { ia_path: string (required), modifier_index: int (required, 0-based) }
+// Result:  { ia_path, removed_class, remaining_modifiers }
+//
+// Lane A. PIE-guarded.
+FMCPResponse Tool_RemoveActionModifier(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+
+	FMCPMutatorScope Scope(Request, LOCTEXT("MCP_RemoveActionModifier", "MCP: remove input action modifier"));
+	if (Scope.PIEBlocked()) { return Scope.Error(); }
+
+	FString IAPath;
+	FMCPResponse Err;
+	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("ia_path"), IAPath, Err)) { return Err; }
+
+	int32 ModifierIdx = -1;
+	if (!FMCPToolHelpers::RequireIntField(Request, TEXT("modifier_index"), ModifierIdx, Err))
+	{
+		return Err;
+	}
+
+	int32 LoadErrCode = 0;
+	FString LoadErrMsg;
+	UInputAction* IA = FMCPAssetLoader::Load<UInputAction>(IAPath, LoadErrCode, LoadErrMsg);
+	if (!IA) { return FMCPToolHelpers::MakeError(Request, LoadErrCode, LoadErrMsg); }
+
+	if (ModifierIdx < 0 || ModifierIdx >= IA->Modifiers.Num())
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(
+				TEXT("modifier_index %d out of range [0,%d) on '%s'"),
+				ModifierIdx, IA->Modifiers.Num(), *IA->GetPathName()));
+	}
+
+	IA->Modify();
+	const FString RemovedClass = (IA->Modifiers[ModifierIdx] && IA->Modifiers[ModifierIdx]->GetClass())
+		? IA->Modifiers[ModifierIdx]->GetClass()->GetPathName()
+		: FString();
+	IA->Modifiers.RemoveAt(ModifierIdx);
+	Scope.DirtyPackage(IA->GetOutermost());
+
+	return FMCPJsonBuilder()
+		.Str(TEXT("ia_path"),             IA->GetPathName())
+		.Str(TEXT("removed_class"),       RemovedClass)
+		.Int(TEXT("remaining_modifiers"), IA->Modifiers.Num())
+		.BuildSuccess(Request);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -907,11 +1851,22 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("input.remove_mapping"),         &Tool_RemoveMapping,        /*Lane A*/ false);
 	RegisterTool(TEXT("input.add_context_to_player"),  &Tool_AddContextToPlayer,   /*Lane A*/ false);
 
+	// Wave N+1 — trigger/modifier authoring (10 tools)
+	RegisterTool(TEXT("input.list_trigger_classes"),    &Tool_ListTriggerClasses,    /*Lane A*/ false);
+	RegisterTool(TEXT("input.list_modifier_classes"),   &Tool_ListModifierClasses,   /*Lane A*/ false);
+	RegisterTool(TEXT("input.add_mapping_trigger"),     &Tool_AddMappingTrigger,     /*Lane A*/ false);
+	RegisterTool(TEXT("input.remove_mapping_trigger"),  &Tool_RemoveMappingTrigger,  /*Lane A*/ false);
+	RegisterTool(TEXT("input.add_mapping_modifier"),    &Tool_AddMappingModifier,    /*Lane A*/ false);
+	RegisterTool(TEXT("input.remove_mapping_modifier"), &Tool_RemoveMappingModifier, /*Lane A*/ false);
+	RegisterTool(TEXT("input.add_action_trigger"),      &Tool_AddActionTrigger,      /*Lane A*/ false);
+	RegisterTool(TEXT("input.remove_action_trigger"),   &Tool_RemoveActionTrigger,   /*Lane A*/ false);
+	RegisterTool(TEXT("input.add_action_modifier"),     &Tool_AddActionModifier,     /*Lane A*/ false);
+	RegisterTool(TEXT("input.remove_action_modifier"),  &Tool_RemoveActionModifier,  /*Lane A*/ false);
+
 	UE_LOG(LogMCP, Log,
-		TEXT("Input surface registered: 9 input.* tools "
-			 "(Wave E S5: list_mapping_contexts + list_input_actions + get_context_bindings + "
-			 "list_player_contexts; Wave N: create_input_action + create_mapping_context + add_mapping "
-			 "+ remove_mapping + add_context_to_player), all Lane A"));
+		TEXT("Input surface registered: 19 input.* tools "
+			 "(Wave E S5: 4 introspection; Wave N: 5 authoring; "
+			 "Wave N+1: 2 discovery + 4 mapping-level CRUD + 4 action-level CRUD), all Lane A"));
 }
 
 } // namespace FInputTools
