@@ -320,8 +320,18 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	// Phase 4.2 (2026-05-22): get_info + get_memory_snapshot promoted to Lane B (atomic global +
 	// thread-safe FPlatformMemory / FApp reads). gc_collect stays Lane A — GEngine->ForceGarbageCollection
 	// MUST run on game thread (operates on the global UObject heap).
-	RegisterTool(TEXT("engine.get_info"),             &Tool_GetInfo,            /*Lane B*/ true);
+	// Wave Q5-followup (2026-05-24): engine.get_info demoted from Lane B → Lane A. The original
+	// Phase 4.2 promotion claimed FApp/GIsEditor thread-safety but missed that the helper
+	// ENG_ResolveCurrentWorld() calls FMCPWorldContext::IsPIEActive() + GetEditorWorld() — both
+	// assert IsInGameThread(). Discovered via Editor live verification smoke test (Wave Q5+1):
+	// calling engine.get_info on a worker thread crashed the editor instantly. Lane A is correct
+	// since the world summary needs GEditor->PlayWorld which is GT-only state.
+	RegisterTool(TEXT("engine.get_info"),             &Tool_GetInfo,            /*Lane A*/ false);
+	// engine.gc_collect: Lane A. CollectGarbage() + GEngine->ForceGarbageCollection() are both
+	// GT-only (engine asserts internally if called off GT — would also crash on Lane B).
 	RegisterTool(TEXT("engine.gc_collect"),           &Tool_GCCollect,          /*Lane A*/ false);
+	// engine.get_memory_snapshot: Lane B safe. FPlatformMemory::GetStats/GetConstants + GMalloc->
+	// GetDescriptiveName documented thread-safe (atomic snapshots from CPU memory subsystem).
 	RegisterTool(TEXT("engine.get_memory_snapshot"),  &Tool_GetMemorySnapshot,  /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
