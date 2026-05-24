@@ -45,10 +45,19 @@ namespace
 
 	// Snapshot the .memreport files in the MemReport output dir so we can detect
 	// which file the engine produces.
+	//
+	// Wave S+3 fix (2026-05-24): RECURSIVE scan. The engine's `MemReport` command writes into
+	// timestamped session subdirectories like
+	//   <Saved>/Profiling/MemReports/Untitled_0-WindowsEditor-MM.DD-HH.MM.SS/PidNNNN_*.memreport
+	// — NOT directly into the MemReports root. Non-recursive FindFiles missed every file the
+	// engine produced and the tool always returned the -32058 "file did not appear" error after
+	// the full poll timeout. FindFilesRecursive returns FULL ABSOLUTE PATHS (per FileManagerGeneric
+	// implementation), so callers MUST treat the elements as paths, not basenames.
 	void MR_SnapshotDir(const FString& Dir, TSet<FString>& OutFiles)
 	{
 		TArray<FString> Files;
-		IFileManager::Get().FindFiles(Files, *Dir, TEXT("*.memreport"));
+		IFileManager::Get().FindFilesRecursive(Files, *Dir, TEXT("*.memreport"),
+			/*Files=*/true, /*Directories=*/false);
 		OutFiles.Reset();
 		for (const FString& F : Files)
 		{
@@ -70,17 +79,35 @@ namespace FMemReportTools
 
 // --- memreport.dump ---------------------------------------------------------------------------
 //
-// Args:    { output_path?: string, full?: bool, timeout_seconds?: int [1, 120] }
-// Result:  { path, size_bytes, is_full, elapsed_seconds }
+// Args:    { mode?: "trigger"|"wait" (default "trigger"),
+//            output_path?: string, full?: bool,
+//            timeout_seconds?: int [1, 600] (wait mode only) }
 //
-// Engine command `MemReport [-FULL] [NAME=...]` writes to
-// <ProjectSavedDir>/Profiling/MemReports/<auto-name>.memreport. The command is
-// deferred (added to DeferredCommands inside the engine) — runs at end-of-tick,
-// then synchronously flushes the file.
+// Result (mode=trigger):
+//   { triggered: true, output_dir, pre_file_count, is_full,
+//     hint: "Poll memreport.list_files until count > pre_file_count" }
 //
-// We watch the dir for a new file by snapshotting before + diffing every 100ms
-// until a new file appears or timeout_seconds elapses. If client requested
-// output_path, the file is moved post-detection (sandbox-validated path).
+// Result (mode=wait):
+//   { path, size_bytes, is_full, elapsed_seconds }
+//
+// Engine command `MemReport [-FULL]` writes to
+// <ProjectSavedDir>/Profiling/MemReports/<session-subdir>/PidNNNN_*.memreport.
+//
+// ── GAME-THREAD STARVATION ──────────────────────────────────────────────────────────────────────
+// **mode=wait is DEPRECATED** for non-trivial projects. The MemReport command runs synchronously
+// on the GAME THREAD (iterates GUObjectArray, serialises platform stats, walks all packages,
+// triggers GC, etc.). This tool is Lane A — it ALSO runs on the game thread. If we busy-wait via
+// FPlatformProcess::Sleep, we starve the very thread that needs to run MemReport, producing the
+// pathology "file appears exactly N+1 seconds after our timeout fires, every time" — verified
+// empirically in FatumGame at N ∈ {120, 180, 280, 500, 600}.
+//
+// **mode=trigger** (default) avoids this by firing the command and returning immediately. The
+// caller then polls memreport.list_files (Lane B, doesn't block GT) on its own schedule to detect
+// the new file. The engine has full game-thread access between polls to actually do the work.
+// On FatumGame-scale projects this produces the file within 5-30 seconds of triggering.
+//
+// On small/empty projects mode=wait completes in <10s and remains usable — kept for
+// backwards-compatibility with existing integrations.
 FMCPResponse Tool_Dump(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
@@ -90,18 +117,35 @@ FMCPResponse Tool_Dump(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMRErrorInternal, TEXT("GEngine is null"));
 	}
 
+	// Mode selection — default to non-blocking trigger to avoid game-thread starvation.
+	FString ModeStr = TEXT("trigger");
+	if (Request.Args.IsValid())
+	{
+		FString RawMode;
+		if (Request.Args->TryGetStringField(TEXT("mode"), RawMode) && !RawMode.IsEmpty())
+		{
+			ModeStr = RawMode.ToLower();
+			if (ModeStr != TEXT("trigger") && ModeStr != TEXT("wait"))
+			{
+				return FMCPToolHelpers::MakeError(Request, kMRErrorInvalidParams,
+					FString::Printf(TEXT("mode must be 'trigger' or 'wait' (got '%s')"), *RawMode));
+			}
+		}
+	}
+	const bool bWaitMode = (ModeStr == TEXT("wait"));
+
 	bool bFull = false;
-	int32 TimeoutSeconds = 30;
+	int32 TimeoutSeconds = 300;
 	if (Request.Args.IsValid())
 	{
 		Request.Args->TryGetBoolField(TEXT("full"), bFull);
-		int32 ParsedTimeout = 30;
+		int32 ParsedTimeout = 300;
 		if (Request.Args->TryGetNumberField(TEXT("timeout_seconds"), ParsedTimeout))
 		{
-			if (ParsedTimeout < 1 || ParsedTimeout > 120)
+			if (ParsedTimeout < 1 || ParsedTimeout > 600)
 			{
 				return FMCPToolHelpers::MakeError(Request, kMRErrorInvalidParams,
-					FString::Printf(TEXT("timeout_seconds must be in [1, 120] (got %d)"), ParsedTimeout));
+					FString::Printf(TEXT("timeout_seconds must be in [1, 600] (got %d)"), ParsedTimeout));
 			}
 			TimeoutSeconds = ParsedTimeout;
 		}
@@ -143,18 +187,40 @@ FMCPResponse Tool_Dump(const FMCPRequest& Request)
 			FString::Printf(TEXT("GEngine->Exec('%s') returned false"), *MemCmd));
 	}
 
+	// mode=trigger: return immediately, let caller poll via memreport.list_files. Crucially this
+	// RELEASES the game thread so the engine can actually run the MemReport work it just queued.
+	if (!bWaitMode)
+	{
+		return FMCPJsonBuilder()
+			.Bool(TEXT("triggered"), true)
+			.Str(TEXT("output_dir"), MemReportsDir)
+			.Int(TEXT("pre_file_count"), PreFiles.Num())
+			.Bool(TEXT("is_full"), bFull)
+			.Str(TEXT("hint"),
+				TEXT("Engine writes file asynchronously. Poll memreport.list_files until file count > pre_file_count "
+					 "(typically 5-30s after trigger). For wait-style behaviour use mode='wait' (NOT RECOMMENDED — "
+					 "blocks game thread which starves the engine of the tick it needs to do the work)."))
+			.BuildSuccess(Request);
+	}
+
 	// 3. Poll the directory for the new file. MemReport is deferred so the file
 	// won't appear on this tick; we sleep + re-scan. Game thread blocks for up
 	// to timeout_seconds, then surfaces a clear error if nothing appeared.
+	//
+	// Wave S+3 fix (2026-05-24): RECURSIVE scan — engine writes into a per-session
+	// subdirectory (e.g. ``Untitled_0-WindowsEditor-MM.DD-HH.MM.SS/PidNNNN_*.memreport``),
+	// not directly into MemReportsDir. ``FindFilesRecursive`` returns full absolute paths,
+	// so the diff and the response carry the absolute path verbatim.
 	const double StartTime = FPlatformTime::Seconds();
 	const double Deadline  = StartTime + static_cast<double>(TimeoutSeconds);
-	FString NewFileName;
+	FString NewFilePath;  // full absolute path of the new .memreport file (post-recursive-scan)
 	while (FPlatformTime::Seconds() < Deadline)
 	{
 		FPlatformProcess::Sleep(0.1f);
 
 		TArray<FString> FilesNow;
-		IFileManager::Get().FindFiles(FilesNow, *MemReportsDir, TEXT("*.memreport"));
+		IFileManager::Get().FindFilesRecursive(FilesNow, *MemReportsDir, TEXT("*.memreport"),
+			/*Files=*/true, /*Directories=*/false);
 
 		// Pick the LATEST new file by alphabetical sort (engine names include a
 		// timestamp so lexicographic ordering tracks creation time).
@@ -169,14 +235,14 @@ FMCPResponse Tool_Dump(const FMCPRequest& Request)
 		}
 		if (!CandidateLatest.IsEmpty())
 		{
-			NewFileName = CandidateLatest;
+			NewFilePath = CandidateLatest;
 			break;
 		}
 	}
 
 	const double Elapsed = FPlatformTime::Seconds() - StartTime;
 
-	if (NewFileName.IsEmpty())
+	if (NewFilePath.IsEmpty())
 	{
 		return FMCPToolHelpers::MakeError(Request, kMRErrorOperationFailed,
 			FString::Printf(
@@ -184,7 +250,7 @@ FMCPResponse Tool_Dump(const FMCPRequest& Request)
 				TimeoutSeconds));
 	}
 
-	FString FinalPath = MemReportsDir / NewFileName;
+	FString FinalPath = NewFilePath;
 
 	// 4. If client requested an alternate path, move the file there.
 	if (!DesiredFinalPath.IsEmpty())
@@ -263,6 +329,49 @@ FMCPResponse Tool_GetQuickStats(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// --- memreport.list_files ---------------------------------------------------------------------
+//
+// Args:    {}
+// Result:  { count, dir, files: [ { path, size_bytes, mtime_iso } ... ] }
+//
+// Lightweight recursive enumeration of .memreport files in
+// <ProjectSavedDir>/Profiling/MemReports/. Designed as the polling companion to
+// memreport.dump(mode="trigger"): caller takes a baseline file count, triggers a dump, then polls
+// this method until count exceeds the baseline (typically 5-30s on FatumGame-scale projects).
+//
+// Lane B — pure filesystem read via IFileManager (thread-safe, no UObject touches). Does NOT
+// starve the game thread, so MemReport processing proceeds normally between polls.
+FMCPResponse Tool_ListFiles(const FMCPRequest& Request)
+{
+	const FString MemReportsDir = FPaths::ProjectSavedDir() / TEXT("Profiling/MemReports/");
+
+	TArray<FString> Files;
+	IFileManager::Get().FindFilesRecursive(Files, *MemReportsDir, TEXT("*.memreport"),
+		/*Files=*/true, /*Directories=*/false);
+	Files.Sort();  // lexicographic — engine names embed timestamps so this sorts chronologically
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	Arr.Reserve(Files.Num());
+	for (const FString& F : Files)
+	{
+		int64 Size = IFileManager::Get().FileSize(*F);
+		if (Size == INDEX_NONE) { Size = 0; }
+		const FDateTime Mtime = IFileManager::Get().GetTimeStamp(*F);
+
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("path"), F);
+		Obj->SetNumberField(TEXT("size_bytes"), static_cast<double>(Size));
+		Obj->SetStringField(TEXT("mtime_iso"), Mtime.ToIso8601());
+		Arr.Add(MakeShared<FJsonValueObject>(Obj));
+	}
+
+	return FMCPJsonBuilder()
+		.Int(TEXT("count"), Files.Num())
+		.Str(TEXT("dir"), MemReportsDir)
+		.Arr(TEXT("files"), MoveTemp(Arr))
+		.BuildSuccess(Request);
+}
+
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
 	auto RegisterTool = [&](const TCHAR* MethodName, FMCPDispatchQueue::FHandler Handler, bool bThreadSafe)
@@ -273,14 +382,18 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 
 	// Wave L+1 (2026-05-23): get_quick_stats promoted to Lane B with gMemReportStatsLock for
 	// defense-in-depth. FPlatformMemory::GetStats() is documented thread-safe; GUObjectArray
-	// counters are simple int reads; GetLastGCTime() is a double read. dump stays Lane A — blocks
-	// the calling thread on FPlatformProcess::Sleep and invokes GEngine->Exec for "MemReport".
+	// counters are simple int reads; GetLastGCTime() is a double read. dump stays Lane A — invokes
+	// GEngine->Exec on the game thread.
+	//
+	// Wave S+3 (2026-05-24): added memreport.list_files as the polling companion for
+	// memreport.dump(mode="trigger"). list_files is Lane B (pure filesystem read).
 	RegisterTool(TEXT("memreport.dump"),            &Tool_Dump,          /*Lane A*/ false);
 	RegisterTool(TEXT("memreport.get_quick_stats"), &Tool_GetQuickStats, /*Lane B*/ true);
+	RegisterTool(TEXT("memreport.list_files"),      &Tool_ListFiles,     /*Lane B*/ true);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("MemReport surface registered: memreport.{dump, get_quick_stats} "
-			 "(1 Lane A + 1 Lane B)"));
+		TEXT("MemReport surface registered: memreport.{dump, get_quick_stats, list_files} "
+			 "(1 Lane A + 2 Lane B)"));
 }
 
 } // namespace FMemReportTools
