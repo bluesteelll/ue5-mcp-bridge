@@ -188,6 +188,11 @@ FMCPResponse Tool_SetCategoryVerbosity(const FMCPRequest& Request)
 	FMCPResponse Err;
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("category"),  Category,     Err)) { return Err; }
 	if (!FMCPToolHelpers::RequireStringField(Request, TEXT("verbosity"), RawVerbosity, Err)) { return Err; }
+	// Wave S+14 (2026-05-24): cap category length BEFORE the FName(*Category) construction below.
+	// Verified crash dump: log.set_category_verbosity with category=2000 chars triggers UnrealNames.cpp:3252
+	// at the FName CategoryName(*Category) construction site (line ~202). Verbosity is bounded by
+	// LOG_CanonicaliseVerbosity rejecting unrecognised tokens, so only category needs the guard.
+	if (!FMCPToolHelpers::ValidateFNameLength(Request, TEXT("category"), Category, Err)) { return Err; }
 
 	const FString CanonVerbosity = LOG_CanonicaliseVerbosity(RawVerbosity);
 	if (CanonVerbosity.IsEmpty())
