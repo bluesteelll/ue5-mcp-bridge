@@ -13,6 +13,8 @@
 
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
+#include "HAL/PlatformTime.h"
+#include <atomic>
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/Level.h"
@@ -317,6 +319,13 @@ namespace FPIETools
 //                               StartQueuedPlaySessionRequest didn't fire the request
 //   -ALREADY_RUNNING-           IsPlaySessionInProgress already true → surface as Internal +
 //                               diagnostic; caller polls pie.is_running
+// Wave S+9 (2026-05-24): UE PIE start/stop has async cleanup phases (BeginTearingDown +
+// Audio teardown + World cleanup) that overlap if start fires too soon after stop. Tested via
+// WS3 Phase Q with 0.3s gap → crash in audio mixer during teardown of previous PIE while
+// new one starts. Track last-stop-time and enforce minimum gap before next start.
+static std::atomic<double> gLastPIEStopTimeSeconds{0.0};
+static constexpr double kMinPIEStartGapSeconds = 1.5;
+
 FMCPResponse Tool_Start(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
@@ -326,11 +335,29 @@ FMCPResponse Tool_Start(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal, TEXT("GEditor unavailable (commandlet?)"));
 	}
 
-	// Already-running guard — refuse rather than silently restarting.
-	if (GEditor->IsPlaySessionInProgress() || FMCPWorldContext::IsPIEActive())
+	// Already-running guard — refuse rather than silently restarting. Also check PlayWorld!=null
+	// which covers the Playing AND Ending phases (IsPlaySessionInProgress goes false during Ending
+	// but PlayWorld is still being torn down).
+	if (GEditor->IsPlaySessionInProgress() || FMCPWorldContext::IsPIEActive() || GEditor->PlayWorld != nullptr)
 	{
 		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
 			TEXT("PIE session already in progress; call pie.stop first or pie.is_running to check"));
+	}
+
+	// Wave S+9 cooldown guard: pie.stop is async — UE finishes teardown (audio, world cleanup,
+	// online subsystems) over ~500ms-1s AFTER the function returns. Starting again before that
+	// completes crashes the editor in the audio mixer or other cleanup paths. Verified via WS3
+	// Phase Q stress (30 rapid cycles with 0.3s gap → editor died on iteration 2).
+	const double Now = FPlatformTime::Seconds();
+	const double LastStop = gLastPIEStopTimeSeconds.load(std::memory_order_acquire);
+	if (LastStop > 0.0 && (Now - LastStop) < kMinPIEStartGapSeconds)
+	{
+		const double Remaining = kMinPIEStartGapSeconds - (Now - LastStop);
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInternal,
+			FString::Printf(
+				TEXT("pie.start too soon after last pie.stop; UE PIE teardown is async — wait %.2fs more "
+					 "(min gap=%.1fs). Use pie.is_running to poll for teardown completion."),
+				Remaining, kMinPIEStartGapSeconds));
 	}
 
 	// Parse mode.
@@ -463,6 +490,11 @@ FMCPResponse Tool_Stop(const FMCPRequest& Request)
 	}
 
 	GEditor->RequestEndPlayMap();
+
+	// Wave S+9: record stop time so the next pie.start can enforce a cooldown gap.
+	// UE PIE teardown is async (audio mixer, world cleanup, online subsystems all unwind
+	// over ~1s after RequestEndPlayMap returns); restarting too soon crashes the editor.
+	gLastPIEStopTimeSeconds.store(FPlatformTime::Seconds(), std::memory_order_release);
 
 	return FMCPJsonBuilder()
 		.Bool(TEXT("stopped"), true)
