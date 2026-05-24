@@ -13,6 +13,7 @@
 #include "Utils/MCPBlueprintUtils.h"
 #include "Utils/MCPPageCursor.h"
 #include "Utils/MCPPinTypeUtils.h"
+#include "Utils/MCPReflection.h"
 #include "Utils/MCPWorldContext.h"
 
 #include "AssetToolsModule.h"
@@ -165,7 +166,8 @@ namespace
 	TSharedPtr<FJsonObject> BP_BuildVariableSummary(
 		const FMCPRequest& Request,
 		const FBPVariableDescription& Var,
-		FMCPResponse& OutError)
+		FMCPResponse& OutError,
+		const UBlueprint* OwnerBlueprint = nullptr)
 	{
 		TSharedPtr<FJsonObject> PinTypeObj = BP_PinTypeToJsonOrError(Request, Var.VarType, OutError);
 		if (!PinTypeObj.IsValid())
@@ -177,16 +179,42 @@ namespace
 		Obj->SetStringField(TEXT("name"), Var.VarName.ToString());
 		Obj->SetObjectField(TEXT("pin_type"), PinTypeObj);
 
-		if (Var.DefaultValue.IsEmpty())
+		// Wave WS3 fix (2026-05-24): prefer CDO-read for default_value because bp.compile
+		// clears NewVariables[].DefaultValue (text form) even though the compiled CDO retains
+		// the value as a typed property. Repro: add var V default="42" → get returns "42",
+		// then bp.compile → get returns null. Fix: when OwnerBlueprint+GeneratedClass available,
+		// look up the FProperty on the generated class and read its CDO value via reflection.
+		// Falls back to Var.DefaultValue text if CDO unavailable (e.g. BP not yet compiled).
+		bool bDefaultValueSet = false;
+		if (OwnerBlueprint && OwnerBlueprint->GeneratedClass)
 		{
-			Obj->SetField(TEXT("default_value"), MakeShared<FJsonValueNull>());
+			UClass* GenClass = OwnerBlueprint->GeneratedClass;
+			FProperty* Prop = FindFProperty<FProperty>(GenClass, Var.VarName);
+			if (Prop)
+			{
+				if (UObject* CDO = GenClass->GetDefaultObject(/*bCreateIfNeeded*/ false))
+				{
+					void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(CDO);
+					TSharedPtr<FJsonValue> CdoJson = FMCPReflection::ReadPropertyValueAt(Prop, ValuePtr);
+					if (CdoJson.IsValid())
+					{
+						Obj->SetField(TEXT("default_value"), CdoJson);
+						bDefaultValueSet = true;
+					}
+				}
+			}
 		}
-		else
+		if (!bDefaultValueSet)
 		{
-			// FBPVariableDescription stores defaults as text-format strings (UE's ExportText form).
-			// Phase 4 returns these verbatim — Day 7+ will parse via FMCPReflection::WritePropertyValueAt
-			// for round-trip typed defaults. Reads now ship as opaque strings.
-			Obj->SetStringField(TEXT("default_value"), Var.DefaultValue);
+			if (Var.DefaultValue.IsEmpty())
+			{
+				Obj->SetField(TEXT("default_value"), MakeShared<FJsonValueNull>());
+			}
+			else
+			{
+				// FBPVariableDescription stores defaults as text-format strings (UE's ExportText form).
+				Obj->SetStringField(TEXT("default_value"), Var.DefaultValue);
+			}
 		}
 
 		Obj->SetStringField(TEXT("category_group"), Var.Category.ToString());
@@ -1000,7 +1028,7 @@ FMCPResponse Tool_GetVariable(const FMCPRequest& Request)
 	}
 
 	FMCPResponse VarErr;
-	TSharedPtr<FJsonObject> VarObj = BP_BuildVariableSummary(Request, Blueprint->NewVariables[Idx], VarErr);
+	TSharedPtr<FJsonObject> VarObj = BP_BuildVariableSummary(Request, Blueprint->NewVariables[Idx], VarErr, Blueprint);
 	if (!VarObj.IsValid())
 	{
 		return VarErr;
@@ -1079,7 +1107,7 @@ FMCPResponse Tool_ListVariables(const FMCPRequest& Request)
 	{
 		const FBPVariableDescription& Var = Blueprint->NewVariables[SortedIndices[i]];
 		FMCPResponse VarErr;
-		TSharedPtr<FJsonObject> VarObj = BP_BuildVariableSummary(Request, Var, VarErr);
+		TSharedPtr<FJsonObject> VarObj = BP_BuildVariableSummary(Request, Var, VarErr, Blueprint);
 		if (!VarObj.IsValid())
 		{
 			// Per D4 fail-fast — abort whole list on first unsupported pin type. The caller's
@@ -1247,7 +1275,8 @@ FMCPResponse Tool_GetFunction(const FMCPRequest& Request)
 		for (const FBPVariableDescription& LocalVar : Entry->LocalVariables)
 		{
 			FMCPResponse LocalErr;
-			TSharedPtr<FJsonObject> LocalObj = BP_BuildVariableSummary(Request, LocalVar, LocalErr);
+			// Locals aren't class properties — CDO lookup will miss + fall back to text default
+			TSharedPtr<FJsonObject> LocalObj = BP_BuildVariableSummary(Request, LocalVar, LocalErr, Blueprint);
 			if (!LocalObj.IsValid()) { return LocalErr; }
 			Locals.Add(MakeShared<FJsonValueObject>(LocalObj));
 		}
@@ -1443,6 +1472,14 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 
 	const TSharedPtr<FJsonValue> DefaultValueField = Request.Args->TryGetField(TEXT("default_value"));
 	const FString DefaultValueText = BP_ConvertJsonDefaultToText(DefaultValueField);
+
+	// WS3-stress 2026-05-24: Fixed read-side asymmetry. `default_value` IS persisted to
+	// FBPVariableDescription::DefaultValue by AddMemberVariable (BlueprintEditorUtils.cpp:4682)
+	// AND propagated to the GeneratedClass CDO during bp.compile. But compile ALSO clears the
+	// text form on NewVariables[], so a naive get_variable that only reads NewVariables[].DefaultValue
+	// returned null. Fix lives in BP_BuildVariableSummary: prefers CDO-property read when
+	// GeneratedClass available, falls back to text otherwise. Result: full round-trip works for
+	// Int / Bool / String / Real(float/double) — verified via WS3 Phase H test harness.
 
 	// Scope owns the undo group; AddMemberVariable internally calls Modify+Mark.
 	const bool bAdded = FBlueprintEditorUtils::AddMemberVariable(
