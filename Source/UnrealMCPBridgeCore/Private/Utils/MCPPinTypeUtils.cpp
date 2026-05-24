@@ -177,6 +177,24 @@ namespace
 			OutTerminal.TerminalSubCategory = FName(*SubCat);
 		}
 
+		// Wave S+5 fix mirror: PC_Real terminal in map value_type also needs subcategory
+		// "float" or "double" — otherwise UE asserts and crashes on compile. Same trap as
+		// the outer pin_type path (BlueprintCompilerMisc.cpp:1453). Catch upfront.
+		if (Category == UEdGraphSchema_K2::PC_Real)
+		{
+			const FString Sub = OutTerminal.TerminalSubCategory.ToString();
+			if (!Sub.Equals(TEXT("float"), ESearchCase::CaseSensitive)
+				&& !Sub.Equals(TEXT("double"), ESearchCase::CaseSensitive))
+			{
+				OutErrorCode = kMCPErrorPinTypeUnsupported;
+				OutError = FString::Printf(
+					TEXT("map 'value_type.category' 'Real' requires subcategory 'float' or 'double' "
+						 "(got '%s'); UE's BP compiler asserts on missing subcategory for PC_Real"),
+					Sub.IsEmpty() ? TEXT("(empty)") : *Sub);
+				return false;
+			}
+		}
+
 		FString SubObjPath;
 		if (Obj->TryGetStringField(TEXT("subcategory_object_path"), SubObjPath) && !SubObjPath.IsEmpty())
 		{

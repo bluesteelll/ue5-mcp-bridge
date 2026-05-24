@@ -1446,6 +1446,16 @@ FMCPResponse Tool_AddVariable(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'variable_name'"));
 	}
+	// Wave S+6 mirror: cap variable_name at 256 — UE prepends BP path prefix when forming
+	// fully-qualified FName; total must stay under NAME_SIZE-1=1023 to avoid editor crash.
+	if (VarNameStr.Len() > 256)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(
+				TEXT("variable_name length %d exceeds safe limit (256); UE-side FName "
+					 "qualification with the BP path can overflow NAME_SIZE-1=1023 and crash"),
+				VarNameStr.Len()));
+	}
 
 	FEdGraphPinType NewPinType;
 	FMCPResponse PinTypeErr;
@@ -1724,6 +1734,21 @@ FMCPResponse Tool_AddFunction(const FMCPRequest& Request)
 	{
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
 			TEXT("missing required string field 'function_name'"));
+	}
+	// Wave S+6 fix (2026-05-24): UE crashes when the fully-qualified FName (BP graph path +
+	// ":" + function_name) exceeds NAME_SIZE-1 = 1023 chars. UE prepends a BP-path prefix like
+	// "/Game/Subfolder/BP_X.BP_X:" (~30-60 chars typically, can be 200+ in nested folders).
+	// To stay safely under the limit regardless of BP location, cap function_name at 256 —
+	// covers every reasonable identifier and leaves ~767 chars for UE's prefix.
+	// Verified via WS3 Phase J: 5000 chars crashed, 1023 chars STILL crashed (got 1074 with prefix).
+	if (FnNameStr.Len() > 256)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidParams,
+			FString::Printf(
+				TEXT("function_name length %d exceeds safe limit (256); UE prepends a "
+					 "BP-path prefix to form the fully-qualified FName, total of which "
+					 "must stay under NAME_SIZE-1=1023 — long names crash the editor"),
+				FnNameStr.Len()));
 	}
 
 	FMCPResponse ResolveErr;
