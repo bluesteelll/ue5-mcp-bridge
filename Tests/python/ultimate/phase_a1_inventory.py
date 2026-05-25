@@ -45,6 +45,7 @@ from mcp_test_harness import (
     is_transport_failure,
     is_valid_bridge_error,
     latest_crash_dump,
+    preflight,
     snapshot,
 )
 
@@ -84,8 +85,7 @@ HARD_FAIL_CODES = {-32601}
 
 
 def main() -> int:
-    if not health():
-        print("FATAL: editor unreachable at start", file=sys.stderr)
+    if not preflight(PHASE):
         return 2
 
     log = TestLogger(PHASE, NAME)

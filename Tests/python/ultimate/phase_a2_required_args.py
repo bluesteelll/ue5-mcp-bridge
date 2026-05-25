@@ -49,6 +49,7 @@ from mcp_test_harness import (
     Connection,
     TestLogger,
     call,
+    cleanup_phantom_assets,
     dummy_value,
     err_code,
     err_message,
@@ -56,6 +57,7 @@ from mcp_test_harness import (
     is_ok,
     is_transport_failure,
     latest_crash_dump,
+    preflight,
 )
 
 PHASE = "a2"
@@ -179,8 +181,7 @@ def discover_required_chain(method: str, conn: "Connection" = None) -> List[Tupl
 
 
 def main() -> int:
-    if not health():
-        print("FATAL: editor unreachable at start", file=sys.stderr)
+    if not preflight(PHASE):
         return 2
 
     needs_args_path = LOG_ROOT / "a1_needs_args.json"
@@ -220,6 +221,18 @@ def main() -> int:
     total_fields = sum(len(c) for c in chains.values())
     log.note(f"Discovered {total_fields} required fields across {len(chains)} methods")
     print(f"[A2] total required fields discovered: {total_fields}", flush=True)
+
+    # PERF: cleanup chain-walker side-effects before stage 2 — chain walker
+    # provided dummies that satisfied required-arg validators, which means
+    # the handler often ran to completion and created assets/folders/actors
+    # in /Game/_phantom_*. Without cleanup the editor's Lane A queue
+    # saturates after ~150 methods of stage 2 (observed in pre-cleanup
+    # run: 88 min wall, 696 socket_died failures).
+    print("[A2] post-stage-1 cleanup …", flush=True)
+    cs = cleanup_phantom_assets()
+    print(f"  cleanup: folders={cs['folders_deleted']} actors={cs['actors_destroyed']} "
+          f"uobj_delta={cs.get('uobj_delta', '?')} mb_delta={cs.get('mb_delta', 0):.1f}", flush=True)
+    log.note(f"Post-stage-1 cleanup: {cs}")
 
     # Stage 2: per-field hostile probes
     # PERF: open ONE keep-alive socket per method, reuse for all its probes.
@@ -296,6 +309,11 @@ def main() -> int:
                 return 2
             if (m_idx + 1) % 30 == 0:
                 print(f"  probe {m_idx+1}/{len(chains)} cases_so_far={case_total} fails={fail_total}", flush=True)
+        # Periodic cleanup — keep Lane A queue + UObject count under control
+        if (m_idx + 1) % 50 == 0:
+            cs = cleanup_phantom_assets()
+            print(f"  cleanup@{m_idx+1}: folders={cs['folders_deleted']} actors={cs['actors_destroyed']} "
+                  f"uobj_delta={cs.get('uobj_delta', '?')}", flush=True)
 
     # Crash dump scrape
     crash = latest_crash_dump(since=crash_baseline)

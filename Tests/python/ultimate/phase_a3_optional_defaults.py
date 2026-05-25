@@ -48,6 +48,7 @@ from mcp_test_harness import (
     LOG_ROOT,
     TestLogger,
     call,
+    cleanup_phantom_assets,
     dummy_value,
     err_code,
     err_message,
@@ -55,6 +56,7 @@ from mcp_test_harness import (
     is_ok,
     is_transport_failure,
     latest_crash_dump,
+    preflight,
 )
 
 PHASE = "a3"
@@ -102,8 +104,7 @@ def discover_chain(method: str) -> List[Tuple[str, str]]:
 
 
 def main() -> int:
-    if not health():
-        print("FATAL: editor unreachable at start", file=sys.stderr)
+    if not preflight(PHASE):
         return 2
 
     # Reuse A2's needs_args.json if available (fast path). Otherwise we'd
@@ -205,6 +206,12 @@ def main() -> int:
         if (idx + 1) % 30 == 0:
             print(f"  [{idx+1}/{len(methods_with_args)}] last={method} "
                   f"coverage_gaps={len(coverage_gaps)} doc_gaps={len(doc_gaps)} fails={fail_total}",
+                  flush=True)
+        # Periodic cleanup to prevent Lane A queue saturation from chain-walker
+        # side-effects (see A2 doc for rationale).
+        if (idx + 1) % 50 == 0:
+            cs = cleanup_phantom_assets()
+            print(f"  cleanup@{idx+1}: folders={cs['folders_deleted']} actors={cs['actors_destroyed']}",
                   flush=True)
 
     # Stash gaps for follow-up

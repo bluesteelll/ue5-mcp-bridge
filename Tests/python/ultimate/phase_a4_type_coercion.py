@@ -49,6 +49,7 @@ from mcp_test_harness import (
     Connection,
     TestLogger,
     call,
+    cleanup_phantom_assets,
     dummy_value,
     err_code,
     err_message,
@@ -56,6 +57,7 @@ from mcp_test_harness import (
     is_ok,
     is_transport_failure,
     latest_crash_dump,
+    preflight,
 )
 
 PHASE = "a4"
@@ -148,8 +150,7 @@ def classify_outcome(r: Dict[str, Any]) -> str:
 
 
 def main() -> int:
-    if not health():
-        print("FATAL: editor unreachable", file=sys.stderr)
+    if not preflight(PHASE):
         return 2
 
     needs_args_path = LOG_ROOT / "a1_needs_args.json"
@@ -219,6 +220,9 @@ def main() -> int:
                 return 2
             if (m_idx + 1) % 50 == 0:
                 print(f"  [{m_idx+1}/{len(methods)}] cases={case_total} fails={fail_total}", flush=True)
+                cs = cleanup_phantom_assets()
+                print(f"  cleanup@{m_idx+1}: folders={cs['folders_deleted']} actors={cs['actors_destroyed']}",
+                      flush=True)
 
     # Stash outcome matrix
     (LOG_ROOT / "a4_coercion_matrix.json").write_text(

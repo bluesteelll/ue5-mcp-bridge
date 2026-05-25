@@ -54,6 +54,7 @@ from mcp_test_harness import (
     is_ok,
     is_transport_failure,
     latest_crash_dump,
+    preflight,
 )
 
 PHASE = "a6"
@@ -225,8 +226,7 @@ def test_tool(log: TestLogger, method: str, args: Dict[str, Any],
 
 
 def main() -> int:
-    if not health():
-        print("FATAL: editor unreachable", file=sys.stderr)
+    if not preflight(PHASE):
         return 2
     log = TestLogger(PHASE, NAME)
     crash_baseline = time.time()

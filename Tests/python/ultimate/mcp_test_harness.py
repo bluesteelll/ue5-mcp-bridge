@@ -284,6 +284,65 @@ def force_gc(settle_s: float = 2.0) -> Dict[str, Any]:
     return {"gc_ok": r.get("ok") is True, "before": before, "after": after, "delta": delta}
 
 
+# Folders/asset paths the harness's dummy_value() may cause the editor to
+# create as side-effects when chain-walking required args. cleanup_phantom_assets
+# best-effort deletes them between batches to prevent Lane A queue saturation.
+_PHANTOM_PATHS = (
+    "/Game/_phantom_ultimate_path",
+    "/Game/_phantom_ultimate_folder",
+    "/Game/PhT_RoundTrip",
+    "/Game/PhT_Codes",
+)
+
+
+def cleanup_phantom_assets(also_force_gc: bool = True, also_destroy_actors: bool = True) -> Dict[str, Any]:
+    """Best-effort cleanup of test-side-effects accumulated by chain walker.
+
+    Deletes the known phantom folder roots in /Game (asset registry deletes
+    cascade), destroys actors spawned at world origin with default class
+    (chain walker's actor.spawn dummy), and optionally runs GC.
+
+    Returns a stats dict (best-effort, errors swallowed).
+    """
+    stats: Dict[str, Any] = {"folders_deleted": 0, "actors_destroyed": 0, "gc_ok": False}
+
+    # Delete content-browser folders (assets + sub-folders recursively).
+    # Note: cb.delete takes 'path' arg, not 'folder_path'.
+    for p in _PHANTOM_PATHS:
+        r = call("cb.delete", {"path": p, "recursive": True}, timeout=15.0)
+        if is_ok(r):
+            stats["folders_deleted"] += 1
+
+    # Destroy actors named like our test placeholders (best-effort label match).
+    if also_destroy_actors:
+        # actor.list returns all actors; filter by label prefix.
+        r = call("actor.list", {"page_size": 1000}, timeout=20.0)
+        if is_ok(r):
+            items = r.get("result", {}).get("items") or []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                label = it.get("actor_label") or it.get("label") or ""
+                path = it.get("actor_path") or it.get("object_path")
+                # Match anything the chain walker might have created at origin.
+                # Heuristic: default StaticMeshActor labels start with "Static",
+                # default empty Actor labels start with "Actor_". We DO NOT touch
+                # those — they're real level actors. Only destroy if label has
+                # our RT_ / PhT_ / phantom marker.
+                if path and any(m in label for m in ("RT_", "PhT_", "phantom", "Phantom")):
+                    dr = call("actor.destroy", {"actor_path": path}, timeout=10.0)
+                    if is_ok(dr):
+                        stats["actors_destroyed"] += 1
+
+    if also_force_gc:
+        gc = force_gc(settle_s=1.0)
+        stats["gc_ok"] = gc.get("gc_ok", False)
+        stats["uobj_delta"] = gc["delta"].get("live_uobject_slots", 0)
+        stats["mb_delta"] = gc["delta"].get("used_physical_mb", 0.0)
+
+    return stats
+
+
 @contextmanager
 def editor_alive_check(label: str = ""):
     """Asserts editor alive before and after the wrapped block.
@@ -842,6 +901,133 @@ def wait_for_editor(timeout: float = 60.0, poll_s: float = 1.0) -> bool:
             return True
         time.sleep(poll_s)
     return False
+
+
+# ============================================================================
+# Modal-dialog defence + autosave suppression
+# ============================================================================
+#
+# When the editor closes uncleanly (taskkill, crash, OOM) while transient
+# packages exist in memory, UE writes them to .uasset.tmp under Saved/Autosaves.
+# On next launch UE pops a modal "Restore Packages?" dialog that BLOCKS the
+# game thread tick — Lane A handlers can never run until a human clicks OK.
+# Lane B keeps working (worker pool), so health()/snapshot() still respond
+# but every Lane A call times out.
+#
+# Defence-in-depth:
+#  1. Disable autosave at the start of every test run (cfg.set_cvar).
+#  2. Delete the Saved/Autosaves folder on the filesystem before launch.
+#  3. Detect blocked Lane A via a probe (cb.create_folder on phantom path)
+#     and abort the run with a clear message if it times out.
+#
+# UE has no MCP tool to dismiss the modal programmatically (it's a Slate
+# dialog modal to the game thread, but Lane B can't drive Slate). The only
+# automatic recovery is prevention.
+
+def disable_autosave() -> Dict[str, Any]:
+    """Best-effort: turn off the autosave timer to prevent .uasset.tmp creation."""
+    results = {}
+    for cvar, value in (
+        ("Editor.AutoSaveTimeMinutes", "9999"),     # effectively never
+        ("Editor.bAutoSaveEnabled", "0"),           # explicit off (if exposed)
+        ("AutosavePackageWarningSeconds", "9999"),  # don't prompt
+    ):
+        r = call("cfg.set_cvar", {"name": cvar, "value": value}, timeout=4.0)
+        results[cvar] = err_code(r) if not is_ok(r) else "ok"
+    return results
+
+
+def purge_autosaves_on_disk(project_dir: Path = Path("D:/Unreal Engine Projects/FatumGame")) -> int:
+    """Delete Saved/Autosaves on disk to prevent the Restore Packages dialog on
+    next editor launch. Returns count of deleted files.
+
+    Safe to call any time — autosaves are by definition non-canonical.
+    """
+    autosave_dir = project_dir / "Saved" / "Autosaves"
+    if not autosave_dir.exists():
+        return 0
+    count = 0
+    for root, _dirs, files in os.walk(autosave_dir):
+        for fn in files:
+            try:
+                (Path(root) / fn).unlink()
+                count += 1
+            except OSError:
+                pass
+    return count
+
+
+def assert_lane_a_alive(timeout_s: float = 6.0) -> bool:
+    """Probe Lane A queue. Returns False if a Lane A op times out (likely the
+    editor is blocked by a modal dialog). Cleans up after itself.
+    """
+    # Use a path that's syntactically valid but doesn't actually create
+    # disk state — cfg.set_cvar is fast Lane A side-effect-free path.
+    # If it round-trips successfully, Lane A is alive.
+    probe_path = f"/Game/_lane_a_probe_{random_suffix(6)}"
+    r = call("cb.create_folder", {"path": probe_path}, timeout=timeout_s)
+    if not is_ok(r):
+        # Either we got an error (still alive — dispatcher worked) or transport
+        # failure. -32014 PathInUse, -32602, etc. = dispatched OK. Transport
+        # failure = Lane A queue dead.
+        if is_transport_failure(r):
+            return False
+        # Other errors mean Lane A IS alive but our probe arguments wrong.
+        # Treat as alive — better to false-positive than block.
+        return True
+    # Successfully created → delete + report alive
+    call("cb.delete", {"path": probe_path}, timeout=timeout_s)
+    return True
+
+
+def preflight(label: str = "") -> bool:
+    """Run before any phase script's main loop.
+
+    Returns True if editor is fully usable (both Lane A and Lane B). False
+    if blocked (likely Restore Packages or similar modal). Caller should
+    abort phase if False, instructing the user to dismiss the dialog.
+
+    Side-effects:
+      - Disables autosave for the session (prevents Restore-Packages on
+        next launch if this run crashes).
+    """
+    if not health():
+        print(f"[preflight {label}] editor unreachable", file=sys.stderr)
+        return False
+    # Lane B works (we got health). Now probe Lane A.
+    if not assert_lane_a_alive(timeout_s=8.0):
+        print(f"[preflight {label}] Lane A queue DEAD — editor likely blocked by",
+              file=sys.stderr)
+        print("    a modal dialog (Restore Packages?, Save Changes?, etc.).",
+              file=sys.stderr)
+        print("    Dismiss the dialog in the editor UI and re-run.", file=sys.stderr)
+        print(f"    (Phantom autosaves on disk that re-trigger the dialog can be",
+              file=sys.stderr)
+        print(f"    purged via: rm -rf <ProjectDir>/Saved/Autosaves/Game)",
+              file=sys.stderr)
+        return False
+    # Defence: suppress autosave for this session so a crash mid-run doesn't
+    # cause the Restore Packages dialog to block next launch.
+    disable_autosave()
+    return True
+
+
+def postflight(label: str = "", purge_autosaves: bool = True) -> Dict[str, Any]:
+    """Run after a phase script's main loop (in main()'s finally:).
+
+    Cleans up test side-effects:
+      - cleanup_phantom_assets() — best-effort delete of /Game/_phantom_* etc.
+      - purge_autosaves_on_disk() — delete Saved/Autosaves/Game so any
+        unflushed transient packages don't trigger Restore Packages on
+        the NEXT editor launch.
+
+    Returns stats dict.
+    """
+    stats = cleanup_phantom_assets(also_force_gc=True, also_destroy_actors=True)
+    if purge_autosaves:
+        stats["autosaves_purged"] = purge_autosaves_on_disk()
+    print(f"[postflight {label}] {stats}")
+    return stats
 
 # ============================================================================
 # Self-test (run directly to verify harness)

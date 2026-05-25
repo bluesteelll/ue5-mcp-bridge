@@ -43,6 +43,7 @@ from mcp_test_harness import (
     is_ok,
     is_transport_failure,
     latest_crash_dump,
+    preflight,
     random_suffix,
 )
 
@@ -324,8 +325,7 @@ CASES = [
 
 
 def main() -> int:
-    if not health():
-        print("FATAL: editor unreachable", file=sys.stderr)
+    if not preflight(PHASE):
         return 2
 
     if is_pie_active():
