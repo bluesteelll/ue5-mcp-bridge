@@ -959,24 +959,18 @@ def purge_autosaves_on_disk(project_dir: Path = Path("D:/Unreal Engine Projects/
 
 def assert_lane_a_alive(timeout_s: float = 6.0) -> bool:
     """Probe Lane A queue. Returns False if a Lane A op times out (likely the
-    editor is blocked by a modal dialog). Cleans up after itself.
+    editor is blocked by a modal dialog).
+
+    Uses asset.exists (Lane A, read-only) — no side-effects, no cleanup needed.
     """
-    # Use a path that's syntactically valid but doesn't actually create
-    # disk state — cfg.set_cvar is fast Lane A side-effect-free path.
-    # If it round-trips successfully, Lane A is alive.
-    probe_path = f"/Game/_lane_a_probe_{random_suffix(6)}"
-    r = call("cb.create_folder", {"path": probe_path}, timeout=timeout_s)
-    if not is_ok(r):
-        # Either we got an error (still alive — dispatcher worked) or transport
-        # failure. -32014 PathInUse, -32602, etc. = dispatched OK. Transport
-        # failure = Lane A queue dead.
-        if is_transport_failure(r):
-            return False
-        # Other errors mean Lane A IS alive but our probe arguments wrong.
-        # Treat as alive — better to false-positive than block.
-        return True
-    # Successfully created → delete + report alive
-    call("cb.delete", {"path": probe_path}, timeout=timeout_s)
+    r = call("asset.exists",
+             {"asset_path": "/Game/__lane_a_probe_nonexistent__"},
+             timeout=timeout_s)
+    if is_transport_failure(r):
+        return False
+    # asset.exists returns ok=true with {exists: false} for missing paths,
+    # OR a structured error (-32004, -32602 etc.) — any dispatched response
+    # means Lane A queue is alive.
     return True
 
 
