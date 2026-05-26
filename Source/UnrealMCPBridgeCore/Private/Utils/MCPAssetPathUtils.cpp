@@ -137,6 +137,27 @@ FString Normalize(const FString& InPath)
 		return {};
 	}
 
+	// Wave S+19 (2026-05-26): "/./" relative-current-dir segment. While "/Game/./Foo" resolves
+	// to "/Game/Foo" by Unix path semantics, the dot-segment is a documented bypass pattern for
+	// naive substring-based defences and creates hostile-pattern variants the asset registry
+	// silently accepts. Reject any "/./" anywhere; the leading "/" plus normal package segments
+	// are all UE expects.
+	if (Path.Contains(TEXT("/./"), ESearchCase::CaseSensitive))
+	{
+		return {};
+	}
+
+	// Wave S+19: URL-encoded reserved characters. ``%2E`` (.) and ``%2F`` (/) can sneak past
+	// substring-based ".." / "//" guards while still being silently decoded by some downstream
+	// path-canonicalisation code. UE itself does NOT URL-decode asset paths, so a literal
+	// "%2E%2E" stays in the package name and resolves to a non-existent asset — but it's a clear
+	// hostile intent marker. Reject case-insensitively.
+	if (Path.Contains(TEXT("%2E"), ESearchCase::IgnoreCase) ||
+		Path.Contains(TEXT("%2F"), ESearchCase::IgnoreCase))
+	{
+		return {};
+	}
+
 	// Must start with a forward slash — the universal UE mount-point marker.
 	if (!Path.StartsWith(TEXT("/"), ESearchCase::CaseSensitive))
 	{

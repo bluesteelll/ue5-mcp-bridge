@@ -39,11 +39,66 @@ FString NormaliseMapPath(const FString& Raw)
 		return FString();
 	}
 
-	// Collapse backslashes (Windows path leakage) and drop trailing slashes.
-	FString Out = Raw.Replace(TEXT("\\"), TEXT("/"));
+	// Wave S+19 (2026-05-26) hardening — bring NormaliseMapPath to parity with
+	// FMCPAssetPathUtils::Normalize so level.* surfaces (level.duplicate / level.load /
+	// level.create / level.save / level.unload / actor-path map-component resolution / etc.)
+	// inherit the same crash-prevention guards. Discovered via B4 path-traversal sweep: backslash,
+	// empty segments, control chars, and URL-encoded sequences were all silently accepted by
+	// NormaliseMapPath (lenient: backslash WAS replaced with forward-slash, others uncheck'd),
+	// allowing hostile-pattern variants through level mutators. The strict guards below match
+	// FMCPAssetPathUtils::Normalize byte-for-byte.
+
+	FString Out = Raw;
+	Out.TrimStartAndEndInline();
+
+	// Length cap (Windows MAX_PATH headroom). Same threshold as Normalize.
+	if (Out.Len() > 240)
+	{
+		return FString();
+	}
+
+	// Reject control characters and DEL. None belong in a UE asset path — they corrupt FName
+	// internals and asset registry serialisation.
+	for (TCHAR Ch : Out)
+	{
+		if (Ch < 0x20 || Ch == 0x7F)
+		{
+			return FString();
+		}
+	}
+
+	// Reject backslashes (NO LONGER auto-replaced — see Wave S+19 hardening rationale above).
+	// Backslash in a UE asset path is always a code-smell or hostile probe.
+	if (Out.Contains(TEXT("\\"), ESearchCase::CaseSensitive))
+	{
+		return FString();
+	}
+
+	// Drop trailing slashes (e.g. "/Game/Maps/" → "/Game/Maps").
 	while (Out.Len() > 1 && Out.EndsWith(TEXT("/")))
 	{
 		Out.LeftChopInline(1);
+	}
+
+	// Reject relative-path escape and other hostile path-traversal patterns. ``..`` could escape
+	// the project sandbox; ``//`` (double slash) crashes FName/FSoftObjectPath internals (S+18);
+	// ``/./`` and URL-encoded ``%2E`` / ``%2F`` are bypass markers for naive substring guards.
+	if (Out.Contains(TEXT(".."), ESearchCase::CaseSensitive))
+	{
+		return FString();
+	}
+	if (Out.Contains(TEXT("//"), ESearchCase::CaseSensitive))
+	{
+		return FString();
+	}
+	if (Out.Contains(TEXT("/./"), ESearchCase::CaseSensitive))
+	{
+		return FString();
+	}
+	if (Out.Contains(TEXT("%2E"), ESearchCase::IgnoreCase) ||
+		Out.Contains(TEXT("%2F"), ESearchCase::IgnoreCase))
+	{
+		return FString();
 	}
 
 	// Strip the optional ``.AssetName`` suffix — both ``/Game/Maps/X`` and ``/Game/Maps/X.X``
