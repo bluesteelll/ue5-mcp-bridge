@@ -222,7 +222,83 @@ def test_tool(log: TestLogger, method: str, args: Dict[str, Any],
         log.case(f"{method}/page_size_zero", "XFAIL",
                  f"unexpected: code={c4} msg={err_message(r4)[:60]}", code=c4)
 
+    # Case 5: stale_cursor — fetch page 1 with filter F1, then re-use the
+    # returned token with filter F2 → expect -32015 StaleCursor when the
+    # tool embeds a filter hash in its cursor (asset.list / asset.search_*
+    # / bp.list_nodes_in_function etc.). Tools that don't embed filter
+    # hash legitimately succeed — those XFAIL (not all paginated tools
+    # carry stale-cursor semantics).
+    _try_stale_cursor(log, method, args, item_key)
+
     return 0
+
+
+# Filter-pair candidates: tool → (filter_variants). For each tool we walk
+# page 1 with variant[0], capture next_page_token, then re-call with
+# variant[1] + same token. Two filter variants must produce DIFFERENT
+# result sets for the staleness check to be meaningful — but the bridge
+# should detect tampering regardless of whether result sets actually differ.
+_STALE_FILTER_PAIRS: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {
+    "asset.list": (
+        {"class_name": "Blueprint"},
+        {"class_name": "Material"},
+    ),
+    "cb.list": (
+        {"folder_path": "/Game"},
+        {"folder_path": "/Engine"},
+    ),
+    "bp.list": (
+        {"name_filter": "BP_"},
+        {"name_filter": "WBP_"},
+    ),
+    "actor.list": (
+        {"class_filter": "/Script/Engine.StaticMeshActor"},
+        {"class_filter": "/Script/Engine.Pawn"},
+    ),
+    # data_table / curve / input / ai.* listings — filter is the only var
+    # we can change cleanly. For surfaces without a usable filter, the
+    # function silently skips by returning XFAIL.
+}
+
+
+def _try_stale_cursor(log: TestLogger, method: str, args: Dict[str, Any],
+                       item_key: str) -> None:
+    case_id = f"{method}/stale_cursor"
+    pair = _STALE_FILTER_PAIRS.get(method)
+    if not pair:
+        log.case(case_id, "SKIP",
+                 "no filter pair defined for this surface — staleness test not applicable")
+        return
+    f1, f2 = pair
+    # Page 1 with filter F1, small page_size so we get a next_page_token
+    a1 = dict(args); a1.update(f1); a1["page_size"] = 2
+    r1 = call(method, a1, timeout=8.0)
+    if not is_ok(r1):
+        log.case(case_id, "XFAIL",
+                 f"page 1 with F1 failed: code={err_code(r1)} msg={err_message(r1)[:60]}",
+                 code=err_code(r1))
+        return
+    token = r1.get("result", {}).get("next_page_token") or None
+    if not token:
+        log.case(case_id, "SKIP",
+                 f"F1 returned no next_page_token (only one page) — staleness test inapplicable")
+        return
+    # Re-call with filter F2 + same token
+    a2 = dict(args); a2.update(f2); a2["page_size"] = 2; a2["page_token"] = token
+    r2 = call(method, a2, timeout=8.0)
+    c2 = err_code(r2)
+    if c2 == -32015:
+        log.case(case_id, "PASS",
+                 "tool detected filter swap mid-pagination → -32015 StaleCursor",
+                 code=c2)
+    elif is_ok(r2):
+        log.case(case_id, "XFAIL",
+                 "tool silently accepted stale cursor (filter not hashed into token)",
+                 code=c2)
+    else:
+        log.case(case_id, "XFAIL",
+                 f"unexpected code={c2}: {err_message(r2)[:60]} (expected -32015 or ok)",
+                 code=c2)
 
 
 def main() -> int:

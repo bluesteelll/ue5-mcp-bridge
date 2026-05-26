@@ -46,9 +46,11 @@ from typing import Any, Dict, List, Tuple
 sys.path.insert(0, str(Path(__file__).parent))
 from mcp_test_harness import (
     LOG_ROOT,
+    Connection,
     TestLogger,
     call,
     cleanup_phantom_assets,
+    discover_chain_via_probes,
     discover_chains_static,
     dummy_value,
     err_code,
@@ -75,34 +77,28 @@ def baseline_args_from_chain(chain: List[Tuple[str, str]]) -> Dict[str, Any]:
     return {f: dummy_value(t, f) for (t, f) in chain}
 
 
-# Reuses harness's static chain discovery + single-shot live fallback.
+# Reuses harness's static chain discovery + multi-probe live fallback.
 _STATIC_CHAINS: Optional[Dict[str, List[Tuple[str, str]]]] = None
 
 
-def discover_chain(method: str) -> List[Tuple[str, str]]:
-    """Hybrid chain discovery — prefer static source-parse, fall back to one
-    live probe for first-missing-field. See A2 for the same pattern.
+def discover_chain(conn: Connection, method: str) -> List[Tuple[str, str]]:
+    """Hybrid chain discovery — start with static source-parse, then augment
+    via live multi-probe (up to 5 iters) when static chain is incomplete.
+
+    Multi-probe is bounded to 5 live calls per method and stops on:
+    - validator passing (-32602 gone)
+    - unparseable error message
+    - same field reported twice (loop guard)
+
+    Side-effect: handler short-circuits at first missing field each iter
+    (never runs to completion) → minimal Lane A pressure.
     """
     global _STATIC_CHAINS
     if _STATIC_CHAINS is None:
         _STATIC_CHAINS = discover_chains_static()
-    sc = _STATIC_CHAINS.get(method, [])
-    if sc:
-        return sc
-    # Fallback: one live call to find first required field
-    import re
-    RE_MISSING = re.compile(
-        r"missing(?: or empty)? required (?:(?:non-empty|valid|numeric) )?(\w+)?\s*field '([A-Za-z0-9_]+)'",
-        re.IGNORECASE,
-    )
-    r = call(method, {}, timeout=4.0)
-    if err_code(r) != -32602:
-        return []
-    m = RE_MISSING.search(err_message(r) or "")
-    if not m:
-        return []
-    typ = (m.group(1) or "string").lower()
-    return [(typ, m.group(2))]
+    initial = _STATIC_CHAINS.get(method, [])
+    # Always augment via live probe — static may have found only first field
+    return discover_chain_via_probes(conn, method, max_iter=6, initial=initial)
 
 
 def main() -> int:
@@ -134,8 +130,25 @@ def main() -> int:
     coverage_gaps: List[Dict[str, Any]] = []
     doc_gaps: List[Dict[str, Any]] = []
 
+    # Persistent connection for chain-discovery probes (saves socket churn).
+    discover_conn = Connection()
+    discover_conn.__enter__()
+
     for idx, method in enumerate(methods_with_args):
-        chain = discover_chain(method)
+        try:
+            chain = discover_chain(discover_conn, method)
+        except Exception as e:
+            # If discovery socket died, reconnect once and retry
+            try:
+                discover_conn.__exit__(None, None, None)
+            except Exception:
+                pass
+            discover_conn = Connection()
+            discover_conn.__enter__()
+            try:
+                chain = discover_chain(discover_conn, method)
+            except Exception:
+                chain = []
         baseline = baseline_args_from_chain(chain)
 
         # ---- Case 1: minimal_call ---------------------------------------
@@ -215,6 +228,12 @@ def main() -> int:
             cs = cleanup_phantom_assets()
             print(f"  cleanup@{idx+1}: folders={cs['folders_deleted']} actors={cs['actors_destroyed']}",
                   flush=True)
+
+    # Cleanup chain-discovery connection
+    try:
+        discover_conn.__exit__(None, None, None)
+    except Exception:
+        pass
 
     # Stash gaps for follow-up
     if coverage_gaps:

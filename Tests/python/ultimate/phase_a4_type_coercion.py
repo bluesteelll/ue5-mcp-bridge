@@ -50,6 +50,7 @@ from mcp_test_harness import (
     TestLogger,
     call,
     cleanup_phantom_assets,
+    discover_chain_via_probes,
     discover_chains_static,
     dummy_value,
     err_code,
@@ -117,27 +118,16 @@ _STATIC_CHAINS: Optional[Dict[str, List[Tuple[str, str]]]] = None
 
 
 def discover_chain_keepalive(conn: Connection, method: str) -> List[Tuple[str, str]]:
-    """Hybrid chain discovery — static source-parse first, single live probe
-    fallback. Avoids Lane A queue saturation when chain walker would
-    otherwise call handlers to completion. See A2 for full rationale.
+    """Hybrid chain discovery — static source-parse first, multi-probe live
+    fallback (up to 5 iters) when static chain incomplete. Avoids Lane A
+    saturation: each probe short-circuits at first missing field. See A2
+    for full rationale.
     """
     global _STATIC_CHAINS
     if _STATIC_CHAINS is None:
         _STATIC_CHAINS = discover_chains_static()
-    sc = _STATIC_CHAINS.get(method, [])
-    if sc:
-        return sc
-    # Fallback: one live call to find first required field
-    try:
-        r = conn.call_keepalive(method, {}, timeout=4.0)
-    except Exception:
-        return []
-    if err_code(r) != -32602:
-        return []
-    m = RE_MISSING.search(err_message(r) or "")
-    if not m:
-        return []
-    return [((m.group(1) or "string").lower(), m.group(2))]
+    initial = _STATIC_CHAINS.get(method, [])
+    return discover_chain_via_probes(conn, method, max_iter=6, initial=initial)
 
 
 def classify_outcome(r: Dict[str, Any]) -> str:

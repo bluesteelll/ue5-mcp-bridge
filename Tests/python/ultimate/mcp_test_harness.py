@@ -643,6 +643,111 @@ def discover_chains_static(src_root: Path = PLUGIN_SRC_ROOT) -> Dict[str, List[T
 # (discover_chains_static is now defined above, inline with discover_required_args).
 
 # ============================================================================
+# Missing-field detection — single source of truth
+# ============================================================================
+#
+# Bridge error messages for missing required args take several forms across
+# 360+ tools. This regex is the union of all forms we've seen in the wild.
+# Returns (type_hint, field_name) on match — type_hint can be None when the
+# handler's error message doesn't name the type.
+#
+# Forms covered (in priority order — first match wins):
+#
+#  1. "missing required <type> field 'X'"
+#     "missing or empty required <type> field 'X'"
+#     "missing required (non-empty|valid|numeric) <type> field 'X'"
+#     "missing required field 'X'"   (typeless)
+#
+#  2. "missing/invalid 'X' field"            (bp.add_comment, bp.move_node)
+#
+#  3. "<method> requires args.X (<note>)"    (anim.add_notify, anim.add_section)
+#
+#  4. "<method> needs args.X ..."            (rare custom form)
+#
+# When two forms could match, form #1 wins (most explicit).
+_RE_MISSING_FIELD_FORM1 = re.compile(
+    r'missing(?:\s+or\s+empty)?\s+required\s+(?:(?:non-empty|valid|numeric)\s+)?'
+    r'(?P<typ>string|number|bool|array|object|int|uint|float|double|field)?\s*'
+    r"(?:field\s+)?'(?P<name>[A-Za-z0-9_\.]+)'",
+    re.IGNORECASE,
+)
+_RE_MISSING_FIELD_FORM2 = re.compile(
+    r"missing/invalid\s+'(?P<name>[A-Za-z0-9_\.]+)'\s+field",
+    re.IGNORECASE,
+)
+_RE_MISSING_FIELD_FORM3 = re.compile(
+    r"\b(?:requires|needs|expects)\s+args\.(?P<name>[A-Za-z0-9_]+)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_missing_field(message: str) -> Optional[Tuple[str, str]]:
+    """Returns (type_hint, field_name) or None.
+
+    type_hint is 'string' when unknown — safe default for `dummy_value`.
+    """
+    if not message:
+        return None
+    m = _RE_MISSING_FIELD_FORM1.search(message)
+    if m:
+        typ = (m.group("typ") or "string").lower()
+        if typ == "field":
+            typ = "string"
+        return (typ, m.group("name"))
+    m = _RE_MISSING_FIELD_FORM2.search(message)
+    if m:
+        return ("array", m.group("name"))  # form 2 is mostly [x,y] arrays
+    m = _RE_MISSING_FIELD_FORM3.search(message)
+    if m:
+        return ("string", m.group("name"))  # safe default
+    return None
+
+
+def discover_chain_via_probes(
+    conn: "Connection",
+    method: str,
+    max_iter: int = 6,
+    initial: Optional[List[Tuple[str, str]]] = None,
+    timeout: float = 4.0,
+) -> List[Tuple[str, str]]:
+    """Multi-probe live chain discovery — keeps satisfying first-missing-field
+    until the handler stops returning -32602 OR max_iter reached OR loop
+    detected (same field reported twice in a row).
+
+    Each probe is a single live call with dummy values for fields known so
+    far. The handler short-circuits at the first missing field, so it never
+    runs to completion — minimal Lane A pressure compared to the old chain
+    walker which provided full satisfying args.
+
+    Returns final chain as [(type, field), ...] suitable for downstream
+    `dummy_value()` construction.
+
+    Cost upper bound: max_iter live calls per method (default 6).
+    """
+    chain: List[Tuple[str, str]] = list(initial or [])
+    seen_fields: set = {f for (_t, f) in chain}
+    last_field: Optional[str] = None
+    for _ in range(max_iter):
+        args = {f: dummy_value(t, f) for (t, f) in chain}
+        try:
+            r = conn.call_keepalive(method, args, timeout=timeout)
+        except Exception:
+            return chain  # transport problem — stop probing
+        if err_code(r) != -32602:
+            return chain  # validator passed (handler moved on / returned other error)
+        miss = parse_missing_field(err_message(r))
+        if not miss:
+            return chain  # can't parse — give up, downstream handles
+        typ, fld = miss
+        if fld == last_field or fld in seen_fields:
+            return chain  # loop guard: same field twice → stuck
+        chain.append((typ, fld))
+        seen_fields.add(fld)
+        last_field = fld
+    return chain
+
+
+# ============================================================================
 # Pagination helper
 # ============================================================================
 
