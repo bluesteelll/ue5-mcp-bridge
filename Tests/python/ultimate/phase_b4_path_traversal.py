@@ -119,6 +119,12 @@ HOSTILE_DISK_PATHS = [
 
 
 # (method, args_template, path_field_name, label_prefix, hostile_set)
+# Note: folder.create / folder.delete are EXCLUDED — they're for world outliner
+# FActorFolders (in-memory labels, not asset paths). Per CLAUDE.md they
+# intentionally accept any string label and are idempotent. They cannot
+# trigger path-traversal vulnerabilities because they never touch disk or
+# the asset registry. Use cb.create_folder / cb.delete for asset-disk-folder
+# operations — those properly normalize.
 PROBES: List[Tuple[str, Dict[str, Any], str, str, str]] = [
     ("asset.exists", {}, "asset_path", "asset.exists", "virtual"),
     ("asset.get_property", {"property_path": "X"}, "asset_path",
@@ -135,8 +141,9 @@ PROBES: List[Tuple[str, Dict[str, Any], str, str, str]] = [
     ("cb.duplicate",
      {"source_path": "/Engine/BasicShapes/Cube.Cube"}, "dest_path",
      "cb.duplicate dest", "virtual"),
-    ("folder.create", {}, "folder_path", "folder.create", "virtual"),
-    ("folder.delete", {}, "folder_path", "folder.delete", "virtual"),
+    # cb.create_folder is the asset-disk-folder variant (properly normalised).
+    # folder.create is world-outliner labelling — excluded, see comment above.
+    ("cb.create_folder", {}, "path", "cb.create_folder", "virtual"),
     ("actor.spawn", {"location": [0, 0, 0]}, "class_path",
      "actor.spawn", "virtual"),
     ("level.duplicate",
