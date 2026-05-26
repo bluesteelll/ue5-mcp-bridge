@@ -193,6 +193,79 @@ bool FMCPConnection::ConsumeBufferedFrames()
 
 void FMCPConnection::HandleFrame(const FString& FrameJson)
 {
+	// Wave S+20 (2026-05-26) — pre-parse JSON depth check.
+	// Discovered via B8 depth-bomb stress: a 500-level nested JSON object blew UE's
+	// TJsonSerializer recursive-descent stack with EXCEPTION_STACK_OVERFLOW (Engine
+	// crash, no Bridge recovery). UE's serializer has NO depth limit, so we must
+	// gate at the parser-entry point. The recursive destructor for the partially-
+	// constructed FJsonObject tree was the actual crash site — even REJECTING the
+	// frame mid-parse doesn't help; the recursion has already overflowed.
+	//
+	// Cheap O(n) lexer scan: count max nesting of { or [ ignoring those inside
+	// JSON string literals. The Bridge protocol has no legitimate need for >32
+	// levels (request envelope = 3-4 levels; deepest tool args we ship are ~6).
+	// 64 is a generous bound; UE's stack starts struggling around 1000 nested
+	// recursive ParseSingleValue() invocations on a Win64 default 1 MB worker stack.
+	constexpr int32 kMaxJsonDepth = 64;
+	{
+		int32 Depth = 0;
+		int32 MaxDepth = 0;
+		bool bInString = false;
+		bool bEscape = false;
+		const int32 Len = FrameJson.Len();
+		const TCHAR* Data = *FrameJson;
+		for (int32 i = 0; i < Len; ++i)
+		{
+			const TCHAR Ch = Data[i];
+			if (bInString)
+			{
+				if (bEscape)
+				{
+					bEscape = false;
+				}
+				else if (Ch == TEXT('\\'))
+				{
+					bEscape = true;
+				}
+				else if (Ch == TEXT('"'))
+				{
+					bInString = false;
+				}
+				continue;
+			}
+			if (Ch == TEXT('"'))
+			{
+				bInString = true;
+				continue;
+			}
+			if (Ch == TEXT('{') || Ch == TEXT('['))
+			{
+				++Depth;
+				if (Depth > MaxDepth)
+				{
+					MaxDepth = Depth;
+				}
+				if (Depth > kMaxJsonDepth)
+				{
+					UE_LOG(LogMCP, Warning,
+						TEXT("MCP connection %d: rejecting JSON frame with depth > %d (max so far %d, frame len=%d)"),
+						ConnectionId, kMaxJsonDepth, MaxDepth, Len);
+					SendImmediateError(FGuid(), -32700,
+						FString::Printf(TEXT("parse error: JSON nesting depth exceeds %d levels"), kMaxJsonDepth));
+					return;
+				}
+			}
+			else if (Ch == TEXT('}') || Ch == TEXT(']'))
+			{
+				if (Depth > 0)
+				{
+					--Depth;
+				}
+			}
+		}
+		// Unbalanced is fine to let through — UE's parser will reject with -32700 itself.
+	}
+
 	TSharedPtr<FJsonObject> ParsedObject;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FrameJson);
 	if (!FJsonSerializer::Deserialize(Reader, ParsedObject) || !ParsedObject.IsValid())
