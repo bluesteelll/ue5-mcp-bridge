@@ -357,6 +357,20 @@ namespace
 				FString::Printf(TEXT("class_path '%s' contains backslash"), *ClassPath));
 			return nullptr;
 		}
+		// Wave S+17: pre-validate length BEFORE LoadObject. LoadObject internally
+		// constructs FNames for package + class parts; if either exceeds FName's
+		// 1023-char limit, the editor hits a fatal assert in FName::Init. Guard
+		// at 512 chars total (way over any legitimate /Game/Long/Path/A.A_C usage
+		// but well below the FName limit). B1 phase repro: 1090-char ClassPath
+		// crashed editor with no crash dump (LoadObject → FName overflow).
+		if (ClassPath.Len() > 512)
+		{
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
+				FString::Printf(
+					TEXT("class_path length %d exceeds 512-char cap (FName::Init limit is 1023 — internal LoadObject would crash)"),
+					ClassPath.Len()));
+			return nullptr;
+		}
 
 		// Best-effort autoload — LoadObject pulls Blueprint reference graphs when needed (10ms-15s).
 		UClass* Class = LoadObject<UClass>(nullptr, *ClassPath);
