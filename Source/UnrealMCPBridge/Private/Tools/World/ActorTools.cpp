@@ -371,6 +371,18 @@ namespace
 					ClassPath.Len()));
 			return nullptr;
 		}
+		// Wave S+18: empty path segments (//) crash internal FName/FSoftObjectPath
+		// construction. ACT_ResolveActorClass doesn't go through MCPAssetPathUtils::Normalize
+		// (it has its own minimal syntax check), so apply the same defence inline.
+		// B4 phase repro: '/Game//_PhT_B4_emptyseg' as class_path crashed editor.
+		if (ClassPath.Contains(TEXT("//")))
+		{
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidClassPath,
+				FString::Printf(
+					TEXT("class_path '%s' contains empty path segment '//' — forbidden by FName/FSoftObjectPath parsing"),
+					*ClassPath));
+			return nullptr;
+		}
 
 		// Best-effort autoload — LoadObject pulls Blueprint reference graphs when needed (10ms-15s).
 		UClass* Class = LoadObject<UClass>(nullptr, *ClassPath);
