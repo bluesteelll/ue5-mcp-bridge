@@ -1232,7 +1232,125 @@ KNOWN_UE_MODAL_TITLES = (
     "Outdated Asset",
     "Source Control",
     "Crash Reporter",
+    # B4 path-traversal phantoms re-create assets that already exist (e.g.
+    # /Game/./_PhT_B4_dot survives as /Game/_/_PhT_B4_dot in the registry,
+    # so next sweep's bp.create_blueprint triggers the overwrite prompt).
+    "Overwrite Existing Object",
+    "Overwrite",
+    "Asset Already Exists",
+    "Replace",
+    "Delete Asset",
+    "Delete Assets",
+    "Warning: Low Drive Space",
+    "Warning",
 )
+
+
+# Substrings that identify a modal even when the exact title differs.
+# Used by the GENERIC dismiss path which enumerates ALL UE-process windows
+# and looks for "modal-like" titles (anything matching these substrings).
+# Caught by generic but missed by exact-match KNOWN_UE_MODAL_TITLES.
+_GENERIC_MODAL_KEYWORDS = (
+    "warning",
+    "error",
+    "confirm",
+    "save",
+    "overwrite",
+    "restore",
+    "compile",
+    "discard",
+    "delete",
+    "replace",
+    "missing",
+    "outdated",
+)
+
+
+# Substrings that identify the editor's MAIN window (must NOT be dismissed).
+# When enumerating UE-process windows we skip anything with these.
+_MAIN_WINDOW_KEYWORDS = (
+    "unreal editor",
+    "fatumgame",
+)
+
+
+def _find_ue_pids() -> List[int]:
+    """Return list of UnrealEditor.exe PIDs (Windows-only)."""
+    if os.name != "nt":
+        return []
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10)
+        pids = []
+        for line in (res.stdout or "").strip().splitlines():
+            if "UnrealEditor" in line:
+                parts = [p.strip('"') for p in line.split(",")]
+                if len(parts) >= 2 and parts[1].isdigit():
+                    pids.append(int(parts[1]))
+        return pids
+    except Exception:
+        return []
+
+
+def _enumerate_ue_modal_hwnds() -> List[Tuple[int, str]]:
+    """Enumerate all visible UE-process windows that LOOK like modals.
+
+    Heuristic: visible window owned by UnrealEditor.exe with a title that
+    matches `_GENERIC_MODAL_KEYWORDS` and does NOT match `_MAIN_WINDOW_KEYWORDS`
+    is a modal.
+
+    Returns list of (hwnd, title) tuples.
+    """
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return []
+    user32 = ctypes.windll.user32
+    ue_pids = set(_find_ue_pids())
+    if not ue_pids:
+        return []
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found: List[Tuple[int, str]] = []
+    def cb(hwnd, lparam):
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in ue_pids:
+            return True
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+        if not title:
+            return True
+        title_lower = title.lower()
+        # Skip the main editor window
+        for kw in _MAIN_WINDOW_KEYWORDS:
+            if kw in title_lower:
+                return True
+        # Match known full titles
+        if title in KNOWN_UE_MODAL_TITLES:
+            found.append((hwnd, title))
+            return True
+        # Match generic substrings
+        for kw in _GENERIC_MODAL_KEYWORDS:
+            if kw in title_lower:
+                found.append((hwnd, title))
+                return True
+        return True
+    try:
+        user32.EnumWindows(EnumWindowsProc(cb), 0)
+    except Exception:
+        pass
+    return found
 
 
 def dismiss_ue_modal_via_win32(titles: Tuple[str, ...] = KNOWN_UE_MODAL_TITLES) -> Optional[str]:
@@ -1350,6 +1468,37 @@ def dismiss_ue_modal_via_win32(titles: Tuple[str, ...] = KNOWN_UE_MODAL_TITLES) 
 
         # Still not dismissed — report partial info
         return f"{title} (FOUND but DISMISS FAILED)"
+
+    # === FALLBACK: GENERIC enumeration ===
+    # Exact-title search above missed everything. Try enumerating ALL
+    # UE-process windows for modal-like titles (heuristic match). This
+    # catches new modal titles we haven't catalogued yet — including
+    # localised strings, version-specific variants, and the long tail.
+    candidates = _enumerate_ue_modal_hwnds()
+    for (hwnd, title) in candidates:
+        # Try WM_CLOSE first (most reliable for Slate)
+        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        time.sleep(0.5)
+        # Check if it's gone
+        still_exists = False
+        for (h, _t) in _enumerate_ue_modal_hwnds():
+            if h == hwnd:
+                still_exists = True
+                break
+        if not still_exists:
+            return f"{title} (generic + WM_CLOSE)"
+        # Try Enter via PostMessage
+        user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0)
+        user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0)
+        time.sleep(0.5)
+        still_exists = False
+        for (h, _t) in _enumerate_ue_modal_hwnds():
+            if h == hwnd:
+                still_exists = True
+                break
+        if not still_exists:
+            return f"{title} (generic + WM_KEYDOWN)"
+        # Couldn't dismiss this one; continue to next candidate
     return None
 
 
