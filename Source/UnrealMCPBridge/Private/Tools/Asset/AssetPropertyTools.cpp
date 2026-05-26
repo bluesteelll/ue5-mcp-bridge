@@ -50,10 +50,23 @@ namespace
 		// fails with "no property X on Package". Fix: auto-canonicalise to object-path form via
 		// FMCPAssetPathUtils::ToObjectPath BEFORE resolve so the lookup always targets the inner
 		// asset. Idempotent for paths that already include .AssetName suffix.
+		//
+		// S+18 (2026-05-26): Normalize-rejected paths used to fall through to raw — that defeated
+		// the defence layer (Normalize rejects // / \\ / control-chars / .. / >240 chars). Hostile
+		// inputs like /Game//_X were then sent into ResolveObjectPath → FindObject → FName::Init
+		// crash. Switch to STRICT: if Normalize rejects, surface kMCPErrorInvalidPath instead of
+		// proceeding with the raw input.
 		const FString NormalizedPath = FMCPAssetPathUtils::Normalize(OutPath);
-		const FString ObjectPath = NormalizedPath.IsEmpty()
-			? OutPath  // fallback to raw input if Normalize rejected (preserves the original error)
-			: FMCPAssetPathUtils::ToObjectPath(NormalizedPath);
+		if (NormalizedPath.IsEmpty())
+		{
+			OutError = FMCPToolHelpers::MakeError(Request, kMCPErrorInvalidPath,
+				FString::Printf(
+					TEXT("asset_path '%s' rejected by path normalizer (empty segments, control chars, "
+					     "relative escape, backslashes, or length > 240 are forbidden)"),
+					*OutPath));
+			return nullptr;
+		}
+		const FString ObjectPath = FMCPAssetPathUtils::ToObjectPath(NormalizedPath);
 
 		UObject* Asset = FMCPReflection::ResolveObjectPath(ObjectPath);
 		if (!Asset)
