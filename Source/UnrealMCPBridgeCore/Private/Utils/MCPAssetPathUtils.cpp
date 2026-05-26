@@ -126,6 +126,17 @@ FString Normalize(const FString& InPath)
 		return {};
 	}
 
+	// Wave S+18 (2026-05-26): empty path segments crash FName/FSoftObjectPath internals.
+	// Discovered via B4 path-traversal stress: ``/Game//_X`` (double-slash) sent to
+	// asset.get_property → FMCPReflection::ResolveObjectPath → FindObject → internal FName
+	// construction died with editor crash, no Lane B recovery. Reject any "//" anywhere in
+	// path (the leading "/" is the only legal start; doubled internal slashes are never
+	// meaningful in UE asset paths).
+	if (Path.Contains(TEXT("//"), ESearchCase::CaseSensitive))
+	{
+		return {};
+	}
+
 	// Must start with a forward slash — the universal UE mount-point marker.
 	if (!Path.StartsWith(TEXT("/"), ESearchCase::CaseSensitive))
 	{
