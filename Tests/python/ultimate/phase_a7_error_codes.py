@@ -193,9 +193,45 @@ def main() -> int:
                   {"folder_path": f"/Game/_phantom_nowhere_{random_suffix(8)}"},
                   allow_codes={-32004}, xfail_other=True)
 
-    # -32057 FunctionParameterDuplicate — requires a BP fixture, expensive
-    log.case("-32057/func_param_dup", "SKIP",
-             "requires BP fixture; covered indirectly by A5 case_bp_create_var_get")
+    # -32057 FunctionParameterDuplicate — build BP fixture, add param twice
+    bp_path = f"/Game/PhT_Codes/BP_Dup_{random_suffix(6)}"
+    fn_name = "DupTestFn"
+    param_name = "DupParam"
+    rc = call("bp.create_blueprint",
+              {"dest_path": bp_path, "parent_class_path": "/Script/Engine.Actor"},
+              timeout=15.0)
+    if not is_ok(rc):
+        log.case("-32057/func_param_dup", "XFAIL",
+                 f"BP fixture create failed: {err_message(rc)[:60]} code={err_code(rc)}",
+                 code=err_code(rc))
+    else:
+        rf = call("bp.add_function",
+                  {"blueprint_path": bp_path, "function_name": fn_name}, timeout=10.0)
+        if not is_ok(rf):
+            log.case("-32057/func_param_dup", "XFAIL",
+                     f"BP fixture add_function failed: {err_message(rf)[:60]}",
+                     code=err_code(rf))
+        else:
+            # First add — should succeed
+            r1 = call("bp.add_function_parameter",
+                      {"blueprint_path": bp_path, "function_name": fn_name,
+                       "param_name": param_name,
+                       "pin_type": {"category": "Real", "subcategory": "float"}},
+                      timeout=8.0)
+            if not is_ok(r1):
+                log.case("-32057/func_param_dup", "XFAIL",
+                         f"first add_function_parameter failed: {err_message(r1)[:60]}",
+                         code=err_code(r1))
+            else:
+                # Second add — SAME param_name → expect -32057 FunctionParameterDuplicate
+                fail += probe(log, "-32057/func_param_dup", -32057,
+                              "bp.add_function_parameter",
+                              {"blueprint_path": bp_path, "function_name": fn_name,
+                               "param_name": param_name,
+                               "pin_type": {"category": "Real", "subcategory": "float"}},
+                              allow_codes={-32602}, xfail_other=True)
+        # Cleanup BP fixture
+        call("cb.delete", {"path": bp_path}, timeout=6.0)
 
     # -32058 OperationFailed — ai.eqs.run_query with bad context
     fail += probe(log, "-32058/operation_failed", -32058,
