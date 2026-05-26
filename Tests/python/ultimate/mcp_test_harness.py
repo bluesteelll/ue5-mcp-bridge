@@ -1500,28 +1500,33 @@ def preflight(label: str = "") -> bool:
     Returns True if editor is fully usable (both Lane A and Lane B). False
     if blocked AFTER auto-recovery attempted (rare).
 
-    Auto-recovery flow:
-      1. Probe health() — fail = process dead, return False
+    Auto-recovery flow (all autonomous, no user intervention):
+      1. Probe health() — fail = process dead → kill+relaunch (cold start)
       2. Probe Lane A — pass = OK, fail = try modal dismiss via Win32
-      3. After dismiss: re-probe Lane A — pass = recovered, fail = report
+      3. After dismiss: re-probe Lane A — pass = recovered, fail = kill+relaunch
 
     Side-effects:
       - Disables autosave for the session (prevents Restore-Packages on
         next launch if this run crashes)
       - May click "Skip Restore" / "Don't Save" / etc. on UE modals
+      - May kill editor process + relaunch fresh (Windows only)
     """
     if not health():
-        print(f"[preflight {label}] editor unreachable (no Lane B)", file=sys.stderr)
-        return False
+        # Cold start — editor not running. Auto-launch.
+        print(f"[preflight {label}] editor unreachable (no Lane B) — auto-launching…",
+              file=sys.stderr)
+        if not _kill_and_relaunch_editor(label=label):
+            print(f"[preflight {label}] auto-launch failed — manual editor start required",
+                  file=sys.stderr)
+            return False
+        # _kill_and_relaunch_editor already verified Lane A is alive
+        disable_autosave()
+        return True
     # Lane B works. Probe Lane A.
     if not assert_lane_a_alive(timeout_s=8.0):
-        # Try autonomous recovery
+        # Try autonomous recovery (modal dismiss → kill+relaunch escalation)
         if not attempt_lane_a_recovery(label=label):
-            print(f"[preflight {label}] Lane A queue DEAD — auto-recovery failed.",
-                  file=sys.stderr)
-            print(f"    Manual steps: focus editor window, dismiss any modal,",
-                  file=sys.stderr)
-            print(f"    or kill editor + rm -rf <Project>/Saved/Autosaves/Game",
+            print(f"[preflight {label}] Lane A queue DEAD — auto-recovery exhausted.",
                   file=sys.stderr)
             return False
     # Defence: suppress autosave for this session so a crash mid-run doesn't
