@@ -37,11 +37,21 @@ PY = sys.executable
 DEFAULT_EXCLUDE = {"mcp_test_harness.py", "phase_e1_sustained_soak.py",
                    "phase_j2_final_report.py", "run_all.py"}
 
+# The four "sweep every one of the ~431 tools with live probes" phases each
+# run for MANY minutes (A1 alone ~141s; A2/A3/A4 longer with chain discovery).
+# They're validated individually and are too heavy to re-run on every
+# regression/soak pass — they dominate runtime and previously stalled a pass.
+# Skipped by default; run with --include-slow (or invoke them directly).
+DEFAULT_SLOW = {"phase_a1_inventory.py", "phase_a2_required_args.py",
+                "phase_a3_optional_defaults.py", "phase_a4_type_coercion.py"}
 
-def _discover(only: str, exclude: str, include_e1: bool) -> List[Path]:
+
+def _discover(only: str, exclude: str, include_e1: bool, include_slow: bool) -> List[Path]:
     out: List[Path] = []
     for p in sorted(HERE.glob("phase_*.py")):
         if p.name in DEFAULT_EXCLUDE and not (include_e1 and p.name == "phase_e1_sustained_soak.py"):
+            continue
+        if p.name in DEFAULT_SLOW and not include_slow:
             continue
         if only and only not in p.name:
             continue
@@ -78,11 +88,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="")
     ap.add_argument("--exclude", default="")
-    ap.add_argument("--per-timeout", type=float, default=360.0)
+    ap.add_argument("--per-timeout", type=float, default=240.0)
     ap.add_argument("--include-e1", action="store_true")
+    ap.add_argument("--include-slow", action="store_true",
+                    help="include the heavy A1-A4 sweep-all-tools phases")
     a = ap.parse_args()
 
-    scripts = _discover(a.only, a.exclude, a.include_e1)
+    scripts = _discover(a.only, a.exclude, a.include_e1, a.include_slow)
     print(f"[run_all] {len(scripts)} phase scripts; per-timeout={a.per_timeout:.0f}s",
           flush=True)
     print(f"[run_all] start {time.strftime('%H:%M:%S')}", flush=True)
