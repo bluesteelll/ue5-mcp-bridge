@@ -43,7 +43,11 @@ DEFAULT_EXCLUDE = {"mcp_test_harness.py", "phase_e1_sustained_soak.py",
 # regression/soak pass — they dominate runtime and previously stalled a pass.
 # Skipped by default; run with --include-slow (or invoke them directly).
 DEFAULT_SLOW = {"phase_a1_inventory.py", "phase_a2_required_args.py",
-                "phase_a3_optional_defaults.py", "phase_a4_type_coercion.py"}
+                "phase_a3_optional_defaults.py", "phase_a4_type_coercion.py",
+                # Long-by-design (exceed the per-phase timeout): g6 does a real
+                # editor kill+relaunch (~3min); k3 churns 40k connections (~6min).
+                # Both pass standalone — skip on default/soak passes.
+                "phase_g6_recovery.py", "phase_k3_conn_resource_growth.py"}
 
 
 def _discover(only: str, exclude: str, include_e1: bool, include_slow: bool) -> List[Path]:
