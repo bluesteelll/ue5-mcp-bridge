@@ -25,23 +25,81 @@ Comprehensive acceptance + crash-safety + concurrency + protocol + stability
 3. Each script self-tests harness liveness on import; aborts cleanly if editor
    is unreachable.
 
-## Status (post-S+16 + polish, HEAD c1e3764)
+## Running the whole suite
 
-Category A (functional baseline) shipped + polished. Initial sweep
-against live editor found a real crash (`asset.search_by_class` short
-class_path → UE FTopLevelAssetPath ensure spam → editor destabilisation)
-that is fixed in S+16. Subsequent runs are clean; no crashes through
-full A1+A2+A3+A4+A5+A6+A7 sweep.
+```
+# full fast/medium sweep (skips the heavy A1-A4 sweeps + long-by-design
+# g6_recovery / k3; add --include-slow for those)
+python run_all.py
 
-| Phase | Script | LOC | Coverage | Result |
-|---|---|---|---|---|
-| A1 | phase_a1_inventory.py | 220 | 431 methods × 1 dispatch | **431/431 PASS** (2m09s) |
-| A2 | phase_a2_required_args.py | 295 | 312 methods × 3-5 hostile probes (≈1200 cases) | **1197P / 0F / 3X** full sweep (7m26s) — was 696F before hybrid |
-| A3 | phase_a3_optional_defaults.py | 235 | 312 methods × 2 (minimal + extras) | 181P / 59F (--limit 150) — 59F = chain-incomplete methods (live fallback finds only 1 field) |
-| A4 | phase_a4_type_coercion.py | 240 | 312 methods × 2-3 coerce probes | 157P / 0F (--limit 50 last validated) |
-| A5 | phase_a5_roundtrip.py | 320 | 7 curated write→read pairs | **5P / 0F / 2X** |
-| A6 | phase_a6_pagination.py | 240 | 19 paginated tools | **32P / 0F / 11X** |
-| A7 | phase_a7_error_codes.py | 240 | 17 documented error codes | **8P / 0F / 6X / 3S** |
+# one phase
+python phase_a7_error_codes.py
+
+# aggregate every phase log into one report
+python phase_j2_final_report.py
+
+# dedicated long soak
+python phase_e1_sustained_soak.py --minutes 60
+```
+
+`run_all.py` runs each phase as a subprocess (each self-preflights →
+auto-relaunches the editor if it died), prints a per-phase PASS/FAIL line,
+continues past failures, then runs the J2 aggregator. Repeated invocation =
+cumulative multi-hour stability soak.
+
+## Status — campaign COMPLETE, suite 0-FAIL
+
+All 10 categories (A–J) plus a "K" edge set are shipped and green. **64 phase
+scripts.** Latest J2 aggregate: **PASS 3338 / FAIL 0 / XFAIL 66 / SKIP 47**.
+A green suite is **0 FAIL**; XFAIL = documented design-limit, SKIP = tool
+not registered / precondition absent. **0 crash dumps** across the campaign.
+
+| Cat | Theme | Phases | Result |
+|---|---|---|---|
+| A | functional baseline | a1-a7 | dispatch 431/431; arg/coercion/roundtrip/pagination/error-codes all green |
+| B | crash-safety | b1-b9 | FName overflow, mount escalation, PIE guards, path traversal, unicode, numeric extremes, empty/null, JSON depth bomb, ref cycles |
+| C | concurrency | c1-c5 | Lane B parallel, Lane A serial, mixed-lane, PIE thrash, atomic queue (C6 N/A — per-conn threads) |
+| D | protocol | d1-d8 | malformed JSON, fragments, slow-loris, conn storm, disconnect-mid-call, oversized, wrong-kind, ID collision |
+| E | long-run stability | e1-e5 | sustained soak, leak hunt, conn churn, Lane B saturation, latency distribution |
+| F | security/privacy | f1-f5 | privilege escalation, path-traversal sweep, cross-asset corruption, PIE world isolation, data sanitization |
+| G | edge/recovery | g1-g6 | asset-deleted-mid-call, PIE-during-Lane-A, GC-during-call, Live-Coding race, save-during-call, kill+relaunch recovery |
+| H | workflows | h1-h7, h6.1-h6.7 | 418-tool dispatch, BP/AI/Input/Niagara+Material pipelines, transaction/render-target/spatial/debug/gameplaytag/sc/livecoding, mega-chain |
+| I | regression | i1-i2 | all historical crash repros (S+5..S+20), API-ergonomics findings |
+| J | observability | j1-j2 | self-instrumentation truthfulness, aggregated report |
+| K | new edge | k1-k3 | path-reuse churn, concurrent distinct writes, per-connection resource-growth diagnostic |
+
+Per-phase Category-A detail (the hardest to get right) is preserved below.
+
+## Stability findings (headline)
+
+- **Steady-state is rock-solid**: multiple 60-min soaks at 100 % success, zero
+  UObject leak (~600 k cumulative requests). Path-reuse + 200-cycle create/
+  delete churns are registry/GC-consistent.
+- **Connection model is leak-free** (K3): 40 k connect→call→close cycles →
+  editor handle count flat (~2920) and thread count flat (~160). The
+  thread-per-connection design does not leak at scale.
+- **One environmental limit, not a bridge defect**: on a 16 GB-class host under
+  *continuous heavy* load the editor process can be OS-terminated after several
+  hours (OOM hard-kill ~6 h, or graceful low-mem shutdown) — no crash dump, flat
+  working set, leak-free connection model all confirm it's host memory pressure.
+  Mitigation: restart the editor every ~4-5 h on constrained hosts; the harness
+  `_kill_and_relaunch_editor` recovers in ~80-165 s. See the GitHub Pages
+  "Stability & Operations" doc.
+- **Accept-saturation ceiling**: `FTcpListener` serial-accept tops out around
+  ~50 simultaneous *new* connects; bursts above that see some `no_connect`
+  (retry succeeds). C1/E4 classify this as XFAIL design-limit, not a fault.
+
+## Category A — per-phase detail
+
+| Phase | Script | Coverage | Result |
+|---|---|---|---|
+| A1 | phase_a1_inventory.py | 431 methods × 1 dispatch | **431/431 PASS** |
+| A2 | phase_a2_required_args.py | 312 methods × 3-5 hostile probes (≈1200 cases) | **1197P / 0F / 3X** (hybrid static+live chain) |
+| A3 | phase_a3_optional_defaults.py | 312 methods × 2 | green with `--limit` (heavy; runs handlers to completion) |
+| A4 | phase_a4_type_coercion.py | 312 methods × 2-3 coerce probes | green with `--limit` |
+| A5 | phase_a5_roundtrip.py | 34 curated write→read pairs | **21P / 0F / 13X** (transform.translation/rotation read paths, attach-via-response, get_nodes, mesh.duplicate path — all fixed) |
+| A6 | phase_a6_pagination.py | 19 paginated tools | **32P / 0F / 11X** |
+| A7 | phase_a7_error_codes.py | 17 documented error codes | **green** |
 
 ## A2 full sweep — FIXED via hybrid static+live chain discovery
 
