@@ -51,8 +51,8 @@ cumulative multi-hour stability soak.
 ## Status — campaign COMPLETE, suite 0-FAIL
 
 All categories (A–K) **plus Category P (PIE runtime)** are shipped and green.
-**74 phase scripts.** Latest J2 aggregate: **PASS 3435 / FAIL 0 / XFAIL 69 /
-SKIP 47**. A green suite is **0 FAIL**; XFAIL = documented design-limit, SKIP =
+**75 phase scripts.** Latest J2 aggregate: **PASS 3446 / FAIL 0 / XFAIL 69 /
+SKIP 48**. A green suite is **0 FAIL**; XFAIL = documented design-limit, SKIP =
 tool not registered / precondition absent. **0 crash dumps** across the campaign.
 
 | Cat | Theme | Phases | Result |
@@ -68,7 +68,7 @@ tool not registered / precondition absent. **0 crash dumps** across the campaign
 | I | regression | i1-i2 | all historical crash repros (S+5..S+20), API-ergonomics findings |
 | J | observability | j1-j2 | self-instrumentation truthfulness, aggregated report |
 | K | new edge | k1-k4 | path-reuse churn, concurrent distinct writes, per-conn resource-growth, committed-memory growth |
-| **P** | **PIE runtime** | **p1-p8** | **drives a LIVE PIE world in the user's real map: lifecycle, actor identity, input sim, stats/world/console, world-adaptive AI+Niagara, PIE-off guards, screenshot + walkthrough, behavioral input** |
+| **P** | **PIE runtime** | **p1-p9** | **drives a LIVE PIE world in the user's real map: lifecycle, actor identity, input sim, stats/world/console, world-adaptive AI+Niagara, PIE-off guards, screenshot + walkthrough, behavioral input, UI + game camera** |
 
 ## Category P — PIE runtime (drives a live PIE world in the user's map)
 
@@ -93,6 +93,7 @@ against the live game world.
 | P6 | phase_p6_pie_off_guards.py | all 13 PIE-required tools → -32038 when PIE off; is_running + console(editor) still work | **17P / 0F** |
 | P7 | phase_p7_pie_screenshot_walkthrough.py | pie.screenshot_to_disk (real PNG to disk) + range/off guards + realistic play-session composition test | **7P / 0F** |
 | P8 | phase_p8_pie_behavioral_input.py | **BEHAVIORAL** input in the floored user map: floor check + W/A/S/D actually move the pawn (correct directions, dot=-1.0 opposite pairs) + jump | **8P / 0F / 1X** (jump) |
+| P9 | phase_p9_pie_ui_camera.py | **UI + game camera**: live UMG viewport (list_root_widgets shows the game's MainHUD/Inventory/LootPanel) + add/remove_from_viewport + mouse-click delivery to Slate + **game camera follows pawn** (cam 483cm == pawn 483cm) + UMG PIE-off guard | **11P / 0F / 1 SKIP** (mouse-look) |
 
 **Key correctness signals proven**: (1) the async start/stop lifecycle + the
 S+9 post-stop cooldown behave exactly as designed; (2) a possessed pawn's
@@ -102,7 +103,11 @@ actually move the pawn** — P8 measures W→+391cm forward, S exactly opposite
 PlayerController → Enhanced Input → movement; (4) the world-adaptive runtime
 tools (ai.*/niagara.*) flip their reported `world` from `editor`→`pie` on PIE
 start — the definitive proof they target the running game, not the editor;
-(5) every PIE-required tool refuses cleanly (-32038) with PIE off.
+(5) every PIE-required tool refuses cleanly (-32038) with PIE off; (6) **the
+live game UI is queryable + mutable in PIE** (the real MainHUD/Inventory/
+LootPanel list via umg.list_root_widgets; widgets add/remove; clicks reach
+Slate) and (7) **the game camera follows the pawn** (PlayerCameraManager loc
+tracks pawn loc 1:1 as it moves).
 
 **User-map test bed**: all P phases run in `/Game/FlecsTestMap2` (loaded
 automatically; `pie_ensure_user_map()` falls back to `/Game/FlecsMyMap` — which
@@ -110,13 +115,21 @@ does not LoadLevel cleanly as of 2026-06, likely World Partition). Running in
 the real map means P2-P5 exercise real level content (23 actors, real
 geometry), and P8's behavioral checks have a floor to stand on.
 
-**Remaining coverage boundary (honest)**: jump (Space) shows no z-rise in P8
-(XFAIL) — likely the jump action isn't bound to that key in this map's IMC, or
-the posture system suppresses it at ~3 FPS; movement (the core proof) is solid.
-Non-empty AI data (live controllers/perception/crowd agents) still needs an
-AI-populated map — FlecsTestMap2 is player-only, so the AI list tools correctly
-return EMPTY and the non-AI player pawn is correctly classified (-32004/-32011).
-Spawning AI pawns into the map at runtime would close that last gap.
+**Remaining coverage boundaries (honest)**:
+- **Mouse-look / camera ROTATION** — the one true *tooling* gap. `pie.simulate_key`
+  is keys/buttons only (InputKey); there is no mouse-axis / `move_mouse`
+  injection, so camera rotation via look-input cannot be driven. Camera
+  *translation* (follow) IS verified (P9). Closing rotation needs a new
+  `pie.add_axis_input` / `pie.move_mouse` bridge tool.
+- **UI callback firing** — P9 proves clicks are delivered to Slate and the live
+  UI is queryable, but asserting a specific widget's OnClicked fired needs an
+  instrumented widget with an observable side-effect (not in the stock game UI).
+- **jump (Space)** — no z-rise in P8 (XFAIL); likely unbound to that key in this
+  map's IMC or suppressed by the posture system at ~3 FPS. Movement is solid.
+- **Non-empty AI data** — largely N/A: FatumGame is a Flecs-ECS game that doesn't
+  use UE `AIController`s, so `ai.controller.list` returning empty is *correct*.
+  The runtime AI tools are validated (dispatch + world-flip + correct
+  empty/typed-error responses).
 
 Per-phase Category-A detail (the hardest to get right) is preserved below.
 
