@@ -82,4 +82,8 @@ namespace FPIETools
 	UNREALMCPBRIDGE_API FMCPResponse Tool_SetTimeDilation(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_GetStats(const FMCPRequest& Request);
 	UNREALMCPBRIDGE_API FMCPResponse Tool_DumpWorldState(const FMCPRequest& Request);
+
+	// 2026-06 — mouse-look / view rotation (closes the camera-rotation gap; the
+	// mouse-axis path pie.simulate_key cannot reach).
+	UNREALMCPBRIDGE_API FMCPResponse Tool_AddLookInput(const FMCPRequest& Request);
 }

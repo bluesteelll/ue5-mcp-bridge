@@ -994,6 +994,72 @@ FMCPResponse Tool_SimulateKey(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// ─── pie.add_look_input — drive view/camera rotation (mouse-look equivalent) ────────────────
+//
+// Args:
+//   - yaw:          number (optional, default 0)  yaw look input (turn right +, left -)
+//   - pitch:        number (optional, default 0)  pitch look input (look up +, down -)
+//   - player_index: int    (optional, default 0)
+//
+// At least one of yaw/pitch must be non-zero. Routes through
+// APlayerController::AddYawInput / AddPitchInput — the SAME rotation accumulators that mouse-look
+// and gamepad-look feed (consumed next PlayerController tick in UpdateRotation). This closes the
+// view-rotation gap that pie.simulate_key (keys/buttons only, via InputKey) cannot reach: mouse
+// look is an analog AXIS, not a key. The applied delta is scaled by the PC's look-input scale, so
+// the resulting rotation is proportional (not an exact degree count) — same as real mouse-look.
+//
+// Response: { applied: true, yaw: <f>, pitch: <f> }
+//
+// Errors:
+//   -32038 PIENotActive   PIE not running
+//   -32602 InvalidParams  both yaw & pitch zero / player_index < 0
+//   -32004 ObjectNotFound no PlayerController at player_index
+FMCPResponse Tool_AddLookInput(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	if (!Request.Args.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("pie.add_look_input requires args.yaw and/or args.pitch"));
+	}
+	double Yaw = 0.0, Pitch = 0.0;
+	int32 PlayerIdx = 0;
+	Request.Args->TryGetNumberField(TEXT("yaw"), Yaw);
+	Request.Args->TryGetNumberField(TEXT("pitch"), Pitch);
+	Request.Args->TryGetNumberField(TEXT("player_index"), PlayerIdx);
+
+	if (FMath::IsNearlyZero(Yaw) && FMath::IsNearlyZero(Pitch))
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("at least one of 'yaw' or 'pitch' must be non-zero"));
+	}
+	if (PlayerIdx < 0)
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
+			FString::Printf(TEXT("player_index must be >= 0; got %d"), PlayerIdx));
+	}
+
+	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
+	if (!PC)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no PlayerController at player_index=%d"), PlayerIdx));
+	}
+
+	if (!FMath::IsNearlyZero(Yaw))   { PC->AddYawInput(static_cast<float>(Yaw)); }
+	if (!FMath::IsNearlyZero(Pitch)) { PC->AddPitchInput(static_cast<float>(Pitch)); }
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("applied"), true)
+		.Num(TEXT("yaw"), Yaw)
+		.Num(TEXT("pitch"), Pitch)
+		.BuildSuccess(Request);
+}
+
 // ─── pie.click_screen — synthesize a click at screen coordinates ────────────────────────────
 //
 // Args:
@@ -1296,6 +1362,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("pie.simulate_key"),     &Tool_SimulateKey,     /*Lane A*/ false);
 	RegisterTool(TEXT("pie.click_screen"),     &Tool_ClickScreen,     /*Lane A*/ false);
 	RegisterTool(TEXT("pie.click_actor"),      &Tool_ClickActor,      /*Lane A*/ false);
+	RegisterTool(TEXT("pie.add_look_input"),   &Tool_AddLookInput,    /*Lane A*/ false);
 	RegisterTool(TEXT("pie.set_time_dilation"),&Tool_SetTimeDilation, /*Lane A*/ false);
 	RegisterTool(TEXT("pie.get_stats"),        &Tool_GetStats,        /*Lane A*/ false);
 	RegisterTool(TEXT("pie.dump_world_state"), &Tool_DumpWorldState,  /*Lane A*/ false);
@@ -1317,7 +1384,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("pie.focus_actor"),           &Tool_FocusActor,          /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 5 Chunk A + Wave A: registered 16 pie.* handlers (lifecycle + introspection + actor identity + input/stats/testing, all Lane A)"));
+		TEXT("Phase 5 Chunk A + Wave A: registered 17 pie.* handlers (lifecycle + introspection + actor identity + input/look/stats/testing, all Lane A)"));
 }
 
 } // namespace FPIETools

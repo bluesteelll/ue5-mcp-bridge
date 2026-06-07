@@ -30,6 +30,7 @@ Exit codes: 0=PASS (0 FAIL), 1=FAIL/editor-died, 2=preflight.
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from pathlib import Path
@@ -237,11 +238,58 @@ def main() -> int:
     else:
         log.case("P8_camera_follows", "SKIP", "no camera/pawn baseline")
 
-    # ── P9: mouse-look gap (documented) ──────────────────────────────────
-    log.case("P9_mouselook_gap", "SKIP",
-             "camera ROTATION via mouse-look not testable — no pie mouse-axis / "
-             "move_mouse tool (simulate_key is keys/buttons only). Closing this "
-             "would need a new pie.add_axis_input / pie.move_mouse bridge tool.")
+    # ── P9: camera ROTATION via pie.add_look_input (mouse-look) ──────────
+    # Behavioral proof: rotating the view should rotate the camera-relative
+    # forward direction, so a W press after a look-turn moves the pawn along a
+    # different world vector than before. Angle between the two forward vectors
+    # = how far the view turned. (SKIP if the tool isn't in this editor build.)
+    def _fwd_vector() -> Optional[Tuple[float, float]]:
+        p0, _ = _cam_and_pawn()
+        call("pie.simulate_key", {"key": "W", "action": "press"}, timeout=6.0)
+        time.sleep(0.9)
+        call("pie.simulate_key", {"key": "W", "action": "release"}, timeout=6.0)
+        time.sleep(0.4)
+        p1, _ = _cam_and_pawn()
+        if not p0 or not p1:
+            return None
+        return (p1[0] - p0[0], p1[1] - p0[1])
+
+    probe = call("pie.add_look_input", {"yaw": 30.0}, timeout=8.0)
+    if err_code(probe) == -32601:
+        log.case("P9_look_rotate", "SKIP",
+                 "pie.add_look_input not in this editor build yet — rebuild required "
+                 "to verify camera rotation (handler is committed; awaiting compile)")
+    elif not is_ok(probe):
+        log.case("P9_look_rotate", "FAIL",
+                 f"pie.add_look_input failed: {err_code(probe)} {err_message(probe)[:50]}")
+        fail += 1
+    else:
+        v0 = _fwd_vector()
+        for _ in range(8):  # accumulate a turn over several look samples (mouse frames)
+            call("pie.add_look_input", {"yaw": 45.0}, timeout=6.0)
+            time.sleep(0.05)
+        time.sleep(0.4)
+        v1 = _fwd_vector()
+        if v0 and v1:
+            m0 = (v0[0] ** 2 + v0[1] ** 2) ** 0.5
+            m1 = (v1[0] ** 2 + v1[1] ** 2) ** 0.5
+            if m0 > 20 and m1 > 20:
+                cosang = max(-1.0, min(1.0, (v0[0] * v1[0] + v0[1] * v1[1]) / (m0 * m1)))
+                ang = math.degrees(math.acos(cosang))
+                if ang > 15:
+                    log.case("P9_look_rotate", "PASS",
+                             f"look-input turned the view {ang:.0f}° (forward dir rotated) "
+                             f"— mouse-look gap CLOSED")
+                else:
+                    log.case("P9_look_rotate", "XFAIL",
+                             f"look applied but forward dir barely moved ({ang:.0f}°); "
+                             f"movement may not be camera-relative")
+            else:
+                log.case("P9_look_rotate", "XFAIL",
+                         f"could not measure forward vectors (m0={m0:.0f}, m1={m1:.0f}) "
+                         f"— pawn may have hit geometry")
+        else:
+            log.case("P9_look_rotate", "XFAIL", "could not sample forward direction")
 
     pie_stop_and_wait()
 
@@ -255,6 +303,18 @@ def main() -> int:
         fail += 1
     else:
         log.case("P10_umg_off_guard", "XFAIL", "non-structured failure with PIE off")
+
+    # ── P11: pie.add_look_input PIE-off guard ────────────────────────────
+    r = call("pie.add_look_input", {"yaw": 10.0}, timeout=8.0)
+    if err_code(r) == -32601:
+        log.case("P11_look_off_guard", "SKIP", "pie.add_look_input not in this editor build yet")
+    elif err_code(r) == -32038:
+        log.case("P11_look_off_guard", "PASS", "add_look_input with PIE off → -32038")
+    elif is_ok(r):
+        log.case("P11_look_off_guard", "FAIL", "add_look_input succeeded with PIE off")
+        fail += 1
+    else:
+        log.case("P11_look_off_guard", "XFAIL", f"code {err_code(r)} (expected -32038)")
 
     crash = latest_crash_dump(since=crash_baseline)
     if crash:
