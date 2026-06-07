@@ -1235,6 +1235,54 @@ def pie_get_pawn_path(player_index: int = 0, timeout: float = 8.0) -> Optional[s
     return (r.get("result", {}) or {}).get("pawn_path")
 
 
+# The user's real, playable maps — preferred test bed for behavioral coverage.
+# A floored, GameMode-driven map (vs the empty /Temp/Untitled scratch map) lets
+# input tests verify EFFECTS (the pawn actually moves), not just plumbing.
+# FlecsTestMap2 is confirmed: floor present, default pawn possessed, W/A/S/D
+# drive movement. FlecsMyMap is a fallback (does not LoadLevel cleanly as of
+# 2026-06 — likely World Partition). First candidate that loads wins.
+USER_TEST_MAP_CANDIDATES = ("/Game/FlecsTestMap2", "/Game/FlecsMyMap")
+
+
+def pie_current_map(timeout: float = 8.0) -> str:
+    """Return the current editor map path (e.g. '/Game/FlecsTestMap2'), or ''."""
+    r = call("level.current_map", {}, timeout=timeout)
+    return (r.get("result", {}) or {}).get("map_path", "") if is_ok(r) else ""
+
+
+def pie_ensure_user_map(
+    candidates: Sequence[str] = USER_TEST_MAP_CANDIDATES,
+    timeout: float = 45.0,
+) -> Optional[str]:
+    """Ensure one of the user's real maps is the loaded persistent level.
+
+    No-op (returns the path) if already on a candidate. Otherwise stops PIE
+    (level.load is PIE-guarded), then loads the first candidate that succeeds,
+    dismissing the dirty-scratch-map 'Save Changes?' modal via Win32 if it
+    blocks the load. Returns the loaded map path, or None if none could load
+    (caller should fall back to the current map + degrade behavioral checks).
+    """
+    cur = pie_current_map()
+    for c in candidates:
+        if c.split("/")[-1] in cur:
+            return c  # already on a user map
+    if pie_is_running():
+        pie_stop_and_wait()
+    for c in candidates:
+        leaf = c.split("/")[-1]
+        dismiss_ue_modal_via_win32()  # pre-clear any dirty-map save prompt
+        r = call("level.load", {"map_path": c, "force": True}, timeout=timeout)
+        if is_ok(r) and leaf in pie_current_map():
+            return c
+        # A save-changes modal may have blocked the load — dismiss + poll.
+        for _ in range(6):
+            dismiss_ue_modal_via_win32()
+            time.sleep(2.0)
+            if leaf in pie_current_map():
+                return c
+    return None
+
+
 # ============================================================================
 # Modal-dialog defence + autosave suppression
 # ============================================================================

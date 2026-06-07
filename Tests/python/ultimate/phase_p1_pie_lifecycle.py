@@ -39,7 +39,9 @@ from mcp_test_harness import (
     health,
     is_ok,
     latest_crash_dump,
+    pie_current_map,
     pie_ensure_stopped,
+    pie_ensure_user_map,
     pie_is_running,
     pie_start_and_wait,
     pie_state,
@@ -65,6 +67,10 @@ def main() -> int:
         log.case("preflight_stop", "FAIL", "could not stop pre-existing PIE")
         log.write()
         return 1
+    user_map = pie_ensure_user_map()
+    log.case("preflight_map", "PASS" if user_map else "SKIP",
+             f"tests run in user map {user_map} ({pie_current_map()})" if user_map
+             else f"no user map loaded; using current ({pie_current_map()})")
 
     # ── P1: start + wait ──────────────────────────────────────────────────
     up, info = pie_start_and_wait()
