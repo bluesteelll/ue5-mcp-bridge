@@ -1211,6 +1211,168 @@ FMCPResponse Tool_ClickActor(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// ─── pie.move_mouse — position/hover the cursor WITHOUT clicking ─────────────────────────────
+//
+// Args:
+//   - x, y:         number (required)  viewport pixel coords
+//   - player_index: int    (optional)  0
+//
+// Moves the cursor (PC->SetMouseLocation) and drives a Slate mouse-MOVE with no button held, so
+// hover states / tooltips / OnHovered fire. This is the cursor-positioning primitive pie.click_screen
+// cannot provide (it always clicks). Use to hover UI, or to position before a click.
+//
+// Response: { moved: true, x, y }
+FMCPResponse Tool_MoveMouse(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	if (!Request.Args.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("pie.move_mouse requires args.x + args.y"));
+	}
+	double X = -1, Y = -1;
+	if (!Request.Args->TryGetNumberField(TEXT("x"), X) || !Request.Args->TryGetNumberField(TEXT("y"), Y))
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams, TEXT("missing args.x or args.y"));
+	}
+	int32 PlayerIdx = 0;
+	Request.Args->TryGetNumberField(TEXT("player_index"), PlayerIdx);
+
+	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
+	if (!PC)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no PlayerController at player_index=%d"), PlayerIdx));
+	}
+
+	PC->SetMouseLocation(static_cast<int32>(X), static_cast<int32>(Y));
+	if (FSlateApplication::IsInitialized())
+	{
+		// Mouse-move with NO button held → Slate hover hit-test (OnHovered / tooltips).
+		FPointerEvent Move(0, FVector2D(X, Y), FVector2D(X, Y),
+			TSet<FKey>(), EKeys::Invalid, 0.f, FModifierKeysState());
+		FSlateApplication::Get().ProcessMouseMoveEvent(Move);
+	}
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("moved"), true)
+		.Num(TEXT("x"), X)
+		.Num(TEXT("y"), Y)
+		.BuildSuccess(Request);
+}
+
+// ─── pie.drag_screen — press, move through steps, release (drag-drop / sliders) ──────────────
+//
+// Args:
+//   - from_x, from_y, to_x, to_y: number (required)  viewport pixel coords
+//   - button:                     string (optional)  "left"|"right"|"middle". Default "left".
+//   - steps:                      int    (optional)  [1,64] interpolated moves. Default 8.
+//   - player_index:               int    (optional)  0
+//
+// Synthesises a real drag: button DOWN at (from) → N interpolated mouse-MOVE events with the button
+// HELD (so Slate OnDragDetected / OnDrag fire) → button UP at (to). Drives UMG drag-and-drop
+// (inventory), sliders, and scrollbars — none of which pie.click_screen (instantaneous down+up at a
+// single point) can do.
+//
+// Response: { dragged: true, from_x, from_y, to_x, to_y, button, steps }
+FMCPResponse Tool_DragScreen(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIENotActive, kMCPMessagePIENotActive);
+	}
+	if (!Request.Args.IsValid())
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("pie.drag_screen requires from_x/from_y/to_x/to_y"));
+	}
+	double FromX = 0, FromY = 0, ToX = 0, ToY = 0;
+	if (!Request.Args->TryGetNumberField(TEXT("from_x"), FromX) ||
+		!Request.Args->TryGetNumberField(TEXT("from_y"), FromY) ||
+		!Request.Args->TryGetNumberField(TEXT("to_x"), ToX) ||
+		!Request.Args->TryGetNumberField(TEXT("to_y"), ToY))
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
+			TEXT("missing one of from_x/from_y/to_x/to_y"));
+	}
+	FString Button(TEXT("left"));
+	Request.Args->TryGetStringField(TEXT("button"), Button);
+	int32 Steps = 8;
+	Request.Args->TryGetNumberField(TEXT("steps"), Steps);
+	Steps = FMath::Clamp(Steps, 1, 64);
+	int32 PlayerIdx = 0;
+	Request.Args->TryGetNumberField(TEXT("player_index"), PlayerIdx);
+
+	FKey MouseKey = EKeys::LeftMouseButton;
+	const FString BLow = Button.ToLower();
+	if      (BLow == TEXT("left"))   { MouseKey = EKeys::LeftMouseButton; }
+	else if (BLow == TEXT("right"))  { MouseKey = EKeys::RightMouseButton; }
+	else if (BLow == TEXT("middle")) { MouseKey = EKeys::MiddleMouseButton; }
+	else
+	{
+		return FMCPToolHelpers::MakeError(Request, kPIEErrorInvalidParams,
+			FString::Printf(TEXT("unknown button '%s'; use left/right/middle"), *Button));
+	}
+
+	APlayerController* PC = UGameplayStatics::GetPlayerController(GEditor->PlayWorld, PlayerIdx);
+	if (!PC)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no PlayerController at player_index=%d"), PlayerIdx));
+	}
+
+	FSlateApplication* Slate = FSlateApplication::IsInitialized() ? &FSlateApplication::Get() : nullptr;
+	const TSet<FKey> Held{MouseKey};
+	const FModifierKeysState Mods;
+
+	// 1) press at FROM
+	PC->SetMouseLocation(static_cast<int32>(FromX), static_cast<int32>(FromY));
+	if (Slate)
+	{
+		FPointerEvent Down(0, FVector2D(FromX, FromY), FVector2D(FromX, FromY), Held, MouseKey, 0.f, Mods);
+		Slate->ProcessMouseButtonDownEvent(nullptr, Down);
+	}
+	PC->InputKey(FInputKeyParams(MouseKey, IE_Pressed, 1.0, false));
+
+	// 2) interpolated moves with the button HELD (drag)
+	FVector2D Prev(FromX, FromY);
+	for (int32 i = 1; i <= Steps; ++i)
+	{
+		const double T = static_cast<double>(i) / static_cast<double>(Steps);
+		const FVector2D Cur(FMath::Lerp(FromX, ToX, T), FMath::Lerp(FromY, ToY, T));
+		PC->SetMouseLocation(static_cast<int32>(Cur.X), static_cast<int32>(Cur.Y));
+		if (Slate)
+		{
+			FPointerEvent Move(0, Cur, Prev, Held, EKeys::Invalid, 0.f, Mods);
+			Slate->ProcessMouseMoveEvent(Move);
+		}
+		Prev = Cur;
+	}
+
+	// 3) release at TO
+	if (Slate)
+	{
+		FPointerEvent Up(0, FVector2D(ToX, ToY), FVector2D(ToX, ToY), TSet<FKey>(), MouseKey, 0.f, Mods);
+		Slate->ProcessMouseButtonUpEvent(Up);
+	}
+	PC->InputKey(FInputKeyParams(MouseKey, IE_Released, 0.0, false));
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("dragged"), true)
+		.Num(TEXT("from_x"), FromX)
+		.Num(TEXT("from_y"), FromY)
+		.Num(TEXT("to_x"), ToX)
+		.Num(TEXT("to_y"), ToY)
+		.Str(TEXT("button"), BLow)
+		.Num(TEXT("steps"), static_cast<double>(Steps))
+		.BuildSuccess(Request);
+}
+
 // ─── pie.set_time_dilation — global time scale via UGameplayStatics::SetGlobalTimeDilation ──
 FMCPResponse Tool_SetTimeDilation(const FMCPRequest& Request)
 {
@@ -1363,6 +1525,8 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("pie.click_screen"),     &Tool_ClickScreen,     /*Lane A*/ false);
 	RegisterTool(TEXT("pie.click_actor"),      &Tool_ClickActor,      /*Lane A*/ false);
 	RegisterTool(TEXT("pie.add_look_input"),   &Tool_AddLookInput,    /*Lane A*/ false);
+	RegisterTool(TEXT("pie.move_mouse"),       &Tool_MoveMouse,       /*Lane A*/ false);
+	RegisterTool(TEXT("pie.drag_screen"),      &Tool_DragScreen,      /*Lane A*/ false);
 	RegisterTool(TEXT("pie.set_time_dilation"),&Tool_SetTimeDilation, /*Lane A*/ false);
 	RegisterTool(TEXT("pie.get_stats"),        &Tool_GetStats,        /*Lane A*/ false);
 	RegisterTool(TEXT("pie.dump_world_state"), &Tool_DumpWorldState,  /*Lane A*/ false);
@@ -1384,7 +1548,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("pie.focus_actor"),           &Tool_FocusActor,          /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
-		TEXT("Phase 5 Chunk A + Wave A: registered 17 pie.* handlers (lifecycle + introspection + actor identity + input/look/stats/testing, all Lane A)"));
+		TEXT("Phase 5 Chunk A + Wave A: registered 19 pie.* handlers (lifecycle + introspection + actor identity + input/look/cursor/drag/stats/testing, all Lane A)"));
 }
 
 } // namespace FPIETools

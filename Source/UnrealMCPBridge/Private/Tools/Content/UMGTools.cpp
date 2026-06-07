@@ -22,6 +22,13 @@
 #include "UObject/UObjectIterator.h"
 #include "WidgetBlueprint.h"
 
+// 2026-06 — live widget targeting (get_widget_geometry / click_widget / hover_widget):
+// resolve a viewport widget's on-screen rect + drive Slate pointer events at it.
+#include "Framework/Application/SlateApplication.h"
+#include "Input/Events.h"
+#include "InputCoreTypes.h"
+#include "Layout/Geometry.h"
+
 #include "AssetToolsModule.h"
 #include "Editor.h"
 #include "EdGraphSchema_K2.h"
@@ -908,6 +915,207 @@ FMCPResponse Tool_ListRootWidgets(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// 2026-06 — live widget TARGETING (get_widget_geometry / click_widget / hover_widget). PIE only.
+// These let a caller interact with UI BY NAME (no pixel math): resolve a live viewport widget's
+// cached geometry, then drive Slate pointer events at its on-screen centre (absolute coords, so it
+// hits the widget regardless of viewport offset). Complements the coordinate-based pie.* cursor
+// tools (move_mouse / drag_screen / click_screen) used for screenshot-driven reasoning.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/** Resolve a live in-viewport UUserWidget in the PIE world by full path (as umg.list_root_widgets
+ *  reports it). Returns nullptr if PIE is off or no match. */
+static UUserWidget* UMG_ResolveLiveWidget(const FString& WidgetPath)
+{
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return nullptr;
+	}
+	for (TObjectIterator<UUserWidget> It; It; ++It)
+	{
+		UUserWidget* W = *It;
+		if (!W || W->GetWorld() != GEditor->PlayWorld)
+		{
+			continue;
+		}
+		if (W->GetPathName() == WidgetPath)
+		{
+			return W;
+		}
+	}
+	return nullptr;
+}
+
+/** Centre of a widget's cached geometry in Slate ABSOLUTE (desktop) coordinates; also returns the
+ *  absolute top-left + size. Slate hit-tests pointer events in this space, so a click/hover at this
+ *  centre lands on the widget regardless of viewport offset. */
+static FVector2D UMG_WidgetAbsoluteCenter(const UUserWidget* W, FVector2D& OutAbsPos, FVector2D& OutAbsSize)
+{
+	check(W != nullptr);
+	const FGeometry& Geo = W->GetCachedGeometry();
+	OutAbsPos = Geo.GetAbsolutePosition();
+	OutAbsSize = Geo.GetAbsoluteSize();
+	return OutAbsPos + OutAbsSize * 0.5;
+}
+
+// ─── umg.get_widget_geometry — on-screen rect of a live viewport widget (PIE only) ─────────────
+//
+// Args:   { widget_path: string }  (a path from umg.list_root_widgets)
+// Result: { found, widget_path, class_path, is_visible, is_hovered,
+//           abs_x, abs_y, width, height, center_x, center_y }  (absolute/desktop pixels)
+FMCPResponse Tool_GetWidgetGeometry(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
+			TEXT("umg.get_widget_geometry requires PIE running"));
+	}
+	FString WidgetPath;
+	if (!Request.Args.IsValid()
+		|| !Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath) || WidgetPath.IsEmpty())
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
+	}
+	UUserWidget* W = UMG_ResolveLiveWidget(WidgetPath);
+	if (!W)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no live viewport widget at path '%s' (use umg.list_root_widgets)"), *WidgetPath));
+	}
+	FVector2D AbsPos, AbsSize;
+	const FVector2D Center = UMG_WidgetAbsoluteCenter(W, AbsPos, AbsSize);
+	const bool bVisible = W->GetVisibility() != ESlateVisibility::Collapsed
+		&& W->GetVisibility() != ESlateVisibility::Hidden;
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("found"), true)
+		.Str(TEXT("widget_path"), W->GetPathName())
+		.Str(TEXT("class_path"), W->GetClass()->GetPathName())
+		.Bool(TEXT("is_visible"), bVisible)
+		.Bool(TEXT("is_hovered"), W->IsHovered())
+		.Num(TEXT("abs_x"), AbsPos.X)
+		.Num(TEXT("abs_y"), AbsPos.Y)
+		.Num(TEXT("width"), AbsSize.X)
+		.Num(TEXT("height"), AbsSize.Y)
+		.Num(TEXT("center_x"), Center.X)
+		.Num(TEXT("center_y"), Center.Y)
+		.BuildSuccess(Request);
+}
+
+// ─── umg.click_widget — click a live viewport widget BY PATH (PIE only) ────────────────────────
+//
+// Args:   { widget_path: string, button?: "left"|"right"|"middle" }
+// Result: { clicked, widget_path, screen_x, screen_y, button }
+//
+// Drives Slate pointer down+up at the widget's on-screen centre so OnClicked fires — no pixel math.
+FMCPResponse Tool_ClickWidget(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
+			TEXT("umg.click_widget requires PIE running"));
+	}
+	FString WidgetPath, Button(TEXT("left"));
+	if (!Request.Args.IsValid()
+		|| !Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath) || WidgetPath.IsEmpty())
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
+	}
+	Request.Args->TryGetStringField(TEXT("button"), Button);
+	FKey MouseKey = EKeys::LeftMouseButton;
+	const FString BLow = Button.ToLower();
+	if      (BLow == TEXT("left"))   { MouseKey = EKeys::LeftMouseButton; }
+	else if (BLow == TEXT("right"))  { MouseKey = EKeys::RightMouseButton; }
+	else if (BLow == TEXT("middle")) { MouseKey = EKeys::MiddleMouseButton; }
+	else
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
+			FString::Printf(TEXT("unknown button '%s'; use left/right/middle"), *Button));
+	}
+	UUserWidget* W = UMG_ResolveLiveWidget(WidgetPath);
+	if (!W)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no live viewport widget at path '%s'"), *WidgetPath));
+	}
+	FVector2D AbsPos, AbsSize;
+	const FVector2D Center = UMG_WidgetAbsoluteCenter(W, AbsPos, AbsSize);
+	if (AbsSize.X < 1.0 || AbsSize.Y < 1.0)
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
+			TEXT("widget has no on-screen geometry (collapsed or not yet painted)"));
+	}
+	if (!FSlateApplication::IsInitialized())
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal, TEXT("Slate not initialized"));
+	}
+	FSlateApplication& Slate = FSlateApplication::Get();
+	const FModifierKeysState Mods;
+	FPointerEvent Down(0, Center, Center, TSet<FKey>{MouseKey}, MouseKey, 0.f, Mods);
+	FPointerEvent Up  (0, Center, Center, TSet<FKey>(),         MouseKey, 0.f, Mods);
+	Slate.ProcessMouseButtonDownEvent(nullptr, Down);
+	Slate.ProcessMouseButtonUpEvent(Up);
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("clicked"), true)
+		.Str(TEXT("widget_path"), W->GetPathName())
+		.Num(TEXT("screen_x"), Center.X)
+		.Num(TEXT("screen_y"), Center.Y)
+		.Str(TEXT("button"), BLow)
+		.BuildSuccess(Request);
+}
+
+// ─── umg.hover_widget — hover the cursor over a live widget BY PATH (PIE only) ──────────────────
+//
+// Args:   { widget_path: string }
+// Result: { hovered, widget_path, is_hovered, screen_x, screen_y }
+//
+// Drives a Slate mouse-MOVE at the widget centre so OnHovered / tooltips fire; is_hovered is
+// re-read afterward so the caller can confirm the hover registered.
+FMCPResponse Tool_HoverWidget(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
+			TEXT("umg.hover_widget requires PIE running"));
+	}
+	FString WidgetPath;
+	if (!Request.Args.IsValid()
+		|| !Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath) || WidgetPath.IsEmpty())
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
+	}
+	UUserWidget* W = UMG_ResolveLiveWidget(WidgetPath);
+	if (!W)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no live viewport widget at path '%s'"), *WidgetPath));
+	}
+	FVector2D AbsPos, AbsSize;
+	const FVector2D Center = UMG_WidgetAbsoluteCenter(W, AbsPos, AbsSize);
+	if (AbsSize.X < 1.0 || AbsSize.Y < 1.0)
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
+			TEXT("widget has no on-screen geometry (collapsed or not yet painted)"));
+	}
+	if (FSlateApplication::IsInitialized())
+	{
+		FPointerEvent Move(0, Center, Center, TSet<FKey>(), EKeys::Invalid, 0.f, FModifierKeysState());
+		FSlateApplication::Get().ProcessMouseMoveEvent(Move);
+	}
+
+	return FMCPJsonBuilder()
+		.Bool(TEXT("hovered"), true)
+		.Str(TEXT("widget_path"), W->GetPathName())
+		.Bool(TEXT("is_hovered"), W->IsHovered())
+		.Num(TEXT("screen_x"), Center.X)
+		.Num(TEXT("screen_y"), Center.Y)
+		.BuildSuccess(Request);
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────────────────────
 void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodNames)
 {
@@ -930,6 +1138,10 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("umg.add_to_viewport"),         &Tool_AddToViewport,         /*Lane A*/ false);
 	RegisterTool(TEXT("umg.remove_from_viewport"),    &Tool_RemoveFromViewport,    /*Lane A*/ false);
 	RegisterTool(TEXT("umg.list_root_widgets"),       &Tool_ListRootWidgets,       /*Lane A*/ false);
+	// 2026-06 — live widget targeting (PIE only): interact with UI by name, no pixel math.
+	RegisterTool(TEXT("umg.get_widget_geometry"),     &Tool_GetWidgetGeometry,     /*Lane A*/ false);
+	RegisterTool(TEXT("umg.click_widget"),            &Tool_ClickWidget,           /*Lane A*/ false);
+	RegisterTool(TEXT("umg.hover_widget"),            &Tool_HoverWidget,           /*Lane A*/ false);
 
 	UE_LOG(LogMCP, Log,
 		TEXT("UMG surface: registered 11 umg.* handlers (2 reads + 1 creator + 4 tree manip + 3 runtime + 1 event binding, all Lane A)"));
