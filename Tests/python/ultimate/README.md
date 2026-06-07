@@ -51,7 +51,7 @@ cumulative multi-hour stability soak.
 ## Status — campaign COMPLETE, suite 0-FAIL
 
 All categories (A–K) **plus Category P (PIE runtime)** are shipped and green.
-**72 phase scripts.** Latest J2 aggregate: **PASS 3415 / FAIL 0 / XFAIL 68 /
+**73 phase scripts.** Latest J2 aggregate: **PASS 3421 / FAIL 0 / XFAIL 68 /
 SKIP 47**. A green suite is **0 FAIL**; XFAIL = documented design-limit, SKIP =
 tool not registered / precondition absent. **0 crash dumps** across the campaign.
 
@@ -68,7 +68,7 @@ tool not registered / precondition absent. **0 crash dumps** across the campaign
 | I | regression | i1-i2 | all historical crash repros (S+5..S+20), API-ergonomics findings |
 | J | observability | j1-j2 | self-instrumentation truthfulness, aggregated report |
 | K | new edge | k1-k4 | path-reuse churn, concurrent distinct writes, per-conn resource-growth, committed-memory growth |
-| **P** | **PIE runtime** | **p1-p6** | **drives a LIVE PIE world: lifecycle state-machine, actor identity, input sim, stats/world/console, world-adaptive AI+Niagara runtime, PIE-off guard matrix** |
+| **P** | **PIE runtime** | **p1-p7** | **drives a LIVE PIE world: lifecycle state-machine, actor identity, input sim, stats/world/console, world-adaptive AI+Niagara runtime, PIE-off guard matrix, screenshot + play-session walkthrough** |
 
 ## Category P — PIE runtime (drives a live PIE world)
 
@@ -78,7 +78,8 @@ Category P is **active**: each phase starts a real PIE session via the shared
 spawns + possesses the default `BP_PlayerFlecs` pawn), exercises every
 PIE-runtime tool against the running world, verifies the result, then stops
 cleanly via `pie_stop_and_wait()` (which observes the bridge's 1.5s post-stop
-cooldown). All 24 PIE-runtime tools get real functional coverage.
+cooldown). All 17 pie.* tools + 11 world-adaptive ai.*/niagara.* runtime tools
+get real functional coverage against the live game world.
 
 | Phase | Script | Coverage | Result |
 |---|---|---|---|
@@ -88,6 +89,7 @@ cooldown). All 24 PIE-runtime tools get real functional coverage.
 | P4 | phase_p4_pie_world.py | get_stats fields / dump_world_state + class_filter / console_exec world targeting (pie/editor/server) | **10P / 0F** |
 | P5 | phase_p5_pie_runtime_inspect.py | ai.controller/perception/crowd/bb + niagara.spawn/list/stop; **world-adaptive flip** (pie↔editor) | **14P / 0F** |
 | P6 | phase_p6_pie_off_guards.py | all 13 PIE-required tools → -32038 when PIE off; is_running + console(editor) still work | **17P / 0F** |
+| P7 | phase_p7_pie_screenshot_walkthrough.py | pie.screenshot_to_disk (real PNG to disk) + range/off guards + 16-step realistic play-session composition test | **6P / 0F** |
 
 **Key correctness signals proven**: (1) the async start/stop lifecycle + the
 S+9 post-stop cooldown behave exactly as designed; (2) a possessed pawn's
