@@ -51,7 +51,7 @@ cumulative multi-hour stability soak.
 ## Status — campaign COMPLETE, suite 0-FAIL
 
 All categories (A–K) **plus Category P (PIE runtime)** are shipped and green.
-**76 phase scripts.** Latest J2 aggregate: **PASS 3461 / FAIL 0 / XFAIL 69 /
+**77 phase scripts.** Latest J2 aggregate: **PASS 3469 / FAIL 0 / XFAIL 69 /
 SKIP 47**. A green suite is **0 FAIL**; XFAIL = documented design-limit, SKIP =
 tool not registered / precondition absent. **0 crash dumps** across the campaign.
 
@@ -59,8 +59,8 @@ tool not registered / precondition absent. **0 crash dumps** across the campaign
 > player-interaction-simulation surface, each added because a phase surfaced the
 > gap, then verified live: `pie.add_look_input` (mouse-look/camera rotation),
 > `pie.move_mouse` (hover/position), `pie.drag_screen` (drag-and-drop / sliders),
-> and `umg.get_widget_geometry` / `umg.click_widget` / `umg.hover_widget`
-> (interact with UI BY NAME, no pixel math).
+> and `umg.list_live_widgets` / `get_widget_geometry` / `click_widget` /
+> `hover_widget` (interact with UI BY NAME — root AND child widgets — no pixel math).
 
 | Cat | Theme | Phases | Result |
 |---|---|---|---|
@@ -75,7 +75,7 @@ tool not registered / precondition absent. **0 crash dumps** across the campaign
 | I | regression | i1-i2 | all historical crash repros (S+5..S+20), API-ergonomics findings |
 | J | observability | j1-j2 | self-instrumentation truthfulness, aggregated report |
 | K | new edge | k1-k4 | path-reuse churn, concurrent distinct writes, per-conn resource-growth, committed-memory growth |
-| **P** | **PIE runtime** | **p1-p10** | **drives a LIVE PIE world in the user's real map: lifecycle, actor identity, input sim, stats/world/console, world-adaptive AI+Niagara, PIE-off guards, screenshot + walkthrough, behavioral input, UI + game camera, cursor + widget-by-name navigation** |
+| **P** | **PIE runtime** | **p1-p11** | **drives a LIVE PIE world in the user's real map: lifecycle, actor identity, input sim, stats/world/console, world-adaptive AI+Niagara, PIE-off guards, screenshot + walkthrough, behavioral input, UI + game camera, cursor nav, child-widget targeting** |
 
 ## Category P — PIE runtime (drives a live PIE world in the user's map)
 
@@ -86,9 +86,9 @@ then starts a real PIE session via `pie_start_and_wait()` (polls
 `pie.is_running`, settles so GM_FlecsGame spawns + possesses the default
 `BP_PlayerFlecs` pawn), exercises every PIE-runtime tool against the running
 world, verifies the result, then stops cleanly via `pie_stop_and_wait()` (which
-observes the bridge's 1.5s post-stop cooldown). All 20 pie.* tools + 13 umg.*
-tools (incl. live widget-targeting) + 11 world-adaptive ai.*/niagara.* runtime
-tools get real functional coverage against the live game world.
+observes the bridge's 1.5s post-stop cooldown). All 20 pie.* tools + 14 umg.*
+tools (incl. live widget-targeting, root AND child) + 11 world-adaptive
+ai.*/niagara.* runtime tools get real functional coverage against the live game world.
 
 | Phase | Script | Coverage | Result |
 |---|---|---|---|
@@ -102,6 +102,7 @@ tools get real functional coverage against the live game world.
 | P8 | phase_p8_pie_behavioral_input.py | **BEHAVIORAL** input in the floored user map: floor check + W/A/S/D actually move the pawn (correct directions, dot=-1.0 opposite pairs) + jump | **8P / 0F / 1X** (jump) |
 | P9 | phase_p9_pie_ui_camera.py | **UI + game camera**: live UMG viewport (list_root_widgets shows the game's MainHUD/Inventory/LootPanel) + add/remove_from_viewport + mouse-click delivery to Slate + **camera follows pawn** (cam 483cm == pawn 483cm) + **camera ROTATES via pie.add_look_input** (view turned 180°) + UMG/look PIE-off guards | **13P / 0F** |
 | P10 | phase_p10_pie_cursor_nav.py | **cursor + widget navigation**: pie.move_mouse (hover/position) + pie.drag_screen (press-move-release, editor survives) + **umg.get_widget_geometry** (MainHUD 1280×722 rect) + **umg.click_widget** (clicks exactly at geometry center) + **umg.hover_widget** + arg/PIE-off guards | **13P / 0F** |
+| P11 | phase_p11_pie_child_widgets.py | **child-widget targeting**: umg.list_live_widgets enumerates a UserWidget's live child tree (12 widgets in MainHUD); `child_name` on get_widget_geometry/click_widget/hover_widget targets a named element inside (clicked child 'Image_1' at its own 33×33 center) + bad-child/PIE-off guards | **8P / 0F** |
 
 **Key correctness signals proven**: (1) the async start/stop lifecycle + the
 S+9 post-stop cooldown behave exactly as designed; (2) a possessed pawn's
@@ -140,10 +141,11 @@ the pawn's camera-relative forward direction (measured 180°). Camera translatio
   a specific widget's OnClicked *fired* needs an instrumented widget with an
   observable side-effect (the stock game UI's root widgets are non-interactive
   canvases, so `is_hovered`/callbacks can't be confirmed on them).
-- **Child-widget targeting** — the by-name tools resolve ROOT viewport widgets
-  (from umg.list_root_widgets). Targeting a specific button INSIDE a UserWidget
-  is via coordinates (screenshot + geometry → pie.click_screen); live child-tree
-  geometry enumeration would close this.
+- **Child-widget targeting — CLOSED (2026-06).** `umg.list_live_widgets`
+  enumerates a UserWidget's live child tree (name/class/geometry/is_variable),
+  and `child_name` on get_widget_geometry/click_widget/hover_widget targets a
+  named element INSIDE the UserWidget (via `GetWidgetFromName`). P11 confirms a
+  child is resolved to its own rect + clicked at its own center.
 - **jump (Space)** — no z-rise in P8 (XFAIL); likely unbound to that key in this
   map's IMC or suppressed by the posture system at ~3 FPS. Movement is solid.
 - **Non-empty AI data** — largely N/A: FatumGame is a Flecs-ECS game that doesn't

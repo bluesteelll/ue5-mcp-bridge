@@ -948,8 +948,9 @@ static UUserWidget* UMG_ResolveLiveWidget(const FString& WidgetPath)
 
 /** Centre of a widget's cached geometry in Slate ABSOLUTE (desktop) coordinates; also returns the
  *  absolute top-left + size. Slate hit-tests pointer events in this space, so a click/hover at this
- *  centre lands on the widget regardless of viewport offset. */
-static FVector2D UMG_WidgetAbsoluteCenter(const UUserWidget* W, FVector2D& OutAbsPos, FVector2D& OutAbsSize)
+ *  centre lands on the widget regardless of viewport offset. Works for the root UserWidget OR any
+ *  child UWidget (both expose GetCachedGeometry). */
+static FVector2D UMG_WidgetAbsoluteCenter(const UWidget* W, FVector2D& OutAbsPos, FVector2D& OutAbsSize)
 {
 	check(W != nullptr);
 	const FGeometry& Geo = W->GetCachedGeometry();
@@ -958,10 +959,43 @@ static FVector2D UMG_WidgetAbsoluteCenter(const UUserWidget* W, FVector2D& OutAb
 	return OutAbsPos + OutAbsSize * 0.5;
 }
 
-// ─── umg.get_widget_geometry — on-screen rect of a live viewport widget (PIE only) ─────────────
+/** Resolve the target UWidget for the by-name tools: the live root UserWidget at `WidgetPath`, OR —
+ *  when `ChildName` is non-empty — a named child within it (UUserWidget::GetWidgetFromName, which
+ *  resolves any widget in the live WidgetTree by its FName). Returns nullptr + fills OutErrCode/
+ *  OutError on failure so callers can surface it verbatim. */
+static UWidget* UMG_ResolveTargetWidget(const FString& WidgetPath, const FString& ChildName,
+	int32& OutErrCode, FString& OutError)
+{
+	UUserWidget* Root = UMG_ResolveLiveWidget(WidgetPath);
+	if (!Root)
+	{
+		OutErrCode = kMCPErrorObjectNotFound;
+		OutError = FString::Printf(
+			TEXT("no live viewport widget at path '%s' (use umg.list_root_widgets)"), *WidgetPath);
+		return nullptr;
+	}
+	if (ChildName.IsEmpty())
+	{
+		return Root;
+	}
+	UWidget* Child = Root->GetWidgetFromName(FName(*ChildName));
+	if (!Child)
+	{
+		OutErrCode = kMCPErrorObjectNotFound;
+		OutError = FString::Printf(
+			TEXT("no child widget named '%s' in '%s' (use umg.list_live_widgets to enumerate)"),
+			*ChildName, *WidgetPath);
+		return nullptr;
+	}
+	return Child;
+}
+
+// ─── umg.get_widget_geometry — on-screen rect of a live viewport widget OR child (PIE only) ────
 //
-// Args:   { widget_path: string }  (a path from umg.list_root_widgets)
-// Result: { found, widget_path, class_path, is_visible, is_hovered,
+// Args:   { widget_path: string, child_name?: string }
+//           widget_path — a root path from umg.list_root_widgets.
+//           child_name  — optional; a named child inside that UserWidget (umg.list_live_widgets).
+// Result: { found, widget_path, child_name, class_path, is_visible, is_hovered,
 //           abs_x, abs_y, width, height, center_x, center_y }  (absolute/desktop pixels)
 FMCPResponse Tool_GetWidgetGeometry(const FMCPRequest& Request)
 {
@@ -971,29 +1005,32 @@ FMCPResponse Tool_GetWidgetGeometry(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
 			TEXT("umg.get_widget_geometry requires PIE running"));
 	}
-	FString WidgetPath;
+	FString WidgetPath, ChildName;
 	if (!Request.Args.IsValid()
 		|| !Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath) || WidgetPath.IsEmpty())
 	{
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
 	}
-	UUserWidget* W = UMG_ResolveLiveWidget(WidgetPath);
-	if (!W)
+	Request.Args->TryGetStringField(TEXT("child_name"), ChildName);
+	int32 ErrCode = 0;
+	FString Err;
+	UWidget* Target = UMG_ResolveTargetWidget(WidgetPath, ChildName, ErrCode, Err);
+	if (!Target)
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("no live viewport widget at path '%s' (use umg.list_root_widgets)"), *WidgetPath));
+		return FMCPToolHelpers::MakeError(Request, ErrCode, Err);
 	}
 	FVector2D AbsPos, AbsSize;
-	const FVector2D Center = UMG_WidgetAbsoluteCenter(W, AbsPos, AbsSize);
-	const bool bVisible = W->GetVisibility() != ESlateVisibility::Collapsed
-		&& W->GetVisibility() != ESlateVisibility::Hidden;
+	const FVector2D Center = UMG_WidgetAbsoluteCenter(Target, AbsPos, AbsSize);
+	const bool bVisible = Target->GetVisibility() != ESlateVisibility::Collapsed
+		&& Target->GetVisibility() != ESlateVisibility::Hidden;
 
 	return FMCPJsonBuilder()
 		.Bool(TEXT("found"), true)
-		.Str(TEXT("widget_path"), W->GetPathName())
-		.Str(TEXT("class_path"), W->GetClass()->GetPathName())
+		.Str(TEXT("widget_path"), WidgetPath)
+		.Str(TEXT("child_name"), ChildName)
+		.Str(TEXT("class_path"), Target->GetClass()->GetPathName())
 		.Bool(TEXT("is_visible"), bVisible)
-		.Bool(TEXT("is_hovered"), W->IsHovered())
+		.Bool(TEXT("is_hovered"), Target->IsHovered())
 		.Num(TEXT("abs_x"), AbsPos.X)
 		.Num(TEXT("abs_y"), AbsPos.Y)
 		.Num(TEXT("width"), AbsSize.X)
@@ -1003,12 +1040,13 @@ FMCPResponse Tool_GetWidgetGeometry(const FMCPRequest& Request)
 		.BuildSuccess(Request);
 }
 
-// ─── umg.click_widget — click a live viewport widget BY PATH (PIE only) ────────────────────────
+// ─── umg.click_widget — click a live viewport widget OR named child BY NAME (PIE only) ─────────
 //
-// Args:   { widget_path: string, button?: "left"|"right"|"middle" }
-// Result: { clicked, widget_path, screen_x, screen_y, button }
+// Args:   { widget_path: string, child_name?: string, button?: "left"|"right"|"middle" }
+// Result: { clicked, widget_path, child_name, screen_x, screen_y, button }
 //
-// Drives Slate pointer down+up at the widget's on-screen centre so OnClicked fires — no pixel math.
+// Drives Slate pointer down+up at the (root or child) widget's on-screen centre so OnClicked fires
+// — no pixel math. child_name targets a button/element inside the UserWidget (umg.list_live_widgets).
 FMCPResponse Tool_ClickWidget(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
@@ -1017,12 +1055,13 @@ FMCPResponse Tool_ClickWidget(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
 			TEXT("umg.click_widget requires PIE running"));
 	}
-	FString WidgetPath, Button(TEXT("left"));
+	FString WidgetPath, ChildName, Button(TEXT("left"));
 	if (!Request.Args.IsValid()
 		|| !Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath) || WidgetPath.IsEmpty())
 	{
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
 	}
+	Request.Args->TryGetStringField(TEXT("child_name"), ChildName);
 	Request.Args->TryGetStringField(TEXT("button"), Button);
 	FKey MouseKey = EKeys::LeftMouseButton;
 	const FString BLow = Button.ToLower();
@@ -1034,14 +1073,15 @@ FMCPResponse Tool_ClickWidget(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams,
 			FString::Printf(TEXT("unknown button '%s'; use left/right/middle"), *Button));
 	}
-	UUserWidget* W = UMG_ResolveLiveWidget(WidgetPath);
-	if (!W)
+	int32 ErrCode = 0;
+	FString Err;
+	UWidget* Target = UMG_ResolveTargetWidget(WidgetPath, ChildName, ErrCode, Err);
+	if (!Target)
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("no live viewport widget at path '%s'"), *WidgetPath));
+		return FMCPToolHelpers::MakeError(Request, ErrCode, Err);
 	}
 	FVector2D AbsPos, AbsSize;
-	const FVector2D Center = UMG_WidgetAbsoluteCenter(W, AbsPos, AbsSize);
+	const FVector2D Center = UMG_WidgetAbsoluteCenter(Target, AbsPos, AbsSize);
 	if (AbsSize.X < 1.0 || AbsSize.Y < 1.0)
 	{
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
@@ -1060,20 +1100,21 @@ FMCPResponse Tool_ClickWidget(const FMCPRequest& Request)
 
 	return FMCPJsonBuilder()
 		.Bool(TEXT("clicked"), true)
-		.Str(TEXT("widget_path"), W->GetPathName())
+		.Str(TEXT("widget_path"), WidgetPath)
+		.Str(TEXT("child_name"), ChildName)
 		.Num(TEXT("screen_x"), Center.X)
 		.Num(TEXT("screen_y"), Center.Y)
 		.Str(TEXT("button"), BLow)
 		.BuildSuccess(Request);
 }
 
-// ─── umg.hover_widget — hover the cursor over a live widget BY PATH (PIE only) ──────────────────
+// ─── umg.hover_widget — hover the cursor over a live widget OR named child (PIE only) ───────────
 //
-// Args:   { widget_path: string }
-// Result: { hovered, widget_path, is_hovered, screen_x, screen_y }
+// Args:   { widget_path: string, child_name?: string }
+// Result: { hovered, widget_path, child_name, is_hovered, screen_x, screen_y }
 //
-// Drives a Slate mouse-MOVE at the widget centre so OnHovered / tooltips fire; is_hovered is
-// re-read afterward so the caller can confirm the hover registered.
+// Drives a Slate mouse-MOVE at the (root or child) widget centre so OnHovered / tooltips fire;
+// is_hovered is re-read afterward so the caller can confirm the hover registered.
 FMCPResponse Tool_HoverWidget(const FMCPRequest& Request)
 {
 	check(IsInGameThread());
@@ -1082,20 +1123,22 @@ FMCPResponse Tool_HoverWidget(const FMCPRequest& Request)
 		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
 			TEXT("umg.hover_widget requires PIE running"));
 	}
-	FString WidgetPath;
+	FString WidgetPath, ChildName;
 	if (!Request.Args.IsValid()
 		|| !Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath) || WidgetPath.IsEmpty())
 	{
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
 	}
-	UUserWidget* W = UMG_ResolveLiveWidget(WidgetPath);
-	if (!W)
+	Request.Args->TryGetStringField(TEXT("child_name"), ChildName);
+	int32 ErrCode = 0;
+	FString Err;
+	UWidget* Target = UMG_ResolveTargetWidget(WidgetPath, ChildName, ErrCode, Err);
+	if (!Target)
 	{
-		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
-			FString::Printf(TEXT("no live viewport widget at path '%s'"), *WidgetPath));
+		return FMCPToolHelpers::MakeError(Request, ErrCode, Err);
 	}
 	FVector2D AbsPos, AbsSize;
-	const FVector2D Center = UMG_WidgetAbsoluteCenter(W, AbsPos, AbsSize);
+	const FVector2D Center = UMG_WidgetAbsoluteCenter(Target, AbsPos, AbsSize);
 	if (AbsSize.X < 1.0 || AbsSize.Y < 1.0)
 	{
 		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal,
@@ -1109,10 +1152,78 @@ FMCPResponse Tool_HoverWidget(const FMCPRequest& Request)
 
 	return FMCPJsonBuilder()
 		.Bool(TEXT("hovered"), true)
-		.Str(TEXT("widget_path"), W->GetPathName())
-		.Bool(TEXT("is_hovered"), W->IsHovered())
+		.Str(TEXT("widget_path"), WidgetPath)
+		.Str(TEXT("child_name"), ChildName)
+		.Bool(TEXT("is_hovered"), Target->IsHovered())
 		.Num(TEXT("screen_x"), Center.X)
 		.Num(TEXT("screen_y"), Center.Y)
+		.BuildSuccess(Request);
+}
+
+// ─── umg.list_live_widgets — enumerate a root widget's LIVE child tree + geometry (PIE only) ────
+//
+// Args:   { widget_path: string }  (a root path from umg.list_root_widgets)
+// Result: { widget_path, count, widgets: [{ name, class, is_variable, is_visible,
+//           abs_x, abs_y, width, height, center_x, center_y }, ...] }  (absolute/desktop pixels)
+//
+// Discovery for CHILD-widget targeting: each `name` can be passed as `child_name` to
+// umg.click_widget / hover_widget / get_widget_geometry. `is_variable` marks the designer-named
+// (stably-named) widgets — the reliable targets; auto-named widgets have churny names.
+FMCPResponse Tool_ListLiveWidgets(const FMCPRequest& Request)
+{
+	check(IsInGameThread());
+	if (!GEditor || !GEditor->PlayWorld)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorPIEActive,
+			TEXT("umg.list_live_widgets requires PIE running"));
+	}
+	FString WidgetPath;
+	if (!Request.Args.IsValid()
+		|| !Request.Args->TryGetStringField(TEXT("widget_path"), WidgetPath) || WidgetPath.IsEmpty())
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInvalidParams, TEXT("missing widget_path"));
+	}
+	UUserWidget* Root = UMG_ResolveLiveWidget(WidgetPath);
+	if (!Root)
+	{
+		return FMCPToolHelpers::MakeError(Request, kMCPErrorObjectNotFound,
+			FString::Printf(TEXT("no live viewport widget at path '%s' (use umg.list_root_widgets)"), *WidgetPath));
+	}
+	if (!Root->WidgetTree)
+	{
+		return FMCPToolHelpers::MakeError(Request, kUMGErrorInternal, TEXT("widget has no live WidgetTree"));
+	}
+
+	TArray<UWidget*> All;
+	Root->WidgetTree->GetAllWidgets(All);
+	TArray<TSharedPtr<FJsonValue>> Out;
+	Out.Reserve(All.Num());
+	for (UWidget* C : All)
+	{
+		if (!C) { continue; }
+		FVector2D Pos, Sz;
+		const FVector2D Center = UMG_WidgetAbsoluteCenter(C, Pos, Sz);
+		const bool bVisible = C->GetVisibility() != ESlateVisibility::Collapsed
+			&& C->GetVisibility() != ESlateVisibility::Hidden;
+		TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("name"), C->GetName());
+		Obj->SetStringField(TEXT("class"), C->GetClass()->GetPathName());
+		Obj->SetBoolField(TEXT("is_variable"), C->bIsVariable);
+		Obj->SetBoolField(TEXT("is_visible"), bVisible);
+		Obj->SetNumberField(TEXT("abs_x"), Pos.X);
+		Obj->SetNumberField(TEXT("abs_y"), Pos.Y);
+		Obj->SetNumberField(TEXT("width"), Sz.X);
+		Obj->SetNumberField(TEXT("height"), Sz.Y);
+		Obj->SetNumberField(TEXT("center_x"), Center.X);
+		Obj->SetNumberField(TEXT("center_y"), Center.Y);
+		Out.Add(MakeShared<FJsonValueObject>(Obj));
+	}
+
+	const int32 N = Out.Num();
+	return FMCPJsonBuilder()
+		.Str(TEXT("widget_path"), Root->GetPathName())
+		.Num(TEXT("count"), static_cast<double>(N))
+		.Arr(TEXT("widgets"), MoveTemp(Out))
 		.BuildSuccess(Request);
 }
 
@@ -1139,6 +1250,7 @@ void Register(FMCPDispatchQueue& Queue, TArray<FString>& OutRegisteredMethodName
 	RegisterTool(TEXT("umg.remove_from_viewport"),    &Tool_RemoveFromViewport,    /*Lane A*/ false);
 	RegisterTool(TEXT("umg.list_root_widgets"),       &Tool_ListRootWidgets,       /*Lane A*/ false);
 	// 2026-06 — live widget targeting (PIE only): interact with UI by name, no pixel math.
+	RegisterTool(TEXT("umg.list_live_widgets"),       &Tool_ListLiveWidgets,       /*Lane A*/ false);
 	RegisterTool(TEXT("umg.get_widget_geometry"),     &Tool_GetWidgetGeometry,     /*Lane A*/ false);
 	RegisterTool(TEXT("umg.click_widget"),            &Tool_ClickWidget,           /*Lane A*/ false);
 	RegisterTool(TEXT("umg.hover_widget"),            &Tool_HoverWidget,           /*Lane A*/ false);
