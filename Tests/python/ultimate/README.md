@@ -1,8 +1,9 @@
 # ULTIMATE test suite
 
 Comprehensive acceptance + crash-safety + concurrency + protocol + stability
-+ security tests for `UnrealMCPBridge`, organized into 10 categories
-(`A`..`J`) per `D:/tmp/ws3_stress/ULTIMATE_TEST_PLAN.md`.
++ security + **PIE-runtime** tests for `UnrealMCPBridge`, organized into
+categories `A`..`K` plus `P` (PIE runtime) per
+`D:/tmp/ws3_stress/ULTIMATE_TEST_PLAN.md`.
 
 ## Layout
 
@@ -49,10 +50,10 @@ cumulative multi-hour stability soak.
 
 ## Status — campaign COMPLETE, suite 0-FAIL
 
-All 10 categories (A–J) plus a "K" edge set are shipped and green. **64 phase
-scripts.** Latest J2 aggregate: **PASS 3338 / FAIL 0 / XFAIL 66 / SKIP 47**.
-A green suite is **0 FAIL**; XFAIL = documented design-limit, SKIP = tool
-not registered / precondition absent. **0 crash dumps** across the campaign.
+All categories (A–K) **plus Category P (PIE runtime)** are shipped and green.
+**72 phase scripts.** Latest J2 aggregate: **PASS 3415 / FAIL 0 / XFAIL 68 /
+SKIP 47**. A green suite is **0 FAIL**; XFAIL = documented design-limit, SKIP =
+tool not registered / precondition absent. **0 crash dumps** across the campaign.
 
 | Cat | Theme | Phases | Result |
 |---|---|---|---|
@@ -66,7 +67,45 @@ not registered / precondition absent. **0 crash dumps** across the campaign.
 | H | workflows | h1-h7, h6.1-h6.7 | 418-tool dispatch, BP/AI/Input/Niagara+Material pipelines, transaction/render-target/spatial/debug/gameplaytag/sc/livecoding, mega-chain |
 | I | regression | i1-i2 | all historical crash repros (S+5..S+20), API-ergonomics findings |
 | J | observability | j1-j2 | self-instrumentation truthfulness, aggregated report |
-| K | new edge | k1-k3 | path-reuse churn, concurrent distinct writes, per-connection resource-growth diagnostic |
+| K | new edge | k1-k4 | path-reuse churn, concurrent distinct writes, per-conn resource-growth, committed-memory growth |
+| **P** | **PIE runtime** | **p1-p6** | **drives a LIVE PIE world: lifecycle state-machine, actor identity, input sim, stats/world/console, world-adaptive AI+Niagara runtime, PIE-off guard matrix** |
+
+## Category P — PIE runtime (drives a live PIE world)
+
+Earlier PIE phases (B3/C4/F4) were **passive** — they SKIP when PIE is off.
+Category P is **active**: each phase starts a real PIE session via the shared
+`pie_start_and_wait()` helper (polls `pie.is_running`, settles so GM_FlecsGame
+spawns + possesses the default `BP_PlayerFlecs` pawn), exercises every
+PIE-runtime tool against the running world, verifies the result, then stops
+cleanly via `pie_stop_and_wait()` (which observes the bridge's 1.5s post-stop
+cooldown). All 24 PIE-runtime tools get real functional coverage.
+
+| Phase | Script | Coverage | Result |
+|---|---|---|---|
+| P1 | phase_p1_pie_lifecycle.py | start/is_running/get_stats/pause/step_frame/resume/set_time_dilation/stop + cooldown + already-running + step-without-pause guards | **11P / 0F** |
+| P2 | phase_p2_pie_actors.py | get_player_controller/get_pawn/focus_actor + identity stability + index/arg guards | **11P / 0F** |
+| P3 | phase_p3_pie_input.py | simulate_key/click_screen/click_actor + FKey/button/arg guards | **12P / 0F / 1X** (pawn projects behind 1P camera) |
+| P4 | phase_p4_pie_world.py | get_stats fields / dump_world_state + class_filter / console_exec world targeting (pie/editor/server) | **10P / 0F** |
+| P5 | phase_p5_pie_runtime_inspect.py | ai.controller/perception/crowd/bb + niagara.spawn/list/stop; **world-adaptive flip** (pie↔editor) | **14P / 0F** |
+| P6 | phase_p6_pie_off_guards.py | all 13 PIE-required tools → -32038 when PIE off; is_running + console(editor) still work | **17P / 0F** |
+
+**Key correctness signals proven**: (1) the async start/stop lifecycle + the
+S+9 post-stop cooldown behave exactly as designed; (2) a possessed pawn's
+identity is stable + cross-checks against dump_world_state; (3) input tools
+route through the live PlayerController; (4) the world-adaptive runtime tools
+(ai.*/niagara.*) flip their reported `world` from `editor`→`pie` on PIE start —
+the definitive proof they target the running game, not the editor; (5) every
+PIE-required tool refuses cleanly (-32038) with PIE off rather than acting on a
+null world.
+
+**Documented coverage boundaries (honest)**: behavioral input EFFECTS (e.g. "W
+moved the pawn") are NOT asserted — the default map is empty (pawn free-falls)
+and the editor runs unfocused at ~3 FPS, so motion can't be attributed to
+input. Non-empty AI data (live controllers/perception/crowd agents) requires an
+AI-populated fixture map; the player-only default map makes the list tools
+correctly return EMPTY, and the non-AI player pawn is correctly classified
+(-32004/-32011). Both boundaries would need an authored fixture map (floor +
+deterministic input mapping + AI pawns) to close.
 
 Per-phase Category-A detail (the hardest to get right) is preserved below.
 

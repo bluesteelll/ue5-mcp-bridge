@@ -1126,6 +1126,116 @@ def wait_for_editor(timeout: float = 60.0, poll_s: float = 1.0) -> bool:
 
 
 # ============================================================================
+# PIE lifecycle helpers (Category P — PIE runtime phases)
+# ============================================================================
+#
+# pie.start is ASYNC: it returns before PlayWorld is fully spun up — callers
+# MUST poll pie.is_running until running, then settle a beat to let the
+# GameMode spawn + possess the default pawn (BP_PlayerFlecs in FatumGame).
+# pie.stop is ALSO async: the bridge enforces a 1.5s post-stop cooldown before
+# the next start (UE teardown of audio/world/online is async; restarting too
+# soon crashes the editor — bridge guard S+9). pie_stop_and_wait observes it.
+
+def pie_state(timeout: float = 6.0) -> Dict[str, Any]:
+    """Returns {running, paused, world_count} dict, or {} on transport error."""
+    r = call("pie.is_running", {}, timeout=timeout)
+    if not is_ok(r):
+        return {}
+    return r.get("result", {}) or {}
+
+
+def pie_is_running(timeout: float = 6.0) -> bool:
+    return bool(pie_state(timeout).get("running"))
+
+
+def pie_start_and_wait(
+    mode: str = "selected_viewport",
+    extra_args: Optional[Dict[str, Any]] = None,
+    up_timeout: float = 25.0,
+    poll_s: float = 0.5,
+    settle_s: float = 2.5,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Start PIE and poll pie.is_running until up, then settle.
+
+    Returns (up: bool, info: dict). `info` carries the pie.start result
+    (`start_result`), the final state (`state`), and any error context.
+    If PIE is already running, returns (True, {note:'already_running'}).
+    The settle lets GM_FlecsGame spawn + possess the default pawn.
+    """
+    if pie_is_running():
+        return True, {"note": "already_running", "state": pie_state()}
+    start_args: Dict[str, Any] = dict(extra_args or {})
+    if mode:
+        start_args.setdefault("mode", mode)
+    st = call("pie.start", start_args, timeout=20.0)
+    # The bridge enforces a 1.5s post-stop cooldown (UE teardown is async) and
+    # also refuses while a prior PlayWorld is still tearing down — both surface
+    # as -32603 with a "too soon"/"teardown"/"wait"/"already in progress"
+    # message. This is keyed to the LAST pie.stop, not to who called it, so a
+    # caller that stopped recently must wait + retry. Handle transparently.
+    cooldown_retries = 4
+    while (not is_ok(st)) and err_code(st) == -32603 and cooldown_retries > 0:
+        msg = err_message(st).lower()
+        if not any(k in msg for k in ("too soon", "teardown", "wait", "already in progress")):
+            break  # a different -32603 (genuine internal error) — don't retry
+        time.sleep(1.6)
+        st = call("pie.start", start_args, timeout=20.0)
+        cooldown_retries -= 1
+    if not is_ok(st):
+        return False, {"start_error_code": err_code(st),
+                       "start_error": err_message(st)}
+    deadline = time.monotonic() + up_timeout
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        if pie_is_running(timeout=6.0):
+            time.sleep(settle_s)  # GameMode spawns + possesses pawn
+            return True, {"start_result": st.get("result", {}), "state": pie_state()}
+    return False, {"start_result": st.get("result", {}), "note": "never_reported_running"}
+
+
+def pie_stop_and_wait(
+    down_timeout: float = 15.0,
+    poll_s: float = 0.5,
+    cooldown_s: float = 2.0,
+) -> bool:
+    """Stop PIE, poll until is_running false, then observe the start-cooldown.
+
+    Returns True iff PIE confirmed stopped (or was already off). Always sleeps
+    `cooldown_s` at the end so a following pie_start_and_wait won't trip the
+    bridge's 1.5s post-stop start guard.
+    """
+    if not pie_is_running():
+        return True
+    call("pie.stop", {}, timeout=down_timeout)
+    deadline = time.monotonic() + down_timeout
+    stopped = False
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        if not pie_is_running(timeout=6.0):
+            stopped = True
+            break
+    time.sleep(cooldown_s)  # cover the bridge's 1.5s post-stop start guard
+    return stopped
+
+
+def pie_ensure_stopped() -> bool:
+    """Guarantee PIE is OFF (for phases that test the PIE-off state). Returns
+    True if PIE is off after the call."""
+    if not pie_is_running():
+        return True
+    return pie_stop_and_wait()
+
+
+def pie_get_pawn_path(player_index: int = 0, timeout: float = 8.0) -> Optional[str]:
+    """Convenience: return the possessed pawn's full path, or None if PIE is
+    off / no pawn possessed yet."""
+    r = call("pie.get_pawn", {"player_index": player_index}, timeout=timeout)
+    if not is_ok(r):
+        return None
+    return (r.get("result", {}) or {}).get("pawn_path")
+
+
+# ============================================================================
 # Modal-dialog defence + autosave suppression
 # ============================================================================
 #
